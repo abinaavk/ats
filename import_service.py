@@ -14,16 +14,16 @@ def import_legacy():
             "name": "pinnacle_api",  # Must match systemd service name exactly
             "port": 8081,
             "domain": "data.gaiasentinel.online",
-            "storage_path": "/opt/extra1_1tb/api", # ATS expects /api/pinnacle_api inside here
-            "repo_url": "MANUAL_IMPORT"
+            "storage_path": "/opt/extra1_1tb", # ATS expects /api/pinnacle_api inside here
+            "repo_url": "git@github.com:Abinaav-K876/gok_pinnacle.git"
         },
         # SERVICE 2: GAIA SENTINEL (Main Site)
         {
             "name": "gaia_sentinel", # Must match systemd service name exactly
             "port": 8080,
             "domain": "gaiasentinel.online",
-            "storage_path": "/opt/websites", # ATS will look for /api/gaia_sentinel here
-            "repo_url": "MANUAL_IMPORT"
+            "storage_path": "/opt", # ATS will look for /api/gaia_sentinel here
+            "repo_url": "git@github.com:Abinaav-K876/gaia_sentinel.git"
         }
     ]
 
