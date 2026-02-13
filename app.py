@@ -3,7 +3,7 @@
 """
 ATS | AUTOMATED TECH STACK | v7.0
 Architect: Abinaav K
-Status: PRODUCTION - DEBUGGED
+Status: PRODUCTION - FULLY DEBUGGED
 """
 
 import os
@@ -270,19 +270,15 @@ class DatabaseManager:
 db = DatabaseManager(DB_FILE)
 
 # ==============================================================================
-#   PORT AND SERVICE CHECKING - FIXED [web:31][web:36][web:39]
+#   PORT AND SERVICE CHECKING
 # ==============================================================================
 
 def check_port_listening(port: int, timeout: float = 1.0) -> bool:
-    """
-    Check if a port is listening using direct socket connection [web:31][web:36][web:39]
-    More reliable than curl for checking if service is up
-    """
+    """Check if a port is listening using direct socket connection"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
         result = sock.connect_ex(('127.0.0.1', port))
-        sock.close()
         return result == 0
     except socket.error:
         return False
@@ -293,7 +289,7 @@ def check_port_listening(port: int, timeout: float = 1.0) -> bool:
             pass
 
 def check_systemd_active(service_name: str) -> bool:
-    """Check if systemd service is active [web:37][web:40]"""
+    """Check if systemd service is active"""
     try:
         result = subprocess.run(
             ["systemctl", "is-active", service_name],
@@ -307,7 +303,7 @@ def check_systemd_active(service_name: str) -> bool:
         return False
 
 def get_service_pid(service_name: str) -> Optional[int]:
-    """Get service PID using systemctl [web:37][web:40]"""
+    """Get service PID using systemctl"""
     try:
         result = subprocess.run(
             ["systemctl", "show", "--property", "MainPID", "--value", service_name],
@@ -322,8 +318,16 @@ def get_service_pid(service_name: str) -> Optional[int]:
         logger.debug(f"Failed to get PID for {service_name}: {e}")
         return None
 
+def check_service_health(service_name: str, port: int) -> bool:
+    """
+    Check service health - both systemd status and port listening
+    """
+    if not check_systemd_active(service_name):
+        return False
+    return check_port_listening(port, timeout=2.0)
+
 # ==============================================================================
-#   ASYNC UTILITIES - FIXED
+#   ASYNC UTILITIES
 # ==============================================================================
 
 async def run_async_command(cmd: List[str], cwd: Optional[str] = None, timeout: int = 300) -> Tuple[int, str, str]:
@@ -351,22 +355,9 @@ async def run_async_command(cmd: List[str], cwd: Optional[str] = None, timeout: 
         logger.error(f"Async command failed: {e}")
         raise
 
-def check_service_health(service_name: str, port: int) -> bool:
-    """
-    Synchronous health check - more reliable [web:31][web:36]
-    Checks both systemd status and port listening
-    """
-    # First check if systemd thinks it's active
-    if not check_systemd_active(service_name):
-        return False
-    
-    # Then check if port is actually listening
-    return check_port_listening(port, timeout=2.0)
-
 async def check_single_service_health_async(svc: Dict) -> Tuple[str, bool]:
     """Async wrapper for health check"""
     try:
-        # Run sync function in executor to avoid blocking
         loop = asyncio.get_event_loop()
         is_healthy = await loop.run_in_executor(
             None, 
@@ -395,7 +386,6 @@ async def parallel_health_checks(services: List[Dict]) -> Dict[str, bool]:
             name, status = result
             health_dict[name] = status
         else:
-            # Handle exceptions
             logger.debug(f"Health check exception: {result}")
     
     return health_dict
@@ -703,23 +693,19 @@ WantedBy=multi-user.target
     return content
 
 # ==============================================================================
-#   HEALTH CHECKING - SIMPLIFIED AND FIXED
+#   HEALTH CHECKING
 # ==============================================================================
 
 def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
-    """
-    Synchronous health check for deployment - more reliable [web:31][web:36]
-    """
+    """Synchronous health check for deployment"""
     for attempt in range(max_retries):
         print_status(f"Health check attempt {attempt + 1}/{max_retries}...", "info")
         
-        # Check systemd status
         if not check_systemd_active(name):
             print(f"  {C_YELLOW}└─ Service not active in systemd{C_RESET}")
             time.sleep(2)
             continue
         
-        # Check port listening
         if check_port_listening(port, timeout=2.0):
             print_status("Health check PASSED", "success")
             return True
@@ -733,7 +719,7 @@ def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
     return False
 
 # ==============================================================================
-#   DEPLOYMENT ENGINE - FIXED
+#   DEPLOYMENT ENGINE
 # ==============================================================================
 
 async def deploy_service_async():
@@ -1036,10 +1022,808 @@ def list_services_detailed():
     
     input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
-# Continue with rest of the functions...
-# [Due to length limits, I'll provide the remaining essential functions in the next part]
-# The key fixes are:
-# 1. Proper port checking using socket.connect_ex()
-# 2. Systemd status checking
-# 3. Fixed async/await handling
-# 4. Better error handling
+# ==============================================================================
+#   SERVICE OPERATIONS
+# ==============================================================================
+
+def destroy_service():
+    """Enhanced service destruction with confirmation"""
+    print_header()
+    print(f"{C_RED}{C_BOLD}═══ DESTROY SERVICE ═══{C_RESET}\n")
+    print(f"{C_YELLOW}WARNING: This will permanently delete the service and all its data.{C_RESET}\n")
+    
+    name = input("Service Name: ").strip()
+    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    
+    if not svc:
+        print_status("Service not found", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    print(f"\n{C_CYAN}Service Information:{C_RESET}")
+    print(f"  Name:    {svc['name']}")
+    print(f"  Domain:  {svc['domain']}")
+    print(f"  Port:    {svc['port']}")
+    print(f"  Created: {svc['created_at']}")
+    
+    print(f"\n{C_RED}Type 'DELETE {name}' to confirm:{C_RESET} ", end='')
+    confirmation = input()
+    
+    if confirmation != f"DELETE {name}":
+        print_status("Destruction cancelled", "warning")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    try:
+        print(f"\n{C_YELLOW}{'='*70}{C_RESET}")
+        print_status("STOPPING SERVICE", "info")
+        run_root(["systemctl", "stop", name])
+        run_root(["systemctl", "disable", name])
+        
+        svc_file = f"/etc/systemd/system/{name}.service"
+        if os.path.exists(svc_file):
+            os.remove(svc_file)
+        run_root(["systemctl", "daemon-reload"])
+        print_status("Service stopped and disabled", "success")
+        
+        print_status("REMOVING CLOUDFLARE ROUTE", "info")
+        cloudflare.remove_route(svc['domain'])
+        print_status("Route removed", "success")
+        
+        print_status("DELETING SERVICE DATA", "info")
+        service_root = get_service_path(svc['storage_path'], name)
+        if os.path.exists(service_root):
+            shutil.rmtree(service_root)
+        
+        db_root = os.path.join(svc['storage_path'], "database", name)
+        if os.path.exists(db_root):
+            shutil.rmtree(db_root)
+        print_status("Data deleted", "success")
+        
+        print_status("UPDATING DATABASE", "info")
+        db.query("DELETE FROM services WHERE id=?", (svc['id'],))
+        print_status("Database updated", "success")
+        
+        audit_log("DESTROY", name, {"domain": svc['domain'], "port": svc['port']})
+        
+        print(f"\n{C_GREEN}{'='*70}{C_RESET}")
+        print_status(f"SERVICE '{name}' DESTROYED", "success")
+        print(f"{C_GREEN}{'='*70}{C_RESET}\n")
+        
+    except Exception as e:
+        logger.error(f"Destroy failed: {e}")
+        print_status(f"Destruction failed: {e}", "error")
+    
+    input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+def view_service_logs():
+    """View service logs with options"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ SERVICE LOGS ═══{C_RESET}\n")
+    
+    name = input("Service Name: ").strip()
+    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    
+    if not svc:
+        print_status("Service not found", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    service_path = get_service_path(svc['storage_path'], name)
+    log_dir = os.path.join(service_path, "logs")
+    
+    print(f"\n{C_CYAN}Available Logs:{C_RESET}")
+    print("  1. Access Log (Gunicorn requests)")
+    print("  2. Error Log (Application errors)")
+    print("  3. Stdout Log (Standard output)")
+    print("  4. Stderr Log (Standard error)")
+    print("  5. Live tail (real-time)")
+    print("  0. Cancel")
+    
+    choice = input(f"\n{C_CYAN}Select log:{C_RESET} ").strip()
+    
+    log_files = {
+        "1": "access.log",
+        "2": "error.log",
+        "3": "stdout.log",
+        "4": "stderr.log",
+        "5": "access.log"
+    }
+    
+    if choice == "0":
+        return
+    
+    if choice not in log_files:
+        print_status("Invalid choice", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    log_file = os.path.join(log_dir, log_files[choice])
+    
+    if not os.path.exists(log_file):
+        print_status(f"Log file not found: {log_files[choice]}", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    if choice == "5":
+        print(f"\n{C_CYAN}{'═'*70}{C_RESET}")
+        print(f"{C_CYAN}Streaming live logs (Ctrl+C to stop)...{C_RESET}")
+        print(f"{C_CYAN}{'═'*70}{C_RESET}\n")
+        try:
+            subprocess.run(["tail", "-f", log_file])
+        except KeyboardInterrupt:
+            print(f"\n\n{C_CYAN}{'═'*70}{C_RESET}")
+            print_status("Log streaming stopped", "info")
+    else:
+        print(f"\n{C_CYAN}{'═'*70}{C_RESET}")
+        print(f"{C_CYAN}Last 50 lines of {log_files[choice]}:{C_RESET}")
+        print(f"{C_CYAN}{'═'*70}{C_RESET}\n")
+        
+        try:
+            result = subprocess.run(
+                ["tail", "-n", "50", log_file],
+                capture_output=True,
+                text=True
+            )
+            print(result.stdout)
+        except Exception as e:
+            print_status(f"Error reading log: {e}", "error")
+    
+    print(f"\n{C_CYAN}{'═'*70}{C_RESET}")
+    input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+def service_operations():
+    """Service management operations menu"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ SERVICE OPERATIONS ═══{C_RESET}\n")
+    
+    name = input("Service Name: ").strip()
+    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    
+    if not svc:
+        print_status("Service not found", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    print(f"\n{C_CYAN}Current Service Status:{C_RESET}\n")
+    result = subprocess.run(
+        ["systemctl", "status", name, "--no-pager", "-l"],
+        capture_output=True,
+        text=True
+    )
+    
+    is_active = "active (running)" in result.stdout
+    status_icon = f"{C_GREEN}●{C_RESET}" if is_active else f"{C_RED}●{C_RESET}"
+    print(f"  {status_icon} Service is {'ACTIVE' if is_active else 'INACTIVE'}\n")
+    
+    print(f"{C_CYAN}Available Operations:{C_RESET}")
+    print("  1. Restart service")
+    print("  2. Stop service")
+    print("  3. Start service")
+    print("  4. Git pull & restart")
+    print("  5. View full systemd status")
+    print("  6. View resource usage")
+    print("  0. Cancel")
+    
+    choice = input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
+    
+    try:
+        if choice == "1":
+            print(f"\n{C_YELLOW}{'═'*70}{C_RESET}")
+            print_status("Restarting service...", "info")
+            run_root(["systemctl", "restart", name])
+            time.sleep(2)
+            
+            result = subprocess.run(
+                ["systemctl", "is-active", name],
+                capture_output=True
+            )
+            if result.stdout.strip() == b"active":
+                print_status("Service restarted successfully", "success")
+                audit_log("RESTART", name)
+            else:
+                print_status("Service restart may have failed", "warning")
+            
+            print(f"{C_YELLOW}{'═'*70}{C_RESET}\n")
+            
+        elif choice == "2":
+            print(f"\n{C_YELLOW}{'═'*70}{C_RESET}")
+            print_status("Stopping service...", "info")
+            run_root(["systemctl", "stop", name])
+            time.sleep(1)
+            print_status("Service stopped", "success")
+            audit_log("STOP", name)
+            print(f"{C_YELLOW}{'═'*70}{C_RESET}\n")
+            
+        elif choice == "3":
+            print(f"\n{C_YELLOW}{'═'*70}{C_RESET}")
+            print_status("Starting service...", "info")
+            run_root(["systemctl", "start", name])
+            time.sleep(2)
+            
+            result = subprocess.run(
+                ["systemctl", "is-active", name],
+                capture_output=True
+            )
+            if result.stdout.strip() == b"active":
+                print_status("Service started successfully", "success")
+                audit_log("START", name)
+            else:
+                print_status("Service start may have failed", "warning")
+                print_status("Check logs for details", "info")
+            
+            print(f"{C_YELLOW}{'═'*70}{C_RESET}\n")
+            
+        elif choice == "4":
+            print(f"\n{C_YELLOW}{'═'*70}{C_RESET}")
+            service_path = get_service_path(svc['storage_path'], name)
+            
+            print_status("Fetching latest code from repository...", "info")
+            returncode, stdout, stderr = run_as_gaia(
+                ["git", "pull"], 
+                cwd=service_path, 
+                capture=True
+            )
+            
+            if returncode == 0:
+                print_status("Code updated successfully", "success")
+                
+                if "Already up to date" in stdout or "Already up-to-date" in stdout:
+                    print(f"  {C_CYAN}└─ No new changes{C_RESET}")
+                else:
+                    print(f"  {C_CYAN}└─ {stdout.strip()[:100]}{C_RESET}")
+                
+                print_status("Restarting service with new code...", "info")
+                run_root(["systemctl", "restart", name])
+                time.sleep(2)
+                
+                result = subprocess.run(
+                    ["systemctl", "is-active", name],
+                    capture_output=True
+                )
+                if result.stdout.strip() == b"active":
+                    print_status("Service updated and restarted successfully", "success")
+                    audit_log("UPDATE", name, {"method": "git_pull"})
+                else:
+                    print_status("Service restart failed after update", "error")
+                    print_status("Rolling back may be required", "warning")
+            else:
+                print_status("Git pull failed", "error")
+                print(f"  {C_RED}└─ {stderr.strip()[:100]}{C_RESET}")
+            
+            print(f"{C_YELLOW}{'═'*70}{C_RESET}\n")
+            
+        elif choice == "5":
+            print(f"\n{C_CYAN}{'═'*70}{C_RESET}")
+            print(f"{C_CYAN}Full Systemd Status:{C_RESET}")
+            print(f"{C_CYAN}{'═'*70}{C_RESET}\n")
+            subprocess.run(["systemctl", "status", name, "--no-pager", "-l"])
+            print(f"\n{C_CYAN}{'═'*70}{C_RESET}\n")
+            
+        elif choice == "6":
+            print(f"\n{C_CYAN}{'═'*70}{C_RESET}")
+            print(f"{C_CYAN}Resource Usage:{C_RESET}")
+            print(f"{C_CYAN}{'═'*70}{C_RESET}\n")
+            
+            if psutil:
+                found = False
+                for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                    try:
+                        cmdline = ' '.join(proc.info['cmdline'] or [])
+                        if name in cmdline and 'gunicorn' in cmdline:
+                            cpu_percent = proc.cpu_percent(interval=1)
+                            memory_info = proc.memory_info()
+                            memory_mb = memory_info.rss / (1024 * 1024)
+                            
+                            print(f"  {C_BOLD}PID:{C_RESET}          {proc.pid}")
+                            print(f"  {C_BOLD}CPU Usage:{C_RESET}    {cpu_percent:.1f}%")
+                            print(f"  {C_BOLD}Memory:{C_RESET}       {memory_mb:.1f} MB")
+                            print(f"  {C_BOLD}Threads:{C_RESET}      {proc.num_threads()}")
+                            
+                            try:
+                                connections = proc.connections()
+                                established = len([c for c in connections if c.status == 'ESTABLISHED'])
+                                print(f"  {C_BOLD}Connections:{C_RESET}  {established} active")
+                            except:
+                                pass
+                            
+                            print()
+                            found = True
+                            break
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                
+                if not found:
+                    print_status("Process information not available", "warning")
+            else:
+                print_status("psutil not installed - cannot show resource usage", "warning")
+            
+            print(f"{C_CYAN}{'═'*70}{C_RESET}\n")
+            
+        elif choice == "0":
+            return
+        else:
+            print_status("Invalid choice", "error")
+        
+    except Exception as e:
+        logger.error(f"Operation failed: {e}")
+        print_status(f"Operation failed: {e}", "error")
+    
+    if choice not in ["5", "0"]:
+        input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+# ==============================================================================
+#   BACKUP SYSTEM
+# ==============================================================================
+
+def backup_service():
+    """Enhanced backup with detailed information"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ BACKUP CENTER ═══{C_RESET}\n")
+    
+    name = input("Service to Backup: ").strip()
+    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    
+    if not svc:
+        print_status("Service not found", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    try:
+        if not os.path.exists(BACKUP_DIR):
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            shutil.chown(BACKUP_DIR, user=SERVICE_USER, group=SERVICE_GROUP)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{name}_{timestamp}"
+        
+        service_path = get_service_path(svc['storage_path'], name)
+        backup_path = os.path.join(BACKUP_DIR, filename)
+        
+        print(f"\n{C_YELLOW}{'='*70}{C_RESET}")
+        print_status("Analyzing service data...", "info")
+        
+        total_size = 0
+        file_count = 0
+        for dirpath, dirnames, filenames in os.walk(service_path):
+            for filename_iter in filenames:
+                filepath = os.path.join(dirpath, filename_iter)
+                try:
+                    total_size += os.path.getsize(filepath)
+                    file_count += 1
+                except:
+                    pass
+        
+        print(f"  {C_CYAN}└─ {file_count} files, {total_size / (1024*1024):.2f} MB{C_RESET}")
+        
+        print_status("Creating compressed archive...", "info")
+        start_time = time.time()
+        shutil.make_archive(backup_path, 'zip', service_path)
+        compression_time = time.time() - start_time
+        
+        archive_file = backup_path + ".zip"
+        file_size = os.path.getsize(archive_file)
+        compression_ratio = (1 - file_size / total_size) * 100 if total_size > 0 else 0
+        
+        print(f"  {C_CYAN}└─ Compressed in {compression_time:.2f}s ({compression_ratio:.1f}% reduction){C_RESET}")
+        
+        print_status("Calculating checksum...", "info")
+        checksum = calculate_file_hash(archive_file)
+        print(f"  {C_CYAN}└─ SHA256: {checksum[:32]}...{C_RESET}")
+        
+        db.query(
+            "INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
+            (name, filename + ".zip", file_size, checksum)
+        )
+        
+        if PROMETHEUS_AVAILABLE:
+            BACKUP_COUNTER.inc()
+        
+        audit_log("BACKUP", name, {
+            "filename": filename + ".zip", 
+            "size_bytes": file_size,
+            "file_count": file_count,
+            "checksum": checksum[:16]
+        })
+        
+        print(f"{C_YELLOW}{'='*70}{C_RESET}\n")
+        
+        print(f"{C_GREEN}{'='*70}{C_RESET}")
+        print(f"{C_GREEN}{C_BOLD}✓ BACKUP CREATED SUCCESSFULLY{C_RESET}")
+        print(f"{C_GREEN}{'='*70}{C_RESET}\n")
+        
+        print(f"{C_CYAN}Backup Details:{C_RESET}\n")
+        print(f"  {C_BOLD}Service:{C_RESET}       {name}")
+        print(f"  {C_BOLD}Filename:{C_RESET}      {filename}.zip")
+        print(f"  {C_BOLD}Location:{C_RESET}      {BACKUP_DIR}")
+        print(f"  {C_BOLD}Size:{C_RESET}          {file_size / (1024*1024):.2f} MB")
+        print(f"  {C_BOLD}Files:{C_RESET}         {file_count}")
+        print(f"  {C_BOLD}Compression:{C_RESET}   {compression_ratio:.1f}% reduction")
+        print(f"  {C_BOLD}Time:{C_RESET}          {compression_time:.2f}s")
+        print(f"  {C_BOLD}Checksum:{C_RESET}      {checksum[:32]}...")
+        print(f"  {C_BOLD}Timestamp:{C_RESET}     {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        print(f"\n{C_GREEN}{'='*70}{C_RESET}\n")
+        
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+        print(f"\n{C_RED}{'='*70}{C_RESET}")
+        print_status(f"Backup failed: {e}", "error")
+        print(f"{C_RED}{'='*70}{C_RESET}\n")
+    
+    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+def list_backups():
+    """List all backups with detailed information"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ BACKUP HISTORY ═══{C_RESET}\n")
+    
+    backups = db.query(
+        "SELECT * FROM backups ORDER BY timestamp DESC LIMIT 30", 
+        fetch_all=True
+    )
+    
+    if not backups:
+        print_status("No backups found", "warning")
+        print(f"\n{C_CYAN}Use option [6] to create your first backup.{C_RESET}\n")
+        input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    print(f"{C_CYAN}Total Backups: {C_BOLD}{len(backups)}{C_RESET}\n")
+    
+    total_size = sum(b['size_bytes'] or 0 for b in backups)
+    print(f"{C_CYAN}Total Storage Used: {C_BOLD}{total_size / (1024**3):.2f} GB{C_RESET}\n")
+    
+    print(f"{C_BOLD}{'#':<4} {'SERVICE':<15} {'SIZE':<12} {'DATE':<20} {'CHECKSUM'}{C_RESET}")
+    print(f"{C_CYAN}{'─'*80}{C_RESET}")
+    
+    for idx, backup in enumerate(backups, 1):
+        size_mb = backup['size_bytes'] / (1024*1024) if backup['size_bytes'] else 0
+        timestamp = backup['timestamp'][:19]
+        checksum_short = backup['checksum'][:16] if backup['checksum'] else "N/A"
+        
+        print(f"{idx:<4} {backup['service_name']:<15} {size_mb:>8.2f} MB  {timestamp:<20} {checksum_short}...")
+    
+    print(f"{C_CYAN}{'─'*80}{C_RESET}\n")
+    
+    print(f"{C_CYAN}Backup Location:{C_RESET} {BACKUP_DIR}\n")
+    
+    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+def view_deployment_history():
+    """View deployment history with detailed information"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ DEPLOYMENT HISTORY ═══{C_RESET}\n")
+    
+    deployments = db.query(
+        "SELECT * FROM deployments ORDER BY timestamp DESC LIMIT 30", 
+        fetch_all=True
+    )
+    
+    if not deployments:
+        print_status("No deployment history", "warning")
+        print(f"\n{C_CYAN}Deployment history will appear here after your first deployment.{C_RESET}\n")
+        input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    total = len(deployments)
+    successful = sum(1 for d in deployments if d['status'] == 'success')
+    failed = total - successful
+    success_rate = (successful / total * 100) if total > 0 else 0
+    avg_duration = sum(d['duration_seconds'] or 0 for d in deployments) / total if total > 0 else 0
+    
+    print(f"{C_CYAN}Statistics:{C_RESET}\n")
+    print(f"  {C_BOLD}Total Deployments:{C_RESET}  {total}")
+    print(f"  {C_BOLD}Successful:{C_RESET}         {C_GREEN}{successful}{C_RESET}")
+    print(f"  {C_BOLD}Failed:{C_RESET}             {C_RED}{failed}{C_RESET}")
+    print(f"  {C_BOLD}Success Rate:{C_RESET}       {success_rate:.1f}%")
+    print(f"  {C_BOLD}Avg Duration:{C_RESET}       {avg_duration:.2f}s")
+    print()
+    
+    print(f"{C_BOLD}{'#':<4} {'SERVICE':<15} {'STATUS':<12} {'DURATION':<12} {'TIMESTAMP'}{C_RESET}")
+    print(f"{C_CYAN}{'─'*80}{C_RESET}")
+    
+    for idx, dep in enumerate(deployments, 1):
+        if dep['status'] == 'success':
+            status_str = f"{C_GREEN}✓ SUCCESS{C_RESET}"
+        else:
+            status_str = f"{C_RED}✗ FAILED{C_RESET}"
+        
+        duration = f"{dep['duration_seconds']:.2f}s" if dep['duration_seconds'] else "N/A"
+        timestamp = dep['timestamp'][:19]
+        
+        print(f"{idx:<4} {dep['service_name']:<15} {status_str:<20} {duration:<12} {timestamp}")
+        
+        if dep['error_message']:
+            error_short = dep['error_message'][:60]
+            print(f"     {C_YELLOW}└─ Error: {error_short}...{C_RESET}")
+    
+    print(f"{C_CYAN}{'─'*80}{C_RESET}\n")
+    
+    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+def export_metrics():
+    """Export Prometheus metrics with feedback"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ METRICS EXPORT ═══{C_RESET}\n")
+    
+    if not PROMETHEUS_AVAILABLE:
+        print_status("Prometheus client not installed", "error")
+        print(f"\n{C_YELLOW}Install with: pip install prometheus-client{C_RESET}\n")
+        input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+    
+    try:
+        print_status("Collecting metrics...", "info")
+        
+        services = db.query("SELECT * FROM services", fetch_all=True)
+        metrics_count = 0
+        
+        for svc in services:
+            result = subprocess.run(
+                ["systemctl", "is-active", svc['name']], 
+                stdout=subprocess.PIPE
+            )
+            is_active = 1 if result.stdout.strip() == b"active" else 0
+            SERVICE_STATUS.labels(service=svc['name']).set(is_active)
+            metrics_count += 1
+        
+        print(f"  {C_CYAN}└─ {metrics_count} service metrics collected{C_RESET}")
+        
+        print_status("Writing metrics to file...", "info")
+        with open(METRICS_FILE, 'wb') as f:
+            f.write(generate_latest(REGISTRY))
+        
+        file_size = os.path.getsize(METRICS_FILE)
+        
+        print(f"  {C_CYAN}└─ {file_size} bytes written{C_RESET}")
+        
+        print(f"\n{C_GREEN}{'='*70}{C_RESET}")
+        print(f"{C_GREEN}{C_BOLD}✓ METRICS EXPORTED SUCCESSFULLY{C_RESET}")
+        print(f"{C_GREEN}{'='*70}{C_RESET}\n")
+        
+        print(f"{C_CYAN}Export Details:{C_RESET}\n")
+        print(f"  {C_BOLD}File:{C_RESET}          {METRICS_FILE}")
+        print(f"  {C_BOLD}Size:{C_RESET}          {file_size} bytes")
+        print(f"  {C_BOLD}Metrics:{C_RESET}       {metrics_count} services")
+        print(f"  {C_BOLD}Timestamp:{C_RESET}     {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        print(f"\n{C_CYAN}Usage:{C_RESET}")
+        print(f"  Configure Prometheus to scrape: file://{METRICS_FILE}")
+        
+        print(f"\n{C_GREEN}{'='*70}{C_RESET}\n")
+        
+        logger.info("Prometheus metrics exported")
+        
+    except Exception as e:
+        logger.error(f"Metrics export failed: {e}")
+        print_status(f"Metrics export failed: {e}", "error")
+    
+    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+# ==============================================================================
+#   DIAGNOSTICS
+# ==============================================================================
+
+async def run_diagnostics():
+    """Comprehensive system diagnostics"""
+    print_header()
+    print(f"{C_YELLOW}{C_BOLD}═══ ATS SYSTEM DIAGNOSTICS ═══{C_RESET}\n")
+    
+    checks = []
+    
+    print_status("Running diagnostic checks...", "info")
+    print()
+    
+    root_ok = os.geteuid() == 0
+    checks.append(("Root Access", root_ok))
+    print(f"{'Root Access':<30} {C_GREEN + '✓ PASS' + C_RESET if root_ok else C_RED + '✗ FAIL' + C_RESET}")
+    
+    db_ok = os.path.exists(DB_FILE) and os.access(DB_FILE, os.W_OK)
+    checks.append(("Database", db_ok))
+    print(f"{'Database Access':<30} {C_GREEN + '✓ PASS' + C_RESET if db_ok else C_RED + '✗ FAIL' + C_RESET}")
+    
+    cf_ok = os.path.exists(CLOUDFLARE_CONFIG)
+    checks.append(("Cloudflare Config", cf_ok))
+    print(f"{'Cloudflare Configuration':<30} {C_GREEN + '✓ PASS' + C_RESET if cf_ok else C_RED + '✗ FAIL' + C_RESET}")
+    
+    result = subprocess.run(["systemctl", "is-active", "cloudflared"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    cf_svc_ok = result.stdout.strip() == b"active"
+    checks.append(("Cloudflare Service", cf_svc_ok))
+    print(f"{'Cloudflare Service':<30} {C_GREEN + '✓ PASS' + C_RESET if cf_svc_ok else C_RED + '✗ FAIL' + C_RESET}")
+    
+    inet_ok = subprocess.call(["ping", "-c", "1", "-W", "2", "1.1.1.1"], 
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    checks.append(("Internet", inet_ok))
+    print(f"{'Internet Connectivity':<30} {C_GREEN + '✓ PASS' + C_RESET if inet_ok else C_RED + '✗ FAIL' + C_RESET}")
+    
+    storage_ok = os.path.exists(DEFAULT_STORAGE) and os.access(DEFAULT_STORAGE, os.W_OK)
+    checks.append(("Default Storage", storage_ok))
+    print(f"{'Default Storage':<30} {C_GREEN + '✓ PASS' + C_RESET if storage_ok else C_RED + '✗ FAIL' + C_RESET}")
+    
+    deps_ok = True
+    for module in ['yaml', 'psutil']:
+        try:
+            __import__(module)
+        except:
+            deps_ok = False
+            break
+    checks.append(("Python Dependencies", deps_ok))
+    print(f"{'Python Dependencies':<30} {C_GREEN + '✓ PASS' + C_RESET if deps_ok else C_RED + '✗ FAIL' + C_RESET}")
+    
+    print(f"\n{C_CYAN}Service Health Checks:{C_RESET}\n")
+    services = db.query("SELECT * FROM services", fetch_all=True)
+    
+    if services:
+        health_results = await parallel_health_checks(services)
+        for svc in services:
+            is_healthy = health_results.get(svc['name'], False)
+            status_str = C_GREEN + "HEALTHY" + C_RESET if is_healthy else C_RED + "UNHEALTHY" + C_RESET
+            print(f"  {svc['name']:<20} {status_str}")
+    else:
+        print("  No services deployed")
+    
+    print(f"\n{C_CYAN}System Resources:{C_RESET}\n")
+    if psutil:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        print(f"  CPU Usage:    {cpu_percent:.1f}%")
+        print(f"  Memory:       {mem.used / (1024**3):.1f} GB / {mem.total / (1024**3):.1f} GB ({mem.percent:.1f}%)")
+        print(f"  Disk:         {disk.used / (1024**3):.1f} GB / {disk.total / (1024**3):.1f} GB ({disk.percent:.1f}%)")
+    else:
+        print("  psutil not available - install for detailed metrics")
+    
+    passed = sum(1 for _, ok in checks if ok)
+    total = len(checks)
+    
+    print(f"\n{C_CYAN}{'='*70}{C_RESET}")
+    if passed == total:
+        print(f"{C_GREEN}{C_BOLD}✓ ALL CHECKS PASSED ({passed}/{total}){C_RESET}")
+    else:
+        print(f"{C_YELLOW}{C_BOLD}⚠ {passed}/{total} CHECKS PASSED{C_RESET}")
+    print(f"{C_CYAN}{'='*70}{C_RESET}\n")
+    
+    input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
+
+def ats_doctor():
+    """Wrapper for async diagnostics"""
+    asyncio.run(run_diagnostics())
+
+# ==============================================================================
+#   TELEMETRY
+# ==============================================================================
+
+async def get_telemetry_async() -> Tuple[float, str, str, int]:
+    """Get system telemetry asynchronously"""
+    if not psutil:
+        return 0.0, "N/A", "N/A", 0
+    
+    cpu = psutil.cpu_percent(interval=0.1)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    services = db.query("SELECT * FROM services WHERE status='active'", fetch_all=True)
+    active_count = len(services) if services else 0
+    
+    ram_str = f"{mem.used/(1024**3):.1f}/{mem.total/(1024**3):.1f}GB"
+    disk_str = f"{disk.used/(1024**3):.0f}/{disk.total/(1024**3):.0f}GB"
+    
+    return cpu, ram_str, disk_str, active_count
+
+# ==============================================================================
+#   MAIN MENU
+# ==============================================================================
+
+def main_menu():
+    """Main interactive menu"""
+    while True:
+        try:
+            print_header()
+            
+            cpu, ram, disk, svc_count = asyncio.run(get_telemetry_async())
+            print(f"{C_CYAN}┌{'─'*68}┐{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} {C_BOLD}System:{C_RESET} CPU {cpu:.1f}%  │  RAM {ram}  │  Disk {disk}  │  Services {svc_count} {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}└{'─'*68}┘{C_RESET}\n")
+            
+            services = db.query("SELECT * FROM services ORDER BY name", fetch_all=True)
+            
+            print(f"{C_BOLD}{'NAME':<15} {'PORT':<8} {'STATUS':<12} {'DOMAIN'}{C_RESET}")
+            print(f"{C_CYAN}{'─'*70}{C_RESET}")
+            
+            if services:
+                health_results = asyncio.run(parallel_health_checks(services))
+                
+                for svc in services:
+                    is_healthy = health_results.get(svc['name'], False)
+                    
+                    if is_healthy:
+                        status_str = f"{C_GREEN}●{C_RESET} ONLINE"
+                    else:
+                        status_str = f"{C_RED}●{C_RESET} OFFLINE"
+                    
+                    print(f"{svc['name']:<15} {svc['port']:<8} {status_str:<20} {svc['domain']}")
+            else:
+                print(f"{C_YELLOW}No services deployed{C_RESET}")
+            
+            print(f"{C_CYAN}{'─'*70}{C_RESET}\n")
+            
+            print(f"{C_CYAN}┌─ DEPLOYMENT ──────────────┬─ MANAGEMENT ──────────────┐{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} [1] Deploy Service         {C_CYAN}│{C_RESET} [5] Service Operations     {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} [2] List Services          {C_CYAN}│{C_RESET} [6] Backup Service         {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} [3] Destroy Service        {C_CYAN}│{C_RESET} [7] List Backups           {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} [4] View Logs              {C_CYAN}│{C_RESET} [8] Export Metrics         {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}└───────────────────────────┴───────────────────────────┘{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} [9] Deployment History     {C_CYAN}│{C_RESET} [D] System Diagnostics     {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}└───────────────────────────┴───────────────────────────┘{C_RESET}")
+            print(f"  {C_RED}[0] Exit{C_RESET}")
+            
+            choice = input(f"\n{C_CYAN}{C_BOLD}ATS>{C_RESET} ").strip().lower()
+            
+            if choice == "1":
+                deploy_service()
+            elif choice == "2":
+                list_services_detailed()
+            elif choice == "3":
+                destroy_service()
+            elif choice == "4":
+                view_service_logs()
+            elif choice == "5":
+                service_operations()
+            elif choice == "6":
+                backup_service()
+            elif choice == "7":
+                list_backups()
+            elif choice == "8":
+                export_metrics()
+            elif choice == "9":
+                view_deployment_history()
+            elif choice == "d":
+                ats_doctor()
+            elif choice == "0":
+                print(f"\n{C_CYAN}{'═'*70}{C_RESET}")
+                print(f"{C_CYAN}Thank you for using ATS v7.0!{C_RESET}")
+                print(f"{C_CYAN}{'═'*70}{C_RESET}\n")
+                sys.exit(0)
+            else:
+                print_status("Invalid choice", "warning")
+                time.sleep(1)
+                
+        except KeyboardInterrupt:
+            print(f"\n\n{C_YELLOW}Use option [0] to exit properly.{C_RESET}\n")
+            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Menu error: {e}")
+            print_status(f"Error: {e}", "error")
+            time.sleep(2)
+
+# ==============================================================================
+#   ENTRY POINT
+# ==============================================================================
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print(f"{C_RED}ERROR: ATS requires root privileges.{C_RESET}")
+        print(f"Run: sudo python3 {sys.argv[0]}")
+        sys.exit(1)
+    
+    if not os.path.exists(ATS_HOME):
+        os.makedirs(ATS_HOME, exist_ok=True)
+        os.chmod(ATS_HOME, 0o700)
+    
+    lock = acquire_lock()
+    
+    print_header()
+    print(f"{C_GREEN}Initializing ATS v7.0...{C_RESET}\n")
+    time.sleep(0.5)
+    
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print(f"\n\n{C_CYAN}Shutting down ATS...{C_RESET}\n")
+        sys.exit(0)
+    except Exception as e:
+        logger.critical(f"Critical error: {e}")
+        print(f"\n{C_RED}CRITICAL ERROR: {e}{C_RESET}\n")
+        sys.exit(1)
