@@ -2516,16 +2516,16 @@ def main_menu():
 
             print(f"{C_CYAN}┌─ DEPLOYMENT ────────────────┬─ MANAGEMENT ──────────────┐{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} [1] Deploy Service         {C_CYAN}│{C_RESET} [5] Service Operations     {C_CYAN}│{C_RESET}")
+                f"{C_CYAN}│{C_RESET} [1] Deploy Service          {C_CYAN}│{C_RESET} [5] Service Operations     {C_CYAN}│{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} [2] List Services          {C_CYAN}│{C_RESET} [6] Backup Service         {C_CYAN}│{C_RESET}")
+                f"{C_CYAN}│{C_RESET} [2] List Services           {C_CYAN}│{C_RESET} [6] Backup Service         {C_CYAN}│{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} [3] Destroy Service        {C_CYAN}│{C_RESET} [7] List Backups           {C_CYAN}│{C_RESET}")
+                f"{C_CYAN}│{C_RESET} [3] Destroy Service         {C_CYAN}│{C_RESET} [7] List Backups           {C_CYAN}│{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} [4] View Logs              {C_CYAN}│{C_RESET} [8] Export Metrics         {C_CYAN}│{C_RESET}")
+                f"{C_CYAN}│{C_RESET} [4] View Logs               {C_CYAN}│{C_RESET} [8] Export Metrics         {C_CYAN}│{C_RESET}")
             print(f"{C_CYAN}└─────────────────────────────┴───────────────────────────┘{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} [9] Deployment History     {C_CYAN}│{C_RESET} [D] System Diagnostics     {C_CYAN}│{C_RESET}")
+                f"{C_CYAN}│{C_RESET} [9] Deployment History      {C_CYAN}│{C_RESET} [D] System Diagnostics     {C_CYAN}│{C_RESET}")
             print(f"{C_CYAN}└─────────────────────────────┴───────────────────────────┘{C_RESET}")
             print(f"  {C_RED}[0] Exit{C_RESET}")
 
