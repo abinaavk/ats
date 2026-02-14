@@ -1183,7 +1183,7 @@ def view_service_logs():
 
 
 def service_operations():
-    """Service management operations menu - WORKING VERSION"""
+    """Service management operations menu - ENHANCED"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ SERVICE OPERATIONS ═══{C_RESET}\n")
 
@@ -1234,10 +1234,9 @@ def service_operations():
     print("  2. Stop service")
     print("  3. Start service")
     print("  4. Git pull and restart")
-    print("  5. View systemd status")
-    print("  6. View resource usage")
-    print("  7. View error logs")
-    print("  8. View access logs")
+    print("  5. Reinstall dependencies (pip install -r requirements.txt)")
+    print("  6. View systemd status")
+    print("  7. View resource usage")
     print("  0. Cancel")
 
     choice = input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
@@ -1329,6 +1328,76 @@ def service_operations():
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
     elif choice == "5":
+        # REINSTALL DEPENDENCIES
+        print(f"\n{C_YELLOW}Reinstalling dependencies...{C_RESET}")
+        try:
+            service_path = get_service_path(svc['storage_path'], name)
+            requirements_file = os.path.join(service_path, "requirements.txt")
+
+            if not os.path.exists(requirements_file):
+                print(f"{C_RED}✗ requirements.txt not found{C_RESET}")
+                print(f"  Expected: {requirements_file}")
+            else:
+                pip_path = os.path.join(service_path, "venv", "bin", "pip")
+
+                if not os.path.exists(pip_path):
+                    print(f"{C_RED}✗ Virtual environment not found{C_RESET}")
+                    print(f"  Expected: {pip_path}")
+                else:
+                    print("Upgrading pip...")
+                    try:
+                        run_as_gaia([pip_path, "install", "--upgrade", "pip"], cwd=service_path, timeout=120)
+                        print(f"{C_GREEN}✓ Pip upgraded{C_RESET}")
+                    except Exception as e:
+                        print(f"{C_YELLOW}⚠ Pip upgrade warning: {e}{C_RESET}")
+
+                    print("\nInstalling requirements.txt...")
+                    try:
+                        returncode, stdout, stderr = run_as_gaia(
+                            [pip_path, "install", "-r", "requirements.txt"],
+                            cwd=service_path,
+                            capture=True,
+                            timeout=600
+                        )
+
+                        if returncode == 0:
+                            print(f"{C_GREEN}✓ Dependencies installed successfully{C_RESET}")
+
+                            # Show installed packages count
+                            if "Successfully installed" in stdout:
+                                packages = stdout.split("Successfully installed")[1].split("\n")[0]
+                                print(f"  Installed: {packages.strip()}")
+
+                            print(f"\n{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
+                            if input().strip().lower() == "yes":
+                                print("\nRestarting service...")
+                                subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+                                time.sleep(2)
+
+                                result = subprocess.run(["systemctl", "is-active", name], capture_output=True,
+                                                        timeout=5)
+                                if result.stdout.strip() == b"active":
+                                    print(f"{C_GREEN}✓ Service restarted{C_RESET}")
+                                    audit_log("REINSTALL_DEPS", name)
+                                else:
+                                    print(f"{C_RED}✗ Service restart failed{C_RESET}")
+                            else:
+                                print(f"{C_YELLOW}Restart cancelled - changes will apply on next restart{C_RESET}")
+                        else:
+                            print(f"{C_RED}✗ Installation failed{C_RESET}")
+                            if stderr:
+                                print(f"\nError output:")
+                                print(stderr[:500])
+                    except TimeoutError:
+                        print(f"{C_RED}✗ Installation timed out (>10 minutes){C_RESET}")
+                    except Exception as e:
+                        print(f"{C_RED}✗ Installation error: {e}{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}✗ Error: {e}{C_RESET}")
+
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "6":
         # SYSTEMD STATUS
         print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
         try:
@@ -1339,80 +1408,65 @@ def service_operations():
 
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-    elif choice == "6":
+    elif choice == "7":
         # RESOURCE USAGE
         print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
         print(f"{C_CYAN}Resource Usage:{C_RESET}\n")
 
         if psutil:
             found = False
+            total_cpu = 0.0
+            total_memory = 0.0
+            process_count = 0
+
             try:
                 for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                     try:
                         cmdline = ' '.join(proc.info['cmdline'] or [])
                         if name in cmdline and 'gunicorn' in cmdline:
-                            print(f"PID:         {proc.pid}")
-                            print(f"CPU:         {proc.cpu_percent(interval=0.5):.1f}%")
-                            print(f"Memory:      {proc.memory_info().rss / (1024 * 1024):.1f} MB")
-                            print(f"Threads:     {proc.num_threads()}")
+                            cpu = proc.cpu_percent(interval=0.5)
+                            mem = proc.memory_info().rss / (1024 * 1024)
+
+                            print(f"PID {proc.pid}:")
+                            print(f"  CPU:         {cpu:.1f}%")
+                            print(f"  Memory:      {mem:.1f} MB")
+                            print(f"  Threads:     {proc.num_threads()}")
                             print()
+
+                            total_cpu += cpu
+                            total_memory += mem
+                            process_count += 1
                             found = True
-                            break
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         continue
 
-                if not found:
-                    print(f"{C_YELLOW}No process found{C_RESET}")
+                if found:
+                    print(f"{C_BOLD}Total ({process_count} processes):{C_RESET}")
+                    print(f"  CPU:         {total_cpu:.1f}%")
+                    print(f"  Memory:      {total_memory:.1f} MB")
+
+                    # Show limits
+                    print(f"\n{C_BOLD}Configured Limits:{C_RESET}")
+                    print(f"  CPU Quota:   {svc['cpu_quota']}%")
+                    print(f"  Memory Max:  {svc['max_memory_mb']} MB")
+
+                    # Calculate usage percentages
+                    cpu_usage = (total_cpu / svc['cpu_quota']) * 100 if svc['cpu_quota'] > 0 else 0
+                    mem_usage = (total_memory / svc['max_memory_mb']) * 100 if svc['max_memory_mb'] > 0 else 0
+
+                    print(f"\n{C_BOLD}Usage vs Limits:{C_RESET}")
+                    cpu_color = C_RED if cpu_usage > 90 else C_YELLOW if cpu_usage > 70 else C_GREEN
+                    mem_color = C_RED if mem_usage > 90 else C_YELLOW if mem_usage > 70 else C_GREEN
+                    print(f"  CPU:         {cpu_color}{cpu_usage:.1f}%{C_RESET}")
+                    print(f"  Memory:      {mem_color}{mem_usage:.1f}%{C_RESET}")
+                else:
+                    print(f"{C_YELLOW}No Gunicorn processes found{C_RESET}")
+                    print(f"Service may not be running")
             except Exception as e:
                 print(f"{C_RED}Error: {e}{C_RESET}")
         else:
             print(f"{C_YELLOW}psutil not installed{C_RESET}")
-
-        print(f"{C_CYAN}{'═' * 70}{C_RESET}")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-
-    elif choice == "7":
-        # ERROR LOGS
-        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
-        print(f"{C_RED}Error Log:{C_RESET}\n")
-
-        try:
-            service_path = get_service_path(svc['storage_path'], name)
-            error_log = os.path.join(service_path, "logs", "error.log")
-
-            if os.path.exists(error_log):
-                result = subprocess.run(["tail", "-n", "20", error_log], capture_output=True, text=True, timeout=5)
-                if result.stdout.strip():
-                    print(result.stdout)
-                else:
-                    print(f"{C_GREEN}(No errors){C_RESET}")
-            else:
-                print(f"{C_YELLOW}Log file not found{C_RESET}")
-        except Exception as e:
-            print(f"{C_RED}Error: {e}{C_RESET}")
-
-        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-
-    elif choice == "8":
-        # ACCESS LOGS
-        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
-        print(f"{C_GREEN}Access Log:{C_RESET}\n")
-
-        try:
-            service_path = get_service_path(svc['storage_path'], name)
-            access_log = os.path.join(service_path, "logs", "access.log")
-
-            if os.path.exists(access_log):
-                result = subprocess.run(["tail", "-n", "20", access_log], capture_output=True, text=True, timeout=5)
-                if result.stdout.strip():
-                    print(result.stdout)
-                else:
-                    print(f"{C_YELLOW}(No requests yet){C_RESET}")
-            else:
-                print(f"{C_YELLOW}Log file not found{C_RESET}")
-        except Exception as e:
-            print(f"{C_RED}Error: {e}{C_RESET}")
+            print(f"\nInstall with: pip install psutil")
 
         print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
@@ -1423,7 +1477,6 @@ def service_operations():
     else:
         print(f"\n{C_RED}Invalid choice{C_RESET}")
         time.sleep(1)
-
 
 # ==============================================================================
 #   BACKUP SYSTEM - FIXED
