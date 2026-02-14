@@ -116,13 +116,17 @@ def print_header():
     os.system('clear')
     print(f"{C_CYAN}{C_BOLD}")
     print(r"""
-       _/_/    _/_/_/_/_/    _/_/_/   
-    _/    _/      _/      _/          
-   _/_/_/_/      _/        _/_/       
-  _/    _/      _/            _/      
- _/    _/      _/      _/_/_/         
+        █████╗ ████████╗███████╗
+       ██╔══██╗╚══██╔══╝██╔════╝
+       ███████║   ██║   ███████╗
+       ██╔══██║   ██║   ╚════██║
+       ██║  ██║   ██║   ███████║
+       ╚═╝  ╚═╝   ╚═╝   ╚══════╝
 
-    AUTOMATED TECH STACK v7.0
+      ░▒▓ AUTOMATED TECH STACK ▓▒░
+      ─────────────────────────────
+            Version 7.0 | ATS
+    Hardened • Automated • Scalable
     """ + f"{C_RESET}")
     print(f"{C_CYAN}{'=' * 70}{C_RESET}")
 
@@ -781,9 +785,7 @@ async def deploy_service_async():
         if db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
             raise ValueError(f"Service '{name}' already exists")
 
-        storage = validate_storage(
-            input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip() or DEFAULT_STORAGE
-        )
+        storage = validate_storage(input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip() or DEFAULT_STORAGE)
 
         print(f"\n{C_CYAN}Domain Configuration:{C_RESET}")
         print(f"  1. Subdomain of {MAIN_DOMAIN}")
@@ -809,16 +811,7 @@ async def deploy_service_async():
         cpu_input = input(f"  CPU Quota % [50]: ").strip()
         cpu_quota = int(cpu_input) if cpu_input else 50
 
-        config = ServiceConfig(
-            name=name,
-            port=port,
-            domain=domain,
-            storage_path=storage,
-            repo_url=repo_url,
-            workers=workers,
-            max_memory_mb=max_memory,
-            cpu_quota=cpu_quota
-        )
+        config = ServiceConfig(name=name, port=port, domain=domain, storage_path=storage, repo_url=repo_url, workers=workers, max_memory_mb=max_memory, cpu_quota=cpu_quota)
 
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print_status("PROVISIONING INFRASTRUCTURE", "info")
@@ -838,11 +831,7 @@ async def deploy_service_async():
         print_status(f"Created: {log_dir}", "success")
 
         print_status("CLONING REPOSITORY", "info")
-        returncode, stdout, stderr = await run_async_command(
-            ["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, "."],
-            cwd=api_dir,
-            timeout=300
-        )
+        returncode, stdout, stderr = await run_async_command(["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, "."], cwd=api_dir, timeout=300)
         if returncode != 0:
             raise RuntimeError(f"Git clone failed: {stderr}")
         print_status("Repository cloned successfully", "success")
@@ -897,29 +886,17 @@ async def deploy_service_async():
 
         deployment_hash = calculate_file_hash(requirements_file) if os.path.exists(requirements_file) else "none"
 
-        db.query(
-            """INSERT INTO services 
-            (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
-        )
+        db.query("""INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash))
 
         duration = time.time() - start_time
-        db.query(
-            "INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
-            (name, "success", duration)
-        )
+        db.query("INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",(name, "success", duration))
 
         if PROMETHEUS_AVAILABLE:
             DEPLOY_COUNTER.labels(status='success').inc()
             DEPLOY_DURATION.observe(duration)
 
-        audit_log("DEPLOY_SUCCESS", name, {
-            "domain": domain,
-            "port": port,
-            "duration": duration,
-            "workers": config.workers
-        })
+        audit_log("DEPLOY_SUCCESS", name, {"domain": domain, "port": port, "duration": duration, "workers": config.workers})
 
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print(f"{C_GREEN}{C_BOLD}✓ DEPLOYMENT SUCCESSFUL{C_RESET}")
@@ -973,10 +950,7 @@ async def deploy_service_async():
 
         duration = time.time() - start_time
         if name:
-            db.query(
-                "INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",
-                (name, "failed", duration, str(e))
-            )
+            db.query("INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",(name, "failed", duration, str(e)))
 
         if PROMETHEUS_AVAILABLE:
             DEPLOY_COUNTER.labels(status='failed').inc()
@@ -1141,9 +1115,11 @@ def view_service_logs():
         print_status("Service not found", "error")
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
         return
-
+    
+    print(svc)
     service_path = get_service_path(svc['storage_path'], name)
     log_dir = os.path.join(service_path, "logs")
+    print(service_path, log_dir)
 
     print(f"\n{C_CYAN}Available Logs:{C_RESET}")
     print("  1. Access Log (Gunicorn requests)")
@@ -2103,8 +2079,7 @@ def main_menu():
 
             cpu, ram, disk, svc_count = asyncio.run(get_telemetry_async())
             print(f"{C_CYAN}┌{'─' * 68}┐{C_RESET}")
-            print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}System:{C_RESET} CPU {cpu:.1f}%  │  RAM {ram}  │  Disk {disk}  │  Services {svc_count} {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} {C_BOLD}System:{C_RESET} CPU {cpu:.1f}%  │  RAM {ram}  │  Disk {disk}  │  Services {svc_count} {C_CYAN}│{C_RESET}")
             print(f"{C_CYAN}└{'─' * 68}┘{C_RESET}\n")
 
             services = db.query("SELECT * FROM services ORDER BY name", fetch_all=True)
@@ -2129,7 +2104,7 @@ def main_menu():
 
             print(f"{C_CYAN}{'─' * 70}{C_RESET}\n")
 
-            print(f"{C_CYAN}┌─ DEPLOYMENT ──────────────┬─ MANAGEMENT ──────────────┐{C_RESET}")
+            print(f"{C_CYAN}┌─ DEPLOYMENT ───────────────┬─ MANAGEMENT ──────────────┐{C_RESET}")
             print(
                 f"{C_CYAN}│{C_RESET} [1] Deploy Service         {C_CYAN}│{C_RESET} [5] Service Operations     {C_CYAN}│{C_RESET}")
             print(
@@ -2141,7 +2116,7 @@ def main_menu():
             print(f"{C_CYAN}└───────────────────────────┴───────────────────────────┘{C_RESET}")
             print(
                 f"{C_CYAN}│{C_RESET} [9] Deployment History     {C_CYAN}│{C_RESET} [D] System Diagnostics     {C_CYAN}│{C_RESET}")
-            print(f"{C_CYAN}└───────────────────────────┴───────────────────────────┘{C_RESET}")
+            print(f"{C_CYAN}└────────────────────────────┴───────────────────────────┘{C_RESET}")
             print(f"  {C_RED}[0] Exit{C_RESET}")
 
             choice = input(f"\n{C_CYAN}{C_BOLD}ATS>{C_RESET} ").strip().lower()
