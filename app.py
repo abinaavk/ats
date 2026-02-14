@@ -1330,7 +1330,7 @@ def service_operations():
 
     elif choice == "5":
 
-        # REINSTALL DEPENDENCIES WITH AUTO-FIX
+        # REINSTALL DEPENDENCIES WITH AUTO-REBUILD
 
         print(f"\n{C_YELLOW}Reinstalling dependencies...{C_RESET}")
 
@@ -1342,13 +1342,9 @@ def service_operations():
 
             venv_path = os.path.join(service_path, "venv")
 
-            pip_path = os.path.join(venv_path, "bin", "pip3")  # Changed to pip3
-
             print(f"Service path: {service_path}")
 
             print(f"Virtual env:  {venv_path}")
-
-            print(f"Pip path:     {pip_path}\n")
 
             # Step 1: Check service directory exists
 
@@ -1368,30 +1364,37 @@ def service_operations():
 
                 return
 
-            # Step 3: Check if venv exists
+            # Step 3: Determine which pip to use
 
-            venv_exists = os.path.exists(venv_path)
+            pip3_path = os.path.join(venv_path, "bin", "pip3")
 
-            pip_exists = os.path.exists(pip_path)
+            pip_path = os.path.join(venv_path, "bin", "pip")
 
-            # Also check for regular pip if pip3 doesn't exist
+            # Check which one exists
 
-            if not pip_exists:
+            if os.path.exists(pip3_path):
 
-                pip_path_alt = os.path.join(venv_path, "bin", "pip")
+                pip_executable = pip3_path
 
-                if os.path.exists(pip_path_alt):
-                    pip_path = pip_path_alt
+                print(f"Pip path:     {pip_executable}\n")
 
-                    pip_exists = True
+            elif os.path.exists(pip_path):
 
-            if not venv_exists:
+                pip_executable = pip_path
 
-                print(f"{C_RED}✗ Virtual environment not found{C_RESET}")
+                print(f"Pip path:     {pip_executable}\n")
 
-                print(f"\n{C_YELLOW}The venv directory is missing. This needs to be recreated.{C_RESET}")
+            else:
 
-                print(f"{C_CYAN}Create virtual environment now? (yes/no):{C_RESET} ", end='')
+                # Neither pip nor pip3 found - venv is missing or corrupted
+
+                print(f"Pip path:     {pip3_path} (not found)\n")
+
+                print(f"{C_RED}✗ Virtual environment is missing or corrupted{C_RESET}")
+
+                print(f"{C_YELLOW}Neither pip3 nor pip found in venv/bin/{C_RESET}\n")
+
+                print(f"{C_CYAN}Would you like to rebuild the virtual environment? (yes/no):{C_RESET} ", end='')
 
                 if input().strip().lower() != "yes":
                     print(f"{C_YELLOW}Cancelled{C_RESET}")
@@ -1400,27 +1403,43 @@ def service_operations():
 
                     return
 
-                # Create venv
+                # REBUILD VENV
 
-                print(f"\n{C_CYAN}Creating virtual environment...{C_RESET}")
+                print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
+
+                print(f"{C_YELLOW}REBUILDING VIRTUAL ENVIRONMENT{C_RESET}")
+
+                print(f"{C_YELLOW}{'=' * 70}{C_RESET}\n")
+
+                # Step 1: Remove old venv if it exists
+
+                if os.path.exists(venv_path):
+
+                    print(f"{C_CYAN}Removing corrupted venv...{C_RESET}")
+
+                    try:
+
+                        shutil.rmtree(venv_path)
+
+                        print(f"{C_GREEN}✓ Old venv removed{C_RESET}")
+
+                    except Exception as e:
+
+                        print(f"{C_RED}✗ Failed to remove old venv: {e}{C_RESET}")
+
+                        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+                        return
+
+                # Step 2: Create fresh venv
+
+                print(f"\n{C_CYAN}Creating new virtual environment...{C_RESET}")
 
                 try:
 
                     run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=service_path, timeout=120)
 
                     print(f"{C_GREEN}✓ Virtual environment created{C_RESET}")
-
-                    venv_exists = True
-
-                    # Check which pip exists after creation
-
-                    pip_path = os.path.join(venv_path, "bin", "pip3")
-
-                    if not os.path.exists(pip_path):
-                        pip_path = os.path.join(venv_path, "bin", "pip")
-
-                    pip_exists = os.path.exists(pip_path)
-
 
                 except Exception as e:
 
@@ -1430,24 +1449,35 @@ def service_operations():
 
                     return
 
-            if not pip_exists:
-                print(f"{C_RED}✗ Pip executable not found (venv corrupted){C_RESET}")
+                # Step 3: Determine which pip was created
 
-                print(f"  Looked for: {pip_path}")
+                if os.path.exists(pip3_path):
 
-                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    pip_executable = pip3_path
 
-                return
+                elif os.path.exists(pip_path):
 
-            # Step 4: Upgrade pip
+                    pip_executable = pip_path
 
-            print(f"\n{C_CYAN}Upgrading pip...{C_RESET}")
+                else:
+
+                    print(f"{C_RED}✗ Failed to create pip executable{C_RESET}")
+
+                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+                    return
+
+                print(f"{C_GREEN}✓ Using: {pip_executable}{C_RESET}")
+
+            # Step 4: Upgrade pip and setuptools
+
+            print(f"\n{C_CYAN}Upgrading pip and setuptools...{C_RESET}")
 
             try:
 
                 returncode, stdout, stderr = run_as_gaia(
 
-                    [pip_path, "install", "--upgrade", "pip", "setuptools"],
+                    [pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"],
 
                     cwd=service_path,
 
@@ -1469,7 +1499,7 @@ def service_operations():
 
                 print(f"{C_YELLOW}⚠ Pip upgrade warning: {e}{C_RESET}")
 
-            # Step 5: Install requirements
+            # Step 5: Install requirements.txt
 
             print(f"\n{C_CYAN}Installing requirements.txt...{C_RESET}")
 
@@ -1481,7 +1511,7 @@ def service_operations():
 
                 returncode, stdout, stderr = run_as_gaia(
 
-                    [pip_path, "install", "-r", "requirements.txt"],
+                    [pip_executable, "install", "-r", "requirements.txt"],
 
                     cwd=service_path,
 
@@ -1510,27 +1540,49 @@ def service_operations():
 
                             print(f"  {C_CYAN}Installed {pkg_count} packages{C_RESET}")
 
-                    # Install gunicorn if not in requirements
+                    # Step 6: Install gunicorn (essential for service)
 
-                    print(f"\n{C_CYAN}Ensuring gunicorn is installed...{C_RESET}")
+                    print(f"\n{C_CYAN}Installing gunicorn...{C_RESET}")
 
                     try:
 
-                        run_as_gaia([pip_path, "install", "gunicorn"], cwd=service_path, timeout=60)
+                        returncode, stdout, stderr = run_as_gaia(
 
-                        print(f"{C_GREEN}✓ Gunicorn ready{C_RESET}")
+                            [pip_executable, "install", "gunicorn"],
 
-                    except:
+                            cwd=service_path,
 
-                        pass
+                            capture=True,
 
-                    # Offer to restart
+                            timeout=60
 
-                    print(f"\n{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
+                        )
+
+                        if returncode == 0:
+
+                            print(f"{C_GREEN}✓ Gunicorn installed{C_RESET}")
+
+                        else:
+
+                            print(f"{C_YELLOW}⚠ Gunicorn installation warning{C_RESET}")
+
+                    except Exception as e:
+
+                        print(f"{C_YELLOW}⚠ Gunicorn warning: {e}{C_RESET}")
+
+                    # Step 7: Offer to restart service
+
+                    print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
+
+                    print(f"{C_GREEN}All dependencies installed successfully!{C_RESET}")
+
+                    print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
+
+                    print(f"{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
 
                     if input().strip().lower() == "yes":
 
-                        print(f"\n{C_YELLOW}Restarting service...{C_RESET}")
+                        print(f"\n{C_YELLOW}Restarting {name}...{C_RESET}")
 
                         try:
 
@@ -1552,7 +1604,7 @@ def service_operations():
 
                                 print(f"{C_GREEN}✓ Service restarted successfully{C_RESET}")
 
-                                # Quick health check
+                                # Health check
 
                                 time.sleep(1)
 
@@ -1562,15 +1614,16 @@ def service_operations():
 
                                 else:
 
-                                    print(f"{C_YELLOW}⚠ Service active but port not responding yet{C_RESET}")
+                                    print(
+                                        f"{C_YELLOW}⚠ Service active but port not responding yet (may need more time){C_RESET}")
 
-                                audit_log("REINSTALL_DEPS", name)
+                                audit_log("REINSTALL_DEPS", name, {"rebuilt_venv": True})
 
                             else:
 
                                 print(f"{C_RED}✗ Service failed to start{C_RESET}")
 
-                                print(f"{C_YELLOW}Check logs with option 6 or journalctl -u {name}{C_RESET}")
+                                print(f"{C_YELLOW}Check logs: journalctl -u {name} -n 50{C_RESET}")
 
                         except Exception as e:
 
@@ -1578,7 +1631,8 @@ def service_operations():
 
                     else:
 
-                        print(f"{C_YELLOW}Restart cancelled - changes will apply on next restart{C_RESET}")
+                        print(
+                            f"{C_YELLOW}Restart cancelled - service will use new dependencies on next restart{C_RESET}")
 
 
                 else:
@@ -1599,7 +1653,7 @@ def service_operations():
 
                 print(f"{C_RED}✗ Installation timed out after 10 minutes{C_RESET}")
 
-                print(f"{C_YELLOW}Large packages may take longer. Try again or install manually.{C_RESET}")
+                print(f"{C_YELLOW}Large packages may take longer. Try again or check network.{C_RESET}")
 
             except Exception as e:
 
