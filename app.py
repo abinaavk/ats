@@ -1349,6 +1349,7 @@ def service_operations():
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
 
+
     elif choice == "5":
 
         # REINSTALL DEPENDENCIES WITH AUTO-REBUILD
@@ -1690,6 +1691,7 @@ def service_operations():
             traceback.print_exc()
 
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
 
 
     elif choice == "6":
