@@ -1342,7 +1342,7 @@ def service_operations():
 
             venv_path = os.path.join(service_path, "venv")
 
-            pip_path = os.path.join(venv_path, "bin", "pip")
+            pip_path = os.path.join(venv_path, "bin", "pip3")  # Changed to pip3
 
             print(f"Service path: {service_path}")
 
@@ -1374,6 +1374,17 @@ def service_operations():
 
             pip_exists = os.path.exists(pip_path)
 
+            # Also check for regular pip if pip3 doesn't exist
+
+            if not pip_exists:
+
+                pip_path_alt = os.path.join(venv_path, "bin", "pip")
+
+                if os.path.exists(pip_path_alt):
+                    pip_path = pip_path_alt
+
+                    pip_exists = True
+
             if not venv_exists:
 
                 print(f"{C_RED}✗ Virtual environment not found{C_RESET}")
@@ -1401,7 +1412,15 @@ def service_operations():
 
                     venv_exists = True
 
+                    # Check which pip exists after creation
+
+                    pip_path = os.path.join(venv_path, "bin", "pip3")
+
+                    if not os.path.exists(pip_path):
+                        pip_path = os.path.join(venv_path, "bin", "pip")
+
                     pip_exists = os.path.exists(pip_path)
+
 
                 except Exception as e:
 
@@ -1413,6 +1432,8 @@ def service_operations():
 
             if not pip_exists:
                 print(f"{C_RED}✗ Pip executable not found (venv corrupted){C_RESET}")
+
+                print(f"  Looked for: {pip_path}")
 
                 input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
