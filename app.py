@@ -174,7 +174,7 @@ def audit_log(action: str, target: str, metadata: Optional[Dict] = None):
         "timestamp": datetime.datetime.now().isoformat(),
         "action": action,
         "target": target,
-        "user": getpass.getuser(),  # FIXED: Using getpass instead of os.getlogin()
+        "user": os.environ.get('SUDO_USER', getpass.getuser()),  # FIXED: Using getpass instead of os.getlogin()
         "metadata": metadata or {}
     }
     try:
@@ -473,11 +473,25 @@ def run_root(cmd: List[str], timeout: int = 60):
 
 
 def get_service_path(storage: str, name: str) -> str:
-    """Get service directory path"""
-    legacy = os.path.join(storage, "websites", name)
-    if os.path.exists(legacy):
-        return legacy
-    return os.path.join(storage, "api", name)
+    """
+    Intelligently determines service path.
+    Handles legacy (/websites), standard (/api), and nested input errors.
+    """
+    # 1. Clean the input
+    base = os.path.abspath(storage)
+
+    # 2. Check if storage input ALREADY points to a parent container
+    #    (e.g., if storage was saved as "/opt/websites")
+    if base.endswith("/websites") or base.endswith("/api"):
+        return os.path.join(base, name)
+
+    # 3. Check Priority 1: Legacy 'websites' folder (Gaia Sentinel)
+    legacy_path = os.path.join(base, "websites", name)
+    if os.path.exists(legacy_path):
+        return legacy_path
+
+    # 4. Default: Standard 'api' folder (Pinnacle & New Apps)
+    return os.path.join(base, "api", name)
 
 
 def calculate_file_hash(filepath: str) -> str:
@@ -1116,10 +1130,17 @@ def view_service_logs():
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
         return
 
-    print(svc)
+    # Remove debug prints for production
     service_path = get_service_path(svc['storage_path'], name)
     log_dir = os.path.join(service_path, "logs")
-    print(service_path, log_dir)
+
+    # Auto-create log dir if missing (prevents crashes on fresh repos)
+    if not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            shutil.chown(log_dir, user=SERVICE_USER, group=SERVICE_GROUP)
+        except:
+            pass
 
     print(f"\n{C_CYAN}Available Logs:{C_RESET}")
     print("  1. Access Log (Gunicorn requests)")
