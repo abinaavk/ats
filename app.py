@@ -1327,75 +1327,228 @@ def service_operations():
 
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
+
     elif choice == "5":
+
         # REINSTALL DEPENDENCIES
+
         print(f"\n{C_YELLOW}Reinstalling dependencies...{C_RESET}")
+
         try:
+
             service_path = get_service_path(svc['storage_path'], name)
+
             requirements_file = os.path.join(service_path, "requirements.txt")
 
+            print(f"Service path: {service_path}")
+
+            # Verify service path exists
+
+            if not os.path.exists(service_path):
+                print(f"{C_RED}✗ Service directory not found{C_RESET}")
+
+                print(f"  Expected: {service_path}")
+
+                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+                return
+
+            # Check for requirements.txt
+
             if not os.path.exists(requirements_file):
+
                 print(f"{C_RED}✗ requirements.txt not found{C_RESET}")
+
                 print(f"  Expected: {requirements_file}")
+
+                # List what's in the directory
+
+                try:
+
+                    files = os.listdir(service_path)
+
+                    print(f"\n  Files in {service_path}:")
+
+                    for f in files[:10]:
+                        print(f"    - {f}")
+
+                except:
+
+                    pass
+
             else:
-                pip_path = os.path.join(service_path, "venv", "bin", "pip")
 
-                if not os.path.exists(pip_path):
-                    print(f"{C_RED}✗ Virtual environment not found{C_RESET}")
+                venv_path = os.path.join(service_path, "venv")
+
+                pip_path = os.path.join(venv_path, "bin", "pip")
+
+                print(f"Virtual env: {venv_path}")
+
+                print(f"Pip path:    {pip_path}")
+
+                # Verify venv exists
+
+                if not os.path.exists(venv_path):
+
+                    print(f"\n{C_RED}✗ Virtual environment not found{C_RESET}")
+
+                    print(f"  Expected: {venv_path}")
+
+                    print(f"\n{C_YELLOW}The venv may need to be recreated. Contact admin.{C_RESET}")
+
+                elif not os.path.exists(pip_path):
+
+                    print(f"\n{C_RED}✗ Pip executable not found{C_RESET}")
+
                     print(f"  Expected: {pip_path}")
-                else:
-                    print("Upgrading pip...")
-                    try:
-                        run_as_gaia([pip_path, "install", "--upgrade", "pip"], cwd=service_path, timeout=120)
-                        print(f"{C_GREEN}✓ Pip upgraded{C_RESET}")
-                    except Exception as e:
-                        print(f"{C_YELLOW}⚠ Pip upgrade warning: {e}{C_RESET}")
 
-                    print("\nInstalling requirements.txt...")
+                    print(f"\n{C_YELLOW}The venv may be corrupted. Contact admin.{C_RESET}")
+
+                else:
+
+                    # Everything exists, proceed with installation
+
+                    print(f"\n{C_CYAN}Upgrading pip...{C_RESET}")
+
                     try:
+
                         returncode, stdout, stderr = run_as_gaia(
-                            [pip_path, "install", "-r", "requirements.txt"],
+
+                            [pip_path, "install", "--upgrade", "pip"],
+
                             cwd=service_path,
+
                             capture=True,
-                            timeout=600
+
+                            timeout=120
+
                         )
 
                         if returncode == 0:
+
+                            print(f"{C_GREEN}✓ Pip upgraded{C_RESET}")
+
+                        else:
+
+                            print(f"{C_YELLOW}⚠ Pip upgrade had warnings{C_RESET}")
+
+                    except Exception as e:
+
+                        print(f"{C_YELLOW}⚠ Pip upgrade warning: {e}{C_RESET}")
+
+                    print(f"\n{C_CYAN}Installing requirements.txt...{C_RESET}")
+
+                    print(f"  This may take several minutes...")
+
+                    try:
+
+                        returncode, stdout, stderr = run_as_gaia(
+
+                            [pip_path, "install", "-r", "requirements.txt"],
+
+                            cwd=service_path,
+
+                            capture=True,
+
+                            timeout=600
+
+                        )
+
+                        if returncode == 0:
+
                             print(f"{C_GREEN}✓ Dependencies installed successfully{C_RESET}")
 
-                            # Show installed packages count
+                            # Show what was installed
+
                             if "Successfully installed" in stdout:
-                                packages = stdout.split("Successfully installed")[1].split("\n")[0]
-                                print(f"  Installed: {packages.strip()}")
+
+                                packages_line = [line for line in stdout.split("\n") if
+                                                 "Successfully installed" in line]
+
+                                if packages_line:
+                                    print(f"\n  {packages_line[0]}")
+
+                            # Count requirements
+
+                            try:
+
+                                with open(requirements_file, 'r') as f:
+
+                                    req_count = len([line for line in f if line.strip() and not line.startswith('#')])
+
+                                print(f"  Total requirements: {req_count}")
+
+                            except:
+
+                                pass
 
                             print(f"\n{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
+
                             if input().strip().lower() == "yes":
-                                print("\nRestarting service...")
+
+                                print(f"\n{C_YELLOW}Restarting service...{C_RESET}")
+
                                 subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+
                                 time.sleep(2)
 
                                 result = subprocess.run(["systemctl", "is-active", name], capture_output=True,
                                                         timeout=5)
+
                                 if result.stdout.strip() == b"active":
-                                    print(f"{C_GREEN}✓ Service restarted{C_RESET}")
+
+                                    print(f"{C_GREEN}✓ Service restarted successfully{C_RESET}")
+
                                     audit_log("REINSTALL_DEPS", name)
+
                                 else:
+
                                     print(f"{C_RED}✗ Service restart failed{C_RESET}")
+
+                                    print(f"{C_YELLOW}Check logs for errors{C_RESET}")
+
                             else:
+
                                 print(f"{C_YELLOW}Restart cancelled - changes will apply on next restart{C_RESET}")
+
                         else:
+
                             print(f"{C_RED}✗ Installation failed{C_RESET}")
+
+                            print(f"\n{C_YELLOW}Error output:{C_RESET}")
+
                             if stderr:
-                                print(f"\nError output:")
-                                print(stderr[:500])
+
+                                # Show last 20 lines of error
+
+                                error_lines = stderr.split("\n")[-20:]
+
+                                for line in error_lines:
+
+                                    if line.strip():
+                                        print(f"  {line}")
+
+
                     except TimeoutError:
+
                         print(f"{C_RED}✗ Installation timed out (>10 minutes){C_RESET}")
+
+                        print(f"{C_YELLOW}Some packages may be very large or network is slow{C_RESET}")
+
                     except Exception as e:
+
                         print(f"{C_RED}✗ Installation error: {e}{C_RESET}")
+
         except Exception as e:
+
             print(f"{C_RED}✗ Error: {e}{C_RESET}")
 
+            import traceback
+
+            traceback.print_exc()
+
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
 
     elif choice == "6":
         # SYSTEMD STATUS
