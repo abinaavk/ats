@@ -1183,160 +1183,178 @@ def view_service_logs():
 
 
 def service_operations():
-    """Service management operations menu"""
+    """Service management operations menu - WORKING VERSION"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ SERVICE OPERATIONS ═══{C_RESET}\n")
 
     name = input("Service Name: ").strip()
+
+    if not name:
+        print_status("Service name cannot be empty", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+
     svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
 
     if not svc:
         print_status("Service not found", "error")
+
+        all_services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
+        if all_services:
+            print(f"\n{C_CYAN}Available services:{C_RESET}")
+            for s in all_services:
+                print(f"  - {s['name']}")
+
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
         return
 
-    print(f"\n{C_CYAN}Current Service Status:{C_RESET}\n")
-    result = subprocess.run(
-        ["systemctl", "status", name, "--no-pager", "-l"],
-        capture_output=True,
-        text=True
-    )
+    # Show service info
+    print(f"\n{C_CYAN}Service: {C_BOLD}{name}{C_RESET}")
+    print(f"Domain:  https://{svc['domain']}")
+    print(f"Port:    {svc['port']}\n")
 
-    is_active = "active (running)" in result.stdout
-    status_icon = f"{C_GREEN}●{C_RESET}" if is_active else f"{C_RED}●{C_RESET}"
-    print(f"  {status_icon} Service is {'ACTIVE' if is_active else 'INACTIVE'}\n")
+    # Check status
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True,
+            timeout=5
+        )
+        is_active = result.stdout.strip() == b"active"
+        status_icon = f"{C_GREEN}●{C_RESET}" if is_active else f"{C_RED}●{C_RESET}"
+        status_text = "ACTIVE" if is_active else "INACTIVE"
+        print(f"Status:  {status_icon} {status_text}\n")
+    except:
+        print(f"Status:  {C_YELLOW}UNKNOWN{C_RESET}\n")
+        is_active = False
 
-    print(f"{C_CYAN}Available Operations:{C_RESET}")
+    print(f"{C_CYAN}{'─' * 70}{C_RESET}\n")
+    print(f"{C_CYAN}Available Operations:{C_RESET}\n")
     print("  1. Restart service")
     print("  2. Stop service")
     print("  3. Start service")
-    print("  4. Git pull & restart")
-    print("  5. View full systemd status")
+    print("  4. Git pull and restart")
+    print("  5. View systemd status")
     print("  6. View resource usage")
+    print("  7. View error logs")
+    print("  8. View access logs")
     print("  0. Cancel")
 
     choice = input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
 
-    try:
-        if choice == "1":
-            print(f"\n{C_YELLOW}{'═' * 70}{C_RESET}")
-            print_status("Restarting service...", "info")
-            run_root(["systemctl", "restart", name])
+    if choice == "1":
+        # RESTART
+        print(f"\n{C_YELLOW}Restarting service...{C_RESET}")
+        try:
+            subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
             time.sleep(2)
 
-            result = subprocess.run(
-                ["systemctl", "is-active", name],
-                capture_output=True
-            )
+            result = subprocess.run(["systemctl", "is-active", name], capture_output=True, timeout=5)
             if result.stdout.strip() == b"active":
-                print_status("Service restarted successfully", "success")
+                print(f"{C_GREEN}✓ Service restarted successfully{C_RESET}")
                 audit_log("RESTART", name)
             else:
-                print_status("Service restart may have failed", "warning")
+                print(f"{C_RED}✗ Service restart failed{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}✗ Error: {e}{C_RESET}")
 
-            print(f"{C_YELLOW}{'═' * 70}{C_RESET}\n")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-        elif choice == "2":
-            print(f"\n{C_YELLOW}{'═' * 70}{C_RESET}")
-            print_status("Stopping service...", "info")
-            run_root(["systemctl", "stop", name])
-            time.sleep(1)
-            print_status("Service stopped", "success")
-            audit_log("STOP", name)
-            print(f"{C_YELLOW}{'═' * 70}{C_RESET}\n")
+    elif choice == "2":
+        # STOP
+        print(f"\n{C_RED}Stop service '{name}'? (yes/no):{C_RESET} ", end='')
+        if input().strip().lower() == "yes":
+            print(f"\n{C_YELLOW}Stopping service...{C_RESET}")
+            try:
+                subprocess.run(["systemctl", "stop", name], timeout=10, check=True)
+                time.sleep(1)
+                print(f"{C_GREEN}✓ Service stopped{C_RESET}")
+                audit_log("STOP", name)
+            except Exception as e:
+                print(f"{C_RED}✗ Error: {e}{C_RESET}")
+        else:
+            print(f"{C_YELLOW}Cancelled{C_RESET}")
 
-        elif choice == "3":
-            print(f"\n{C_YELLOW}{'═' * 70}{C_RESET}")
-            print_status("Starting service...", "info")
-            run_root(["systemctl", "start", name])
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "3":
+        # START
+        print(f"\n{C_YELLOW}Starting service...{C_RESET}")
+        try:
+            subprocess.run(["systemctl", "start", name], timeout=10, check=True)
             time.sleep(2)
 
-            result = subprocess.run(
-                ["systemctl", "is-active", name],
-                capture_output=True
-            )
+            result = subprocess.run(["systemctl", "is-active", name], capture_output=True, timeout=5)
             if result.stdout.strip() == b"active":
-                print_status("Service started successfully", "success")
+                print(f"{C_GREEN}✓ Service started successfully{C_RESET}")
                 audit_log("START", name)
             else:
-                print_status("Service start may have failed", "warning")
-                print_status("Check logs for details", "info")
+                print(f"{C_RED}✗ Service start failed{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}✗ Error: {e}{C_RESET}")
 
-            print(f"{C_YELLOW}{'═' * 70}{C_RESET}\n")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-        elif choice == "4":
-            print(f"\n{C_YELLOW}{'═' * 70}{C_RESET}")
+    elif choice == "4":
+        # GIT PULL
+        print(f"\n{C_YELLOW}Updating code...{C_RESET}")
+        try:
             service_path = get_service_path(svc['storage_path'], name)
 
-            print_status("Fetching latest code from repository...", "info")
-            returncode, stdout, stderr = run_as_gaia(
-                ["git", "pull"],
-                cwd=service_path,
-                capture=True
-            )
+            print("Pulling from git...")
+            returncode, stdout, stderr = run_as_gaia(["git", "pull"], cwd=service_path, capture=True)
 
             if returncode == 0:
-                print_status("Code updated successfully", "success")
-
+                print(f"{C_GREEN}✓ Code updated{C_RESET}")
                 if "Already up to date" in stdout or "Already up-to-date" in stdout:
-                    print(f"  {C_CYAN}└─ No new changes{C_RESET}")
-                else:
-                    print(f"  {C_CYAN}└─ {stdout.strip()[:100]}{C_RESET}")
+                    print("  (no new changes)")
 
-                print_status("Restarting service with new code...", "info")
-                run_root(["systemctl", "restart", name])
+                print("\nRestarting service...")
+                subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
                 time.sleep(2)
 
-                result = subprocess.run(
-                    ["systemctl", "is-active", name],
-                    capture_output=True
-                )
+                result = subprocess.run(["systemctl", "is-active", name], capture_output=True, timeout=5)
                 if result.stdout.strip() == b"active":
-                    print_status("Service updated and restarted successfully", "success")
+                    print(f"{C_GREEN}✓ Service restarted with new code{C_RESET}")
                     audit_log("UPDATE", name, {"method": "git_pull"})
                 else:
-                    print_status("Service restart failed after update", "error")
-                    print_status("Rolling back may be required", "warning")
+                    print(f"{C_RED}✗ Service restart failed{C_RESET}")
             else:
-                print_status("Git pull failed", "error")
-                print(f"  {C_RED}└─ {stderr.strip()[:100]}{C_RESET}")
+                print(f"{C_RED}✗ Git pull failed{C_RESET}")
+                if stderr:
+                    print(f"Error: {stderr[:200]}")
+        except Exception as e:
+            print(f"{C_RED}✗ Error: {e}{C_RESET}")
 
-            print(f"{C_YELLOW}{'═' * 70}{C_RESET}\n")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-        elif choice == "5":
-            print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
-            print(f"{C_CYAN}Full Systemd Status:{C_RESET}")
-            print(f"{C_CYAN}{'═' * 70}{C_RESET}\n")
-            subprocess.run(["systemctl", "status", name, "--no-pager", "-l"])
-            print(f"\n{C_CYAN}{'═' * 70}{C_RESET}\n")
+    elif choice == "5":
+        # SYSTEMD STATUS
+        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
+        try:
+            subprocess.run(["systemctl", "status", name, "--no-pager", "-l"], timeout=10)
+        except Exception as e:
+            print(f"{C_RED}Error: {e}{C_RESET}")
+        print(f"{C_CYAN}{'═' * 70}{C_RESET}")
 
-        elif choice == "6":
-            print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
-            print(f"{C_CYAN}Resource Usage:{C_RESET}")
-            print(f"{C_CYAN}{'═' * 70}{C_RESET}\n")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-            if psutil:
-                found = False
+    elif choice == "6":
+        # RESOURCE USAGE
+        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
+        print(f"{C_CYAN}Resource Usage:{C_RESET}\n")
+
+        if psutil:
+            found = False
+            try:
                 for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                     try:
                         cmdline = ' '.join(proc.info['cmdline'] or [])
                         if name in cmdline and 'gunicorn' in cmdline:
-                            cpu_percent = proc.cpu_percent(interval=1)
-                            memory_info = proc.memory_info()
-                            memory_mb = memory_info.rss / (1024 * 1024)
-
-                            print(f"  {C_BOLD}PID:{C_RESET}          {proc.pid}")
-                            print(f"  {C_BOLD}CPU Usage:{C_RESET}    {cpu_percent:.1f}%")
-                            print(f"  {C_BOLD}Memory:{C_RESET}       {memory_mb:.1f} MB")
-                            print(f"  {C_BOLD}Threads:{C_RESET}      {proc.num_threads()}")
-
-                            try:
-                                connections = proc.connections()
-                                established = len([c for c in connections if c.status == 'ESTABLISHED'])
-                                print(f"  {C_BOLD}Connections:{C_RESET}  {established} active")
-                            except:
-                                pass
-
+                            print(f"PID:         {proc.pid}")
+                            print(f"CPU:         {proc.cpu_percent(interval=0.5):.1f}%")
+                            print(f"Memory:      {proc.memory_info().rss / (1024 * 1024):.1f} MB")
+                            print(f"Threads:     {proc.num_threads()}")
                             print()
                             found = True
                             break
@@ -1344,23 +1362,67 @@ def service_operations():
                         continue
 
                 if not found:
-                    print_status("Process information not available", "warning")
-            else:
-                print_status("psutil not installed - cannot show resource usage", "warning")
-
-            print(f"{C_CYAN}{'═' * 70}{C_RESET}\n")
-
-        elif choice == "0":
-            return
+                    print(f"{C_YELLOW}No process found{C_RESET}")
+            except Exception as e:
+                print(f"{C_RED}Error: {e}{C_RESET}")
         else:
-            print_status("Invalid choice", "error")
+            print(f"{C_YELLOW}psutil not installed{C_RESET}")
 
-    except Exception as e:
-        logger.error(f"Operation failed: {e}")
-        print_status(f"Operation failed: {e}", "error")
+        print(f"{C_CYAN}{'═' * 70}{C_RESET}")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-    if choice not in ["5", "0"]:
-        input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+    elif choice == "7":
+        # ERROR LOGS
+        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
+        print(f"{C_RED}Error Log:{C_RESET}\n")
+
+        try:
+            service_path = get_service_path(svc['storage_path'], name)
+            error_log = os.path.join(service_path, "logs", "error.log")
+
+            if os.path.exists(error_log):
+                result = subprocess.run(["tail", "-n", "20", error_log], capture_output=True, text=True, timeout=5)
+                if result.stdout.strip():
+                    print(result.stdout)
+                else:
+                    print(f"{C_GREEN}(No errors){C_RESET}")
+            else:
+                print(f"{C_YELLOW}Log file not found{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}Error: {e}{C_RESET}")
+
+        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "8":
+        # ACCESS LOGS
+        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
+        print(f"{C_GREEN}Access Log:{C_RESET}\n")
+
+        try:
+            service_path = get_service_path(svc['storage_path'], name)
+            access_log = os.path.join(service_path, "logs", "access.log")
+
+            if os.path.exists(access_log):
+                result = subprocess.run(["tail", "-n", "20", access_log], capture_output=True, text=True, timeout=5)
+                if result.stdout.strip():
+                    print(result.stdout)
+                else:
+                    print(f"{C_YELLOW}(No requests yet){C_RESET}")
+            else:
+                print(f"{C_YELLOW}Log file not found{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}Error: {e}{C_RESET}")
+
+        print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "0":
+        return
+
+    else:
+        print(f"\n{C_RED}Invalid choice{C_RESET}")
+        time.sleep(1)
 
 
 # ==============================================================================
