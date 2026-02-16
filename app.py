@@ -779,7 +779,7 @@ def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
 # ==============================================================================
 
 async def deploy_service_async():
-    """Enhanced asynchronous service deployment"""
+    """Enhanced asynchronous service deployment - FIXED PATH HANDLING"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ DEPLOY NEW SERVICE ═══{C_RESET}\n")
 
@@ -799,7 +799,8 @@ async def deploy_service_async():
         if db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
             raise ValueError(f"Service '{name}' already exists")
 
-        storage = validate_storage(input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip() or DEFAULT_STORAGE)
+        storage = validate_storage(
+            input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip() or DEFAULT_STORAGE)
 
         print(f"\n{C_CYAN}Domain Configuration:{C_RESET}")
         print(f"  1. Subdomain of {MAIN_DOMAIN}")
@@ -825,15 +826,26 @@ async def deploy_service_async():
         cpu_input = input(f"  CPU Quota % [50]: ").strip()
         cpu_quota = int(cpu_input) if cpu_input else 50
 
-        config = ServiceConfig(name=name, port=port, domain=domain, storage_path=storage, repo_url=repo_url, workers=workers, max_memory_mb=max_memory, cpu_quota=cpu_quota)
+        config = ServiceConfig(name=name, port=port, domain=domain, storage_path=storage, repo_url=repo_url,
+                               workers=workers, max_memory_mb=max_memory, cpu_quota=cpu_quota)
 
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print_status("PROVISIONING INFRASTRUCTURE", "info")
 
-        api_dir = os.path.join(storage, "api", name)
+        # FIXED: Use get_service_path() to determine correct path structure
+        # This ensures consistency with service management operations
+        api_dir = get_service_path(storage, name)
         db_dir = os.path.join(storage, "database", name)
         log_dir = os.path.join(api_dir, "logs")
         svc_file = f"/etc/systemd/system/{name}.service"
+
+        # FIXED: Create parent directory structure if it doesn't exist
+        api_parent = os.path.dirname(api_dir)
+        if not os.path.exists(api_parent):
+            os.makedirs(api_parent, exist_ok=True)
+            shutil.chown(api_parent, user=SERVICE_USER, group=SERVICE_GROUP)
+            os.chmod(api_parent, 0o755)
+            print_status(f"Created parent: {api_parent}", "success")
 
         for directory in [api_dir, db_dir, log_dir]:
             os.makedirs(directory, exist_ok=True)
@@ -845,30 +857,67 @@ async def deploy_service_async():
         print_status(f"Created: {log_dir}", "success")
 
         print_status("CLONING REPOSITORY", "info")
-        returncode, stdout, stderr = await run_async_command(["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, "."], cwd=api_dir, timeout=300)
-        if returncode != 0:
-            raise RuntimeError(f"Git clone failed: {stderr}")
-        print_status("Repository cloned successfully", "success")
+
+        # FIXED: Better error handling for git clone
+        try:
+            returncode, stdout, stderr = await run_async_command(
+                ["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, "."],
+                cwd=api_dir,
+                timeout=300
+            )
+            if returncode != 0:
+                # Show more detailed error
+                error_msg = stderr.strip() if stderr else "Unknown git error"
+                raise RuntimeError(f"Git clone failed: {error_msg}")
+
+            print_status("Repository cloned successfully", "success")
+
+            # Verify critical files exist
+            app_file = os.path.join(api_dir, "app.py")
+            if not os.path.exists(app_file):
+                print_status("Warning: app.py not found in repository root", "warning")
+                print(f"  {C_YELLOW}Make sure your Flask app is named 'app.py'{C_RESET}")
+
+        except Exception as git_error:
+            raise RuntimeError(f"Repository clone failed: {git_error}")
 
         print_status("CREATING PYTHON VIRTUAL ENVIRONMENT", "info")
         run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=api_dir, timeout=120)
 
+        # FIXED: Check for both pip and pip3
+        pip3_path = os.path.join(api_dir, "venv", "bin", "pip3")
         pip_path = os.path.join(api_dir, "venv", "bin", "pip")
 
-        run_as_gaia([pip_path, "install", "--upgrade", "pip"], cwd=api_dir)
+        if os.path.exists(pip3_path):
+            pip_executable = pip3_path
+        elif os.path.exists(pip_path):
+            pip_executable = pip_path
+        else:
+            raise RuntimeError("Failed to create virtual environment (no pip found)")
+
+        print_status(f"Using pip: {os.path.basename(pip_executable)}", "info")
+
+        run_as_gaia([pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=api_dir)
 
         requirements_file = os.path.join(api_dir, "requirements.txt")
         if os.path.exists(requirements_file):
             print_status("Installing requirements.txt", "info")
-            run_as_gaia([pip_path, "install", "-r", "requirements.txt"], cwd=api_dir, timeout=600)
+            try:
+                run_as_gaia([pip_executable, "install", "-r", "requirements.txt"], cwd=api_dir, timeout=600)
+                print_status("Dependencies installed", "success")
+            except Exception as pip_error:
+                raise RuntimeError(f"Failed to install requirements: {pip_error}")
         else:
-            print_status("Installing default Flask stack", "warning")
-            run_as_gaia([pip_path, "install", "flask", "flask-cors"], cwd=api_dir)
+            print_status("No requirements.txt found, installing default Flask stack", "warning")
+            run_as_gaia([pip_executable, "install", "flask", "flask-cors"], cwd=api_dir)
 
-        run_as_gaia([pip_path, "install", "gunicorn"], cwd=api_dir)
+        run_as_gaia([pip_executable, "install", "gunicorn"], cwd=api_dir)
 
         if PROMETHEUS_AVAILABLE:
-            run_as_gaia([pip_path, "install", "prometheus-flask-exporter"], cwd=api_dir)
+            try:
+                run_as_gaia([pip_executable, "install", "prometheus-flask-exporter"], cwd=api_dir)
+            except:
+                print_status("Prometheus exporter installation skipped", "warning")
 
         print_status("Python environment ready", "success")
 
@@ -892,7 +941,20 @@ async def deploy_service_async():
         health_ok = health_check_deployment(name, port)
 
         if not health_ok:
-            raise RuntimeError("Service failed health checks")
+            # Show logs to help diagnose
+            print(f"\n{C_YELLOW}Service failed to start. Recent logs:{C_RESET}")
+            try:
+                result = subprocess.run(
+                    ["journalctl", "-u", name, "-n", "20", "--no-pager"],
+                    capture_output=True,
+                    timeout=5
+                )
+                log_output = result.stdout.decode()
+                print(f"{C_YELLOW}{log_output}{C_RESET}")
+            except:
+                pass
+
+            raise RuntimeError("Service failed health checks - check logs above")
 
         print_status("CONFIGURING CLOUDFLARE TUNNEL", "info")
         cloudflare.add_route(domain, port)
@@ -900,17 +962,20 @@ async def deploy_service_async():
 
         deployment_hash = calculate_file_hash(requirements_file) if os.path.exists(requirements_file) else "none"
 
-        db.query("""INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        db.query(
+            """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash))
 
         duration = time.time() - start_time
-        db.query("INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",(name, "success", duration))
+        db.query("INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
+                 (name, "success", duration))
 
         if PROMETHEUS_AVAILABLE:
             DEPLOY_COUNTER.labels(status='success').inc()
             DEPLOY_DURATION.observe(duration)
 
-        audit_log("DEPLOY_SUCCESS", name, {"domain": domain, "port": port, "duration": duration, "workers": config.workers})
+        audit_log("DEPLOY_SUCCESS", name,
+                  {"domain": domain, "port": port, "duration": duration, "workers": config.workers})
 
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print(f"{C_GREEN}{C_BOLD}✓ DEPLOYMENT SUCCESSFUL{C_RESET}")
@@ -922,6 +987,7 @@ async def deploy_service_async():
         print(f"  Memory:     {C_BOLD}{max_memory}MB{C_RESET}")
         print(f"  CPU Quota:  {C_BOLD}{cpu_quota}%{C_RESET}")
         print(f"  Duration:   {C_BOLD}{duration:.2f}s{C_RESET}")
+        print(f"  Location:   {C_BOLD}{api_dir}{C_RESET}")
         print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
 
     except Exception as e:
@@ -946,9 +1012,11 @@ async def deploy_service_async():
 
             if api_dir and os.path.exists(api_dir):
                 shutil.rmtree(api_dir)
+                print_status(f"Removed: {api_dir}", "success")
 
             if db_dir and os.path.exists(db_dir):
                 shutil.rmtree(db_dir)
+                print_status(f"Removed: {db_dir}", "success")
 
             if domain:
                 try:
@@ -964,7 +1032,9 @@ async def deploy_service_async():
 
         duration = time.time() - start_time
         if name:
-            db.query("INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",(name, "failed", duration, str(e)))
+            db.query(
+                "INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",
+                (name, "failed", duration, str(e)))
 
         if PROMETHEUS_AVAILABLE:
             DEPLOY_COUNTER.labels(status='failed').inc()
