@@ -774,7 +774,7 @@ def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
 # ==============================================================================
 
 async def deploy_service_async():
-    """Enhanced asynchronous service deployment - COMPLETE"""
+    """Enhanced asynchronous service deployment - BULLETPROOF VERSION"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ DEPLOY NEW SERVICE ═══{C_RESET}\n")
 
@@ -786,8 +786,10 @@ async def deploy_service_async():
     svc_file = None
     domain = None
     name = None
+    api_parent = None
 
     try:
+        # ========== INPUT VALIDATION ==========
         name = input(f"{C_BOLD}Service Name (alphanumeric):{C_RESET} ").strip()
         if not re.match(r"^[a-zA-Z0-9_-]+$", name):
             raise ValueError("Invalid service name format")
@@ -821,58 +823,123 @@ async def deploy_service_async():
         cpu_input = input(f"  CPU Quota % [50]: ").strip()
         cpu_quota = int(cpu_input) if cpu_input else 50
 
-        config = ServiceConfig(name=name, port=port, domain=domain, storage_path=storage, repo_url=repo_url,
-                               workers=workers, max_memory_mb=max_memory, cpu_quota=cpu_quota)
+        config = ServiceConfig(
+            name=name,
+            port=port,
+            domain=domain,
+            storage_path=storage,
+            repo_url=repo_url,
+            workers=workers,
+            max_memory_mb=max_memory,
+            cpu_quota=cpu_quota
+        )
 
+        # ========== INFRASTRUCTURE PROVISIONING ==========
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print_status("PROVISIONING INFRASTRUCTURE", "info")
 
-        api_dir = os.path.join(storage, "api", name)
+        # Define all paths BEFORE creating anything
+        api_parent = os.path.join(storage, "api")
+        api_dir = os.path.join(api_parent, name)
         db_dir = os.path.join(storage, "database", name)
         log_dir = os.path.join(api_dir, "logs")
         svc_file = f"/etc/systemd/system/{name}.service"
 
-        api_parent = os.path.join(storage, "api")
-        if not os.path.exists(api_parent):
-            os.makedirs(api_parent, exist_ok=True)
+        print(f"\n{C_CYAN}Planned structure:{C_RESET}")
+        print(f"  Storage:   {storage}")
+        print(f"  API Dir:   {api_dir}")
+        print(f"  DB Dir:    {db_dir}")
+        print(f"  Logs:      {log_dir}\n")
+
+        # STEP 1: Create parent /api directory
+        try:
+            if not os.path.exists(api_parent):
+                os.makedirs(api_parent, exist_ok=True)
+                print_status(f"Created: {api_parent}", "success")
+
+            # Ensure proper ownership
             shutil.chown(api_parent, user=SERVICE_USER, group=SERVICE_GROUP)
             os.chmod(api_parent, 0o755)
-            print_status(f"Created parent: {api_parent}", "success")
 
-        os.makedirs(db_dir, exist_ok=True)
-        shutil.chown(db_dir, user=SERVICE_USER, group=SERVICE_GROUP)
-        os.chmod(db_dir, 0o750)
-        print_status(f"Created: {db_dir}", "success")
+        except Exception as e:
+            raise RuntimeError(f"Failed to create API parent directory: {e}")
 
+        # STEP 2: Create database directory (independent from code)
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            shutil.chown(db_dir, user=SERVICE_USER, group=SERVICE_GROUP)
+            os.chmod(db_dir, 0o750)
+            print_status(f"Created: {db_dir}", "success")
+        except Exception as e:
+            raise RuntimeError(f"Failed to create database directory: {e}")
+
+        # ========== CLONE REPOSITORY ==========
         print_status("CLONING REPOSITORY", "info")
+        print(f"  From: {repo_url}")
+        print(f"  To:   {api_dir}\n")
 
         try:
+            # Verify api_parent exists and is accessible
+            if not os.path.exists(api_parent):
+                raise RuntimeError(f"API parent directory disappeared: {api_parent}")
+
+            if not os.access(api_parent, os.W_OK):
+                raise RuntimeError(f"API parent directory not writable: {api_parent}")
+
+            # Clone repository (git will create the 'name' subdirectory)
             returncode, stdout, stderr = await run_async_command(
                 ["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, name],
                 cwd=api_parent,
                 timeout=300
             )
+
             if returncode != 0:
                 error_msg = stderr.strip() if stderr else "Unknown git error"
                 raise RuntimeError(f"Git clone failed: {error_msg}")
 
-            print_status(f"Repository cloned to: {api_dir}", "success")
+            # Verify clone was successful
+            if not os.path.exists(api_dir):
+                raise RuntimeError(f"Git clone completed but directory not found: {api_dir}")
 
+            print_status(f"Repository cloned successfully", "success")
+            print(f"  Location: {api_dir}\n")
+
+            # Check for app.py
             app_file = os.path.join(api_dir, "app.py")
             if not os.path.exists(app_file):
                 print_status("Warning: app.py not found in repository root", "warning")
+                print(f"  {C_YELLOW}Make sure your Flask app is named 'app.py'{C_RESET}\n")
 
         except Exception as git_error:
             raise RuntimeError(f"Repository clone failed: {git_error}")
 
-        os.makedirs(log_dir, exist_ok=True)
-        shutil.chown(log_dir, user=SERVICE_USER, group=SERVICE_GROUP)
-        os.chmod(log_dir, 0o750)
-        print_status(f"Created: {log_dir}", "success")
+        # STEP 3: Create logs directory INSIDE cloned repo
+        try:
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
 
+            shutil.chown(log_dir, user=SERVICE_USER, group=SERVICE_GROUP)
+            os.chmod(log_dir, 0o750)
+            print_status(f"Created: {log_dir}", "success")
+        except Exception as e:
+            raise RuntimeError(f"Failed to create logs directory: {e}")
+
+        # ========== PYTHON ENVIRONMENT ==========
+        print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
         print_status("CREATING PYTHON VIRTUAL ENVIRONMENT", "info")
-        run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=api_dir, timeout=120)
 
+        try:
+            # Verify we're in the right directory
+            if not os.path.exists(api_dir):
+                raise RuntimeError(f"API directory missing before venv creation: {api_dir}")
+
+            run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=api_dir, timeout=120)
+            print_status("Virtual environment created", "success")
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to create virtual environment: {e}")
+
+        # Find pip executable
         pip3_path = os.path.join(api_dir, "venv", "bin", "pip3")
         pip_path = os.path.join(api_dir, "venv", "bin", "pip")
 
@@ -881,45 +948,94 @@ async def deploy_service_async():
         elif os.path.exists(pip_path):
             pip_executable = pip_path
         else:
-            raise RuntimeError("Failed to create virtual environment (no pip found)")
+            raise RuntimeError(f"Failed to create virtual environment - no pip found in {api_dir}/venv/bin/")
 
-        run_as_gaia([pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=api_dir)
+        print(f"  Using: {os.path.basename(pip_executable)}\n")
 
+        # Upgrade pip
+        print_status("Upgrading pip...", "info")
+        try:
+            run_as_gaia(
+                [pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"],
+                cwd=api_dir,
+                timeout=120
+            )
+            print_status("Pip upgraded", "success")
+        except Exception as e:
+            print_status(f"Pip upgrade warning: {e}", "warning")
+
+        # Install requirements
         requirements_file = os.path.join(api_dir, "requirements.txt")
+
         if os.path.exists(requirements_file):
-            print_status("Installing requirements.txt", "info")
+            print_status("Installing requirements.txt...", "info")
+            print(f"  This may take several minutes\n")
+
             try:
-                run_as_gaia([pip_executable, "install", "-r", "requirements.txt"], cwd=api_dir, timeout=600)
+                run_as_gaia(
+                    [pip_executable, "install", "-r", "requirements.txt"],
+                    cwd=api_dir,
+                    timeout=600
+                )
                 print_status("Dependencies installed", "success")
             except Exception as pip_error:
                 raise RuntimeError(f"Failed to install requirements: {pip_error}")
         else:
-            print_status("No requirements.txt found, installing default Flask stack", "warning")
-            run_as_gaia([pip_executable, "install", "flask", "flask-cors"], cwd=api_dir)
+            print_status("No requirements.txt found, installing Flask defaults", "warning")
+            try:
+                run_as_gaia(
+                    [pip_executable, "install", "flask", "flask-cors"],
+                    cwd=api_dir,
+                    timeout=120
+                )
+            except Exception as e:
+                raise RuntimeError(f"Failed to install Flask: {e}")
 
-        run_as_gaia([pip_executable, "install", "gunicorn"], cwd=api_dir)
+        # Install gunicorn
+        print_status("Installing Gunicorn...", "info")
+        try:
+            run_as_gaia([pip_executable, "install", "gunicorn"], cwd=api_dir, timeout=60)
+            print_status("Gunicorn installed", "success")
+        except Exception as e:
+            raise RuntimeError(f"Failed to install Gunicorn: {e}")
 
+        # Optional: Prometheus exporter
         if PROMETHEUS_AVAILABLE:
             try:
-                run_as_gaia([pip_executable, "install", "prometheus-flask-exporter"], cwd=api_dir)
+                run_as_gaia([pip_executable, "install", "prometheus-flask-exporter"], cwd=api_dir, timeout=60)
             except:
                 pass
 
         print_status("Python environment ready", "success")
 
+        # ========== SYSTEMD SERVICE ==========
+        print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
         print_status("GENERATING SYSTEMD SERVICE", "info")
-        service_content = generate_systemd_service(config, api_dir, log_dir, db_dir)
 
-        with open(svc_file, 'w') as f:
-            f.write(service_content)
-        os.chmod(svc_file, 0o644)
+        try:
+            service_content = generate_systemd_service(config, api_dir, log_dir, db_dir)
 
-        run_root(["systemctl", "daemon-reload"])
-        run_root(["systemctl", "enable", name])
-        run_root(["systemctl", "start", name])
+            with open(svc_file, 'w') as f:
+                f.write(service_content)
+            os.chmod(svc_file, 0o644)
 
-        print_status(f"Service {name}.service created and started", "success")
+            print_status(f"Service file created: {svc_file}", "success")
 
+        except Exception as e:
+            raise RuntimeError(f"Failed to create service file: {e}")
+
+        # Enable and start service
+        try:
+            run_root(["systemctl", "daemon-reload"])
+            run_root(["systemctl", "enable", name])
+            run_root(["systemctl", "start", name])
+
+            print_status(f"Service {name}.service started", "success")
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to start service: {e}")
+
+        # ========== HEALTH CHECKS ==========
         print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
         print_status("RUNNING HEALTH CHECKS", "info")
         time.sleep(3)
@@ -927,53 +1043,72 @@ async def deploy_service_async():
         health_ok = health_check_deployment(name, port)
 
         if not health_ok:
-            print(f"\n{C_YELLOW}Service failed to start. Recent logs:{C_RESET}")
+            print(f"\n{C_YELLOW}Service failed health checks. Recent logs:{C_RESET}\n")
             try:
                 result = subprocess.run(
-                    ["journalctl", "-u", name, "-n", "20", "--no-pager"],
+                    ["journalctl", "-u", name, "-n", "30", "--no-pager"],
                     capture_output=True,
                     timeout=5
                 )
                 log_output = result.stdout.decode()
-                print(f"{C_YELLOW}{log_output}{C_RESET}")
+                print(f"{C_YELLOW}{log_output}{C_RESET}\n")
             except:
                 pass
 
-            raise RuntimeError("Service failed health checks")
+            raise RuntimeError("Service failed to pass health checks")
 
+        # ========== CLOUDFLARE TUNNEL ==========
         print_status("CONFIGURING CLOUDFLARE TUNNEL", "info")
-        cloudflare.add_route(domain, port)
-        print_status(f"Route added: {domain} -> localhost:{port}", "success")
+        try:
+            cloudflare.add_route(domain, port)
+            print_status(f"Route added: {domain} -> localhost:{port}", "success")
+        except Exception as e:
+            raise RuntimeError(f"Failed to configure Cloudflare: {e}")
 
+        # ========== DATABASE RECORD ==========
         deployment_hash = calculate_file_hash(requirements_file) if os.path.exists(requirements_file) else "none"
 
         db.query(
-            """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash))
+            """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
+        )
 
         duration = time.time() - start_time
-        db.query("INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
-                 (name, "success", duration))
+        db.query(
+            "INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
+            (name, "success", duration)
+        )
 
         if PROMETHEUS_AVAILABLE:
             DEPLOY_COUNTER.labels(status='success').inc()
             DEPLOY_DURATION.observe(duration)
 
-        audit_log("DEPLOY_SUCCESS", name,
-                  {"domain": domain, "port": port, "duration": duration, "workers": config.workers})
+        audit_log("DEPLOY_SUCCESS", name, {
+            "domain": domain,
+            "port": port,
+            "duration": duration,
+            "workers": config.workers
+        })
 
+        # ========== SUCCESS MESSAGE ==========
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print(f"{C_GREEN}{C_BOLD}✓ DEPLOYMENT SUCCESSFUL{C_RESET}")
+        print(f"{C_GREEN}{'=' * 70}{C_RESET}")
         print(f"\n{C_CYAN}Service Details:{C_RESET}")
-        print(f"  Name:       {C_BOLD}{name}{C_RESET}")
-        print(f"  Domain:     {C_BOLD}https://{domain}{C_RESET}")
-        print(f"  Port:       {C_BOLD}{port}{C_RESET}")
-        print(f"  Workers:    {C_BOLD}{config.workers}{C_RESET}")
-        print(f"  Memory:     {C_BOLD}{max_memory}MB{C_RESET}")
-        print(f"  CPU Quota:  {C_BOLD}{cpu_quota}%{C_RESET}")
-        print(f"  Duration:   {C_BOLD}{duration:.2f}s{C_RESET}")
-        print(f"  Location:   {C_BOLD}{api_dir}{C_RESET}")
-        print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
+        print(f"  {C_BOLD}Name:{C_RESET}       {name}")
+        print(f"  {C_BOLD}Domain:{C_RESET}     https://{domain}")
+        print(f"  {C_BOLD}Port:{C_RESET}       {port}")
+        print(f"  {C_BOLD}Workers:{C_RESET}    {config.workers}")
+        print(f"  {C_BOLD}Memory:{C_RESET}     {max_memory}MB")
+        print(f"  {C_BOLD}CPU Quota:{C_RESET}  {cpu_quota}%")
+        print(f"  {C_BOLD}Duration:{C_RESET}   {duration:.2f}s")
+        print(f"\n{C_CYAN}File Locations:{C_RESET}")
+        print(f"  {C_BOLD}Code:{C_RESET}       {api_dir}")
+        print(f"  {C_BOLD}Database:{C_RESET}   {db_dir}")
+        print(f"  {C_BOLD}Logs:{C_RESET}       {log_dir}")
+        print(f"  {C_BOLD}Service:{C_RESET}    {svc_file}")
+        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
 
     except Exception as e:
         logger.error(f"Deployment failed: {e}")
@@ -983,43 +1118,64 @@ async def deploy_service_async():
 
         print_status("INITIATING ROLLBACK", "warning")
 
+        # ========== ROLLBACK ==========
         try:
+            # Stop and disable service
             if name and svc_file:
                 try:
+                    print_status("Stopping service...", "info")
                     run_root(["systemctl", "stop", name])
                     run_root(["systemctl", "disable", name])
-                except:
-                    pass
+                    print_status("Service stopped", "success")
+                except Exception as svc_err:
+                    print_status(f"Service stop warning: {svc_err}", "warning")
 
+                # Remove service file
                 if os.path.exists(svc_file):
-                    os.remove(svc_file)
-                    run_root(["systemctl", "daemon-reload"])
+                    try:
+                        os.remove(svc_file)
+                        run_root(["systemctl", "daemon-reload"])
+                        print_status("Service file removed", "success")
+                    except Exception as file_err:
+                        print_status(f"Service file removal warning: {file_err}", "warning")
 
+            # Remove API directory
             if api_dir and os.path.exists(api_dir):
-                shutil.rmtree(api_dir)
-                print_status(f"Removed: {api_dir}", "success")
+                try:
+                    shutil.rmtree(api_dir)
+                    print_status(f"Removed: {api_dir}", "success")
+                except Exception as api_err:
+                    print_status(f"API cleanup warning: {api_err}", "warning")
 
+            # Remove database directory
             if db_dir and os.path.exists(db_dir):
-                shutil.rmtree(db_dir)
-                print_status(f"Removed: {db_dir}", "success")
+                try:
+                    shutil.rmtree(db_dir)
+                    print_status(f"Removed: {db_dir}", "success")
+                except Exception as db_err:
+                    print_status(f"Database cleanup warning: {db_err}", "warning")
 
+            # Remove Cloudflare route
             if domain:
                 try:
                     cloudflare.remove_route(domain)
-                except:
-                    pass
+                    print_status("Cloudflare route removed", "success")
+                except Exception as cf_err:
+                    print_status(f"Cloudflare cleanup warning: {cf_err}", "warning")
 
-            print_status("Rollback completed", "success")
+            print(f"\n{C_GREEN}Rollback completed{C_RESET}\n")
 
         except Exception as rollback_error:
             logger.error(f"Rollback error: {rollback_error}")
             print_status(f"Rollback error: {rollback_error}", "error")
 
+        # Log failed deployment
         duration = time.time() - start_time
         if name:
             db.query(
                 "INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",
-                (name, "failed", duration, str(e)))
+                (name, "failed", duration, str(e)[:500])  # Limit error message length
+            )
 
         if PROMETHEUS_AVAILABLE:
             DEPLOY_COUNTER.labels(status='failed').inc()
@@ -1027,6 +1183,11 @@ async def deploy_service_async():
         audit_log("DEPLOY_FAILED", name or "unknown", {"error": str(e)})
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+
+def deploy_service():
+    """Wrapper to run async deployment"""
+    asyncio.run(deploy_service_async())
 
 
 def deploy_service():
@@ -1098,7 +1259,7 @@ def list_services_detailed():
 
 
 # ==============================================================================
-#   SERVICE OPERATIONS  
+#   SERVICE OPERATIONS
 # ==============================================================================
 
 def destroy_service():
