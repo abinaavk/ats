@@ -778,7 +778,7 @@ def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
 # ==============================================================================
 
 async def deploy_service_async():
-    """Enhanced asynchronous service deployment - RESPECTS MANUAL PATHS"""
+    """Enhanced asynchronous service deployment - AUTO STANDARD STRUCTURE"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ DEPLOY NEW SERVICE ═══{C_RESET}\n")
 
@@ -791,7 +791,6 @@ async def deploy_service_async():
     domain = None
     name = None
     storage = None
-    use_standard_structure = True
 
     try:
         # ========== INPUT VALIDATION ==========
@@ -801,20 +800,17 @@ async def deploy_service_async():
         if db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
             raise ValueError(f"Service '{name}' already exists")
 
-        # Storage path input
-        storage_input = input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip() or DEFAULT_STORAGE
-        storage = validate_storage(storage_input)
+        # Storage path - defaults to /opt/extra1_1tb
+        storage_input = input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip()
 
-        # Check if user provided a specific project directory structure
-        print(f"\n{C_CYAN}Directory Structure:{C_RESET}")
-        print(f"  1. Standard (storage/api/{name})")
-        print(f"  2. Direct path (storage/{name})")
-
-        struct_choice = input(f"{C_BOLD}Choice (1/2) [{C_CYAN}1{C_RESET}]:{C_RESET} ").strip()
-
-        if struct_choice == "2":
-            use_standard_structure = False
-            print(f"  {C_YELLOW}Using direct path structure{C_RESET}")
+        if not storage_input:
+            # User pressed Enter - use standard structure
+            storage = DEFAULT_STORAGE
+            print(f"  {C_CYAN}→ Using standard structure: {DEFAULT_STORAGE}/api/{name}{C_RESET}")
+        else:
+            # User provided custom path
+            storage = validate_storage(storage_input)
+            print(f"  {C_CYAN}→ Using custom path: {storage}/api/{name}{C_RESET}")
 
         print(f"\n{C_CYAN}Domain Configuration:{C_RESET}")
         print(f"  1. Subdomain of {MAIN_DOMAIN}")
@@ -855,28 +851,20 @@ async def deploy_service_async():
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print_status("PROVISIONING INFRASTRUCTURE", "info")
 
-        # Define paths based on structure choice
-        if use_standard_structure:
-            # Standard: storage/api/name
-            api_parent = os.path.join(storage, "api")
-            api_dir = os.path.join(api_parent, name)
-            db_dir = os.path.join(storage, "database", name)
-        else:
-            # Direct: storage/name
-            api_parent = storage
-            api_dir = os.path.join(storage, name)
-            db_dir = os.path.join(storage, f"{name}_database")
-
+        # Always use standard /api structure
+        api_parent = os.path.join(storage, "api")
+        api_dir = os.path.join(api_parent, name)
+        db_dir = os.path.join(storage, "database", name)
         log_dir = os.path.join(api_dir, "logs")
         svc_file = f"/etc/systemd/system/{name}.service"
 
-        print(f"\n{C_CYAN}Planned structure:{C_RESET}")
+        print(f"\n{C_CYAN}Deployment structure:{C_RESET}")
         print(f"  Storage:   {storage}")
-        print(f"  API Dir:   {api_dir}")
-        print(f"  DB Dir:    {db_dir}")
+        print(f"  Code:      {api_dir}")
+        print(f"  Database:  {db_dir}")
         print(f"  Logs:      {log_dir}\n")
 
-        # STEP 1: Create parent directory
+        # STEP 1: Create parent /api directory
         try:
             if not os.path.exists(api_parent):
                 os.makedirs(api_parent, exist_ok=True)
@@ -887,9 +875,9 @@ async def deploy_service_async():
             os.chmod(api_parent, 0o755)
 
         except Exception as e:
-            raise RuntimeError(f"Failed to create parent directory: {e}")
+            raise RuntimeError(f"Failed to create API parent directory: {e}")
 
-        # STEP 2: Create database directory (independent from code)
+        # STEP 2: Create database directory
         try:
             os.makedirs(db_dir, exist_ok=True)
             shutil.chown(db_dir, user=SERVICE_USER, group=SERVICE_GROUP)
@@ -911,7 +899,7 @@ async def deploy_service_async():
             if not os.access(api_parent, os.W_OK):
                 raise RuntimeError(f"Parent directory not writable: {api_parent}")
 
-            # Clone repository (git will create the 'name' subdirectory)
+            # Clone repository
             returncode, stdout, stderr = await run_async_command(
                 ["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, name],
                 cwd=api_parent,
@@ -938,7 +926,7 @@ async def deploy_service_async():
         except Exception as git_error:
             raise RuntimeError(f"Repository clone failed: {git_error}")
 
-        # STEP 3: Create logs directory INSIDE cloned repo
+        # STEP 3: Create logs directory
         try:
             if not os.path.exists(log_dir):
                 os.makedirs(log_dir, exist_ok=True)
@@ -954,7 +942,6 @@ async def deploy_service_async():
         print_status("CREATING PYTHON VIRTUAL ENVIRONMENT", "info")
 
         try:
-            # Verify we're in the right directory
             if not os.path.exists(api_dir):
                 raise RuntimeError(f"API directory missing before venv creation: {api_dir}")
 
@@ -1097,7 +1084,6 @@ async def deploy_service_async():
         try:
             deployment_hash = calculate_file_hash(requirements_file) if os.path.exists(requirements_file) else "none"
 
-            # Insert service with explicit commit
             print_status("Inserting service record...", "info")
             db.query(
                 """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
@@ -1105,12 +1091,12 @@ async def deploy_service_async():
                 (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
             )
 
-            # CRITICAL: Verify the insertion immediately
-            time.sleep(0.5)  # Give DB time to commit
+            # Verify insertion
+            time.sleep(0.5)
             verify = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
 
             if not verify:
-                # Try direct sqlite3 insert as fallback
+                # Fallback to direct insert
                 logger.error("Database query method failed, trying direct insert")
                 import sqlite3
                 conn = sqlite3.connect(DB_FILE)
@@ -1123,15 +1109,13 @@ async def deploy_service_async():
                 conn.commit()
                 conn.close()
 
-                # Verify again
                 verify = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
                 if not verify:
                     raise RuntimeError("Service deployed but failed to register in database")
 
             print_status(f"Service registered: ID={verify['id']}", "success")
 
-            # Record deployment history
-            print_status("Logging deployment...", "info")
+            # Record deployment
             duration = time.time() - start_time
             db.query(
                 "INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
@@ -1144,18 +1128,12 @@ async def deploy_service_async():
             logger.error(f"Database registration error: {db_error}")
             print_status(f"DATABASE ERROR: {db_error}", "error")
 
-            # Service is running but not in DB - print manual fix
             print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
-            print(f"{C_YELLOW}WARNING: Service is running but not in ATS database!{C_RESET}")
+            print(f"{C_YELLOW}WARNING: Service running but not in ATS database!{C_RESET}")
             print(f"{C_YELLOW}{'=' * 70}{C_RESET}\n")
 
-            print(f"{C_CYAN}Manual fix command:{C_RESET}")
-            print(f"\nsudo sqlite3 {DB_FILE} << EOF")
-            print(
-                f"INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota)")
-            print(
-                f"VALUES ('{name}', {port}, '{domain}', '{storage}', '{repo_url}', {config.workers}, {max_memory}, {cpu_quota});")
-            print(f"EOF\n")
+            print(f"{C_CYAN}Manual fix:{C_RESET}")
+            print(f"sudo python3 register_service.py\n")
 
             raise RuntimeError(f"Service deployed but database registration failed: {db_error}")
 
@@ -1180,13 +1158,12 @@ async def deploy_service_async():
         print(f"  {C_BOLD}Port:{C_RESET}       {port}")
         print(f"  {C_BOLD}Workers:{C_RESET}    {config.workers}")
         print(f"  {C_BOLD}Memory:{C_RESET}     {max_memory}MB")
-        print(f"  {C_BOLD}CPU Quota:{C_RESET}  {cpu_quota}%")
+        print(f"  {C_BOLD}CPU:{C_RESET}        {cpu_quota}%")
         print(f"  {C_BOLD}Duration:{C_RESET}   {duration:.2f}s")
-        print(f"\n{C_CYAN}File Locations:{C_RESET}")
+        print(f"\n{C_CYAN}Locations:{C_RESET}")
         print(f"  {C_BOLD}Code:{C_RESET}       {api_dir}")
         print(f"  {C_BOLD}Database:{C_RESET}   {db_dir}")
         print(f"  {C_BOLD}Logs:{C_RESET}       {log_dir}")
-        print(f"  {C_BOLD}Service:{C_RESET}    {svc_file}")
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
 
     except Exception as e:
@@ -1199,7 +1176,6 @@ async def deploy_service_async():
 
         # ========== ROLLBACK ==========
         try:
-            # Stop and disable service
             if name and svc_file:
                 try:
                     print_status("Stopping service...", "info")
@@ -1209,7 +1185,6 @@ async def deploy_service_async():
                 except Exception as svc_err:
                     print_status(f"Service stop warning: {svc_err}", "warning")
 
-                # Remove service file
                 if os.path.exists(svc_file):
                     try:
                         os.remove(svc_file)
@@ -1218,7 +1193,6 @@ async def deploy_service_async():
                     except Exception as file_err:
                         print_status(f"Service file removal warning: {file_err}", "warning")
 
-            # Remove API directory
             if api_dir and os.path.exists(api_dir):
                 try:
                     shutil.rmtree(api_dir)
@@ -1226,7 +1200,6 @@ async def deploy_service_async():
                 except Exception as api_err:
                     print_status(f"API cleanup warning: {api_err}", "warning")
 
-            # Remove database directory
             if db_dir and os.path.exists(db_dir):
                 try:
                     shutil.rmtree(db_dir)
@@ -1234,7 +1207,6 @@ async def deploy_service_async():
                 except Exception as db_err:
                     print_status(f"Database cleanup warning: {db_err}", "warning")
 
-            # Remove Cloudflare route
             if domain:
                 try:
                     cloudflare.remove_route(domain)
@@ -1248,7 +1220,6 @@ async def deploy_service_async():
             logger.error(f"Rollback error: {rollback_error}")
             print_status(f"Rollback error: {rollback_error}", "error")
 
-        # Log failed deployment
         duration = time.time() - start_time
         if name:
             db.query(
@@ -1267,12 +1238,6 @@ async def deploy_service_async():
 def deploy_service():
     """Wrapper to run async deployment"""
     asyncio.run(deploy_service_async())
-
-
-def deploy_service():
-    """Wrapper to run async deployment"""
-    asyncio.run(deploy_service_async())
-
 
 # ==============================================================================
 #   SERVICE LISTING
