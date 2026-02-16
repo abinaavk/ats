@@ -778,7 +778,7 @@ def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
 # ==============================================================================
 
 async def deploy_service_async():
-    """Enhanced asynchronous service deployment - BULLETPROOF VERSION"""
+    """Enhanced asynchronous service deployment - RESPECTS MANUAL PATHS"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ DEPLOY NEW SERVICE ═══{C_RESET}\n")
 
@@ -790,7 +790,8 @@ async def deploy_service_async():
     svc_file = None
     domain = None
     name = None
-    api_parent = None
+    storage = None
+    use_standard_structure = True
 
     try:
         # ========== INPUT VALIDATION ==========
@@ -800,8 +801,20 @@ async def deploy_service_async():
         if db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
             raise ValueError(f"Service '{name}' already exists")
 
-        storage = validate_storage(
-            input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip() or DEFAULT_STORAGE)
+        # Storage path input
+        storage_input = input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip() or DEFAULT_STORAGE
+        storage = validate_storage(storage_input)
+
+        # Check if user provided a specific project directory structure
+        print(f"\n{C_CYAN}Directory Structure:{C_RESET}")
+        print(f"  1. Standard (storage/api/{name})")
+        print(f"  2. Direct path (storage/{name})")
+
+        struct_choice = input(f"{C_BOLD}Choice (1/2) [{C_CYAN}1{C_RESET}]:{C_RESET} ").strip()
+
+        if struct_choice == "2":
+            use_standard_structure = False
+            print(f"  {C_YELLOW}Using direct path structure{C_RESET}")
 
         print(f"\n{C_CYAN}Domain Configuration:{C_RESET}")
         print(f"  1. Subdomain of {MAIN_DOMAIN}")
@@ -842,10 +855,18 @@ async def deploy_service_async():
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print_status("PROVISIONING INFRASTRUCTURE", "info")
 
-        # Define all paths BEFORE creating anything
-        api_parent = os.path.join(storage, "api")
-        api_dir = os.path.join(api_parent, name)
-        db_dir = os.path.join(storage, "database", name)
+        # Define paths based on structure choice
+        if use_standard_structure:
+            # Standard: storage/api/name
+            api_parent = os.path.join(storage, "api")
+            api_dir = os.path.join(api_parent, name)
+            db_dir = os.path.join(storage, "database", name)
+        else:
+            # Direct: storage/name
+            api_parent = storage
+            api_dir = os.path.join(storage, name)
+            db_dir = os.path.join(storage, f"{name}_database")
+
         log_dir = os.path.join(api_dir, "logs")
         svc_file = f"/etc/systemd/system/{name}.service"
 
@@ -855,7 +876,7 @@ async def deploy_service_async():
         print(f"  DB Dir:    {db_dir}")
         print(f"  Logs:      {log_dir}\n")
 
-        # STEP 1: Create parent /api directory
+        # STEP 1: Create parent directory
         try:
             if not os.path.exists(api_parent):
                 os.makedirs(api_parent, exist_ok=True)
@@ -866,7 +887,7 @@ async def deploy_service_async():
             os.chmod(api_parent, 0o755)
 
         except Exception as e:
-            raise RuntimeError(f"Failed to create API parent directory: {e}")
+            raise RuntimeError(f"Failed to create parent directory: {e}")
 
         # STEP 2: Create database directory (independent from code)
         try:
@@ -883,12 +904,12 @@ async def deploy_service_async():
         print(f"  To:   {api_dir}\n")
 
         try:
-            # Verify api_parent exists and is accessible
+            # Verify parent exists and is accessible
             if not os.path.exists(api_parent):
-                raise RuntimeError(f"API parent directory disappeared: {api_parent}")
+                raise RuntimeError(f"Parent directory disappeared: {api_parent}")
 
             if not os.access(api_parent, os.W_OK):
-                raise RuntimeError(f"API parent directory not writable: {api_parent}")
+                raise RuntimeError(f"Parent directory not writable: {api_parent}")
 
             # Clone repository (git will create the 'name' subdirectory)
             returncode, stdout, stderr = await run_async_command(
@@ -1149,6 +1170,25 @@ async def deploy_service_async():
             "workers": config.workers
         })
 
+        # ========== SUCCESS MESSAGE ==========
+        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
+        print(f"{C_GREEN}{C_BOLD}✓ DEPLOYMENT SUCCESSFUL{C_RESET}")
+        print(f"{C_GREEN}{'=' * 70}{C_RESET}")
+        print(f"\n{C_CYAN}Service Details:{C_RESET}")
+        print(f"  {C_BOLD}Name:{C_RESET}       {name}")
+        print(f"  {C_BOLD}Domain:{C_RESET}     https://{domain}")
+        print(f"  {C_BOLD}Port:{C_RESET}       {port}")
+        print(f"  {C_BOLD}Workers:{C_RESET}    {config.workers}")
+        print(f"  {C_BOLD}Memory:{C_RESET}     {max_memory}MB")
+        print(f"  {C_BOLD}CPU Quota:{C_RESET}  {cpu_quota}%")
+        print(f"  {C_BOLD}Duration:{C_RESET}   {duration:.2f}s")
+        print(f"\n{C_CYAN}File Locations:{C_RESET}")
+        print(f"  {C_BOLD}Code:{C_RESET}       {api_dir}")
+        print(f"  {C_BOLD}Database:{C_RESET}   {db_dir}")
+        print(f"  {C_BOLD}Logs:{C_RESET}       {log_dir}")
+        print(f"  {C_BOLD}Service:{C_RESET}    {svc_file}")
+        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
+
     except Exception as e:
         logger.error(f"Deployment failed: {e}")
         print(f"\n{C_RED}{'=' * 70}{C_RESET}")
@@ -1213,7 +1253,7 @@ async def deploy_service_async():
         if name:
             db.query(
                 "INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",
-                (name, "failed", duration, str(e)[:500])  # Limit error message length
+                (name, "failed", duration, str(e)[:500])
             )
 
         if PROMETHEUS_AVAILABLE:
@@ -1222,6 +1262,11 @@ async def deploy_service_async():
         audit_log("DEPLOY_FAILED", name or "unknown", {"error": str(e)})
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+
+def deploy_service():
+    """Wrapper to run async deployment"""
+    asyncio.run(deploy_service_async())
 
 
 def deploy_service():
