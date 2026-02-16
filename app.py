@@ -269,19 +269,23 @@ class DatabaseManager:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(sql, args)
+
             res = None
             if fetch_one:
                 res = cursor.fetchone()
             elif fetch_all:
                 res = cursor.fetchall()
             else:
+                # CRITICAL: Commit for INSERT/UPDATE/DELETE
                 conn.commit()
+
             conn.close()
             return res
         except sqlite3.Error as e:
             logger.error(f"DB Error: {e}")
+            logger.error(f"SQL: {sql}")
+            logger.error(f"Args: {args}")
             return None
-
 
 db = DatabaseManager(DB_FILE)
 
@@ -1066,19 +1070,73 @@ async def deploy_service_async():
             raise RuntimeError(f"Failed to configure Cloudflare: {e}")
 
         # ========== DATABASE RECORD ==========
-        deployment_hash = calculate_file_hash(requirements_file) if os.path.exists(requirements_file) else "none"
+        print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
+        print_status("REGISTERING SERVICE IN DATABASE", "info")
 
-        db.query(
-            """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
-        )
+        try:
+            deployment_hash = calculate_file_hash(requirements_file) if os.path.exists(requirements_file) else "none"
 
-        duration = time.time() - start_time
-        db.query(
-            "INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
-            (name, "success", duration)
-        )
+            # Insert service with explicit commit
+            print_status("Inserting service record...", "info")
+            db.query(
+                """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
+            )
+
+            # CRITICAL: Verify the insertion immediately
+            time.sleep(0.5)  # Give DB time to commit
+            verify = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+
+            if not verify:
+                # Try direct sqlite3 insert as fallback
+                logger.error("Database query method failed, trying direct insert")
+                import sqlite3
+                conn = sqlite3.connect(DB_FILE)
+                cursor = conn.cursor()
+                cursor.execute(
+                    """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
+                )
+                conn.commit()
+                conn.close()
+
+                # Verify again
+                verify = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+                if not verify:
+                    raise RuntimeError("Service deployed but failed to register in database")
+
+            print_status(f"Service registered: ID={verify['id']}", "success")
+
+            # Record deployment history
+            print_status("Logging deployment...", "info")
+            duration = time.time() - start_time
+            db.query(
+                "INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
+                (name, "success", duration)
+            )
+
+            print_status("Deployment logged successfully", "success")
+
+        except Exception as db_error:
+            logger.error(f"Database registration error: {db_error}")
+            print_status(f"DATABASE ERROR: {db_error}", "error")
+
+            # Service is running but not in DB - print manual fix
+            print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
+            print(f"{C_YELLOW}WARNING: Service is running but not in ATS database!{C_RESET}")
+            print(f"{C_YELLOW}{'=' * 70}{C_RESET}\n")
+
+            print(f"{C_CYAN}Manual fix command:{C_RESET}")
+            print(f"\nsudo sqlite3 {DB_FILE} << EOF")
+            print(
+                f"INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota)")
+            print(
+                f"VALUES ('{name}', {port}, '{domain}', '{storage}', '{repo_url}', {config.workers}, {max_memory}, {cpu_quota});")
+            print(f"EOF\n")
+
+            raise RuntimeError(f"Service deployed but database registration failed: {db_error}")
 
         if PROMETHEUS_AVAILABLE:
             DEPLOY_COUNTER.labels(status='success').inc()
@@ -1090,25 +1148,6 @@ async def deploy_service_async():
             "duration": duration,
             "workers": config.workers
         })
-
-        # ========== SUCCESS MESSAGE ==========
-        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
-        print(f"{C_GREEN}{C_BOLD}✓ DEPLOYMENT SUCCESSFUL{C_RESET}")
-        print(f"{C_GREEN}{'=' * 70}{C_RESET}")
-        print(f"\n{C_CYAN}Service Details:{C_RESET}")
-        print(f"  {C_BOLD}Name:{C_RESET}       {name}")
-        print(f"  {C_BOLD}Domain:{C_RESET}     https://{domain}")
-        print(f"  {C_BOLD}Port:{C_RESET}       {port}")
-        print(f"  {C_BOLD}Workers:{C_RESET}    {config.workers}")
-        print(f"  {C_BOLD}Memory:{C_RESET}     {max_memory}MB")
-        print(f"  {C_BOLD}CPU Quota:{C_RESET}  {cpu_quota}%")
-        print(f"  {C_BOLD}Duration:{C_RESET}   {duration:.2f}s")
-        print(f"\n{C_CYAN}File Locations:{C_RESET}")
-        print(f"  {C_BOLD}Code:{C_RESET}       {api_dir}")
-        print(f"  {C_BOLD}Database:{C_RESET}   {db_dir}")
-        print(f"  {C_BOLD}Logs:{C_RESET}       {log_dir}")
-        print(f"  {C_BOLD}Service:{C_RESET}    {svc_file}")
-        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
 
     except Exception as e:
         logger.error(f"Deployment failed: {e}")
@@ -1183,11 +1222,6 @@ async def deploy_service_async():
         audit_log("DEPLOY_FAILED", name or "unknown", {"error": str(e)})
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
-
-
-def deploy_service():
-    """Wrapper to run async deployment"""
-    asyncio.run(deploy_service_async())
 
 
 def deploy_service():
