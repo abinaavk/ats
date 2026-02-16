@@ -779,7 +779,7 @@ def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
 # ==============================================================================
 
 async def deploy_service_async():
-    """Enhanced asynchronous service deployment - FIXED PATH HANDLING"""
+    """Enhanced asynchronous service deployment - FIXED CLONE ORDER"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ DEPLOY NEW SERVICE ═══{C_RESET}\n")
 
@@ -832,59 +832,60 @@ async def deploy_service_async():
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print_status("PROVISIONING INFRASTRUCTURE", "info")
 
-        # FIXED: Use get_service_path() to determine correct path structure
-        # This ensures consistency with service management operations
-        api_dir = get_service_path(storage, name)
+        # Define paths
+        api_dir = os.path.join(storage, "api", name)
         db_dir = os.path.join(storage, "database", name)
         log_dir = os.path.join(api_dir, "logs")
         svc_file = f"/etc/systemd/system/{name}.service"
 
-        # FIXED: Create parent directory structure if it doesn't exist
-        api_parent = os.path.dirname(api_dir)
+        # FIXED: Create parent /api directory but NOT the service directory yet
+        api_parent = os.path.join(storage, "api")
         if not os.path.exists(api_parent):
             os.makedirs(api_parent, exist_ok=True)
             shutil.chown(api_parent, user=SERVICE_USER, group=SERVICE_GROUP)
             os.chmod(api_parent, 0o755)
             print_status(f"Created parent: {api_parent}", "success")
 
-        for directory in [api_dir, db_dir, log_dir]:
-            os.makedirs(directory, exist_ok=True)
-            shutil.chown(directory, user=SERVICE_USER, group=SERVICE_GROUP)
-            os.chmod(directory, 0o750)
-
-        print_status(f"Created: {api_dir}", "success")
+        # FIXED: Create database directory (separate from code)
+        os.makedirs(db_dir, exist_ok=True)
+        shutil.chown(db_dir, user=SERVICE_USER, group=SERVICE_GROUP)
+        os.chmod(db_dir, 0o750)
         print_status(f"Created: {db_dir}", "success")
-        print_status(f"Created: {log_dir}", "success")
 
+        # FIXED: Clone FIRST into empty directory
         print_status("CLONING REPOSITORY", "info")
 
-        # FIXED: Better error handling for git clone
         try:
+            # Clone directly into the service directory name (git will create it)
             returncode, stdout, stderr = await run_async_command(
-                ["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, "."],
-                cwd=api_dir,
+                ["sudo", "-u", SERVICE_USER, "git", "clone", repo_url, name],
+                cwd=api_parent,  # Clone from parent directory
                 timeout=300
             )
             if returncode != 0:
-                # Show more detailed error
                 error_msg = stderr.strip() if stderr else "Unknown git error"
                 raise RuntimeError(f"Git clone failed: {error_msg}")
 
-            print_status("Repository cloned successfully", "success")
+            print_status(f"Repository cloned to: {api_dir}", "success")
 
-            # Verify critical files exist
+            # Verify app.py exists
             app_file = os.path.join(api_dir, "app.py")
             if not os.path.exists(app_file):
                 print_status("Warning: app.py not found in repository root", "warning")
-                print(f"  {C_YELLOW}Make sure your Flask app is named 'app.py'{C_RESET}")
 
         except Exception as git_error:
             raise RuntimeError(f"Repository clone failed: {git_error}")
 
+        # NOW create logs directory inside the cloned repo
+        os.makedirs(log_dir, exist_ok=True)
+        shutil.chown(log_dir, user=SERVICE_USER, group=SERVICE_GROUP)
+        os.chmod(log_dir, 0o750)
+        print_status(f"Created: {log_dir}", "success")
+
         print_status("CREATING PYTHON VIRTUAL ENVIRONMENT", "info")
         run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=api_dir, timeout=120)
 
-        # FIXED: Check for both pip and pip3
+        # Check for both pip and pip3
         pip3_path = os.path.join(api_dir, "venv", "bin", "pip3")
         pip_path = os.path.join(api_dir, "venv", "bin", "pip")
 
@@ -894,8 +895,6 @@ async def deploy_service_async():
             pip_executable = pip_path
         else:
             raise RuntimeError("Failed to create virtual environment (no pip found)")
-
-        print_status(f"Using pip: {os.path.basename(pip_executable)}", "info")
 
         run_as_gaia([pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"], cwd=api_dir)
 
@@ -917,7 +916,7 @@ async def deploy_service_async():
             try:
                 run_as_gaia([pip_executable, "install", "prometheus-flask-exporter"], cwd=api_dir)
             except:
-                print_status("Prometheus exporter installation skipped", "warning")
+                pass
 
         print_status("Python environment ready", "success")
 
@@ -941,7 +940,6 @@ async def deploy_service_async():
         health_ok = health_check_deployment(name, port)
 
         if not health_ok:
-            # Show logs to help diagnose
             print(f"\n{C_YELLOW}Service failed to start. Recent logs:{C_RESET}")
             try:
                 result = subprocess.run(
@@ -954,7 +952,7 @@ async def deploy_service_async():
             except:
                 pass
 
-            raise RuntimeError("Service failed health checks - check logs above")
+            raise RuntimeError("Service failed health checks")
 
         print_status("CONFIGURING CLOUDFLARE TUNNEL", "info")
         cloudflare.add_route(domain, port)
