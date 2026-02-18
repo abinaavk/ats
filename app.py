@@ -2596,8 +2596,8 @@ def mainmenu():
                         f" {name:<40} "
                         f" {svc['port']:<7} "
                         f" {status_str:<21}"
-                        f" {domain:<42}"
-                        f" {C_CYAN}{location}{C_RESET}")
+                        f"{domain:<42}"
+                        f"{C_CYAN}{location}{C_RESET}")
                     print(f"{C_CYAN}│{C_RESET}{row}")
 
             else:
