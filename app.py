@@ -2566,7 +2566,7 @@ def mainmenu():
             cpu, ram, disk, svccount = asyncio.run(get_telemetry_async())
 
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
-            print(f"{C_CYAN}│{C_RESET} {C_BOLD}System{C_RESET}: CPU {cpu:.1f}% | RAM {ram} | Disk {disk} | Services {svccount} {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} {C_BOLD}System{C_RESET}: CPU {cpu:.1f}% | RAM: {ram} | Disk: {disk} | Services: {svccount} {C_CYAN}│{C_RESET}")
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
             print(f"{C_CYAN}{'=' * 175}{C_RESET}")
 
