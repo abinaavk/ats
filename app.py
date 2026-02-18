@@ -200,6 +200,8 @@ class DatabaseManager:
     def init_db(self):
         """Initialize database with enhanced schema"""
         conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         cursor = conn.cursor()
 
         cursor.execute('''
@@ -287,7 +289,9 @@ class DatabaseManager:
     def query(self, sql: str, args=(), fetch_all=False, fetch_one=False):
         """Execute database query with error handling"""
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(sql, args)
@@ -298,7 +302,6 @@ class DatabaseManager:
             elif fetch_all:
                 res = cursor.fetchall()
             else:
-                # CRITICAL: Commit for INSERT/UPDATE/DELETE
                 conn.commit()
 
             conn.close()
@@ -308,6 +311,7 @@ class DatabaseManager:
             logger.error(f"SQL: {sql}")
             logger.error(f"Args: {args}")
             return None
+
 
 db = DatabaseManager(DB_FILE)
 
