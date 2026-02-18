@@ -2594,8 +2594,8 @@ def mainmenu():
                     row = (
                         f"  {C_BOLD}{idx:<6}{C_RESET}"
                         f" {name:<40} "
-                        f" {svc['port']:<7} "
-                        f" {status_str:<21}"
+                        f"{svc['port']:<7}"
+                        f"{status_str:<21}"
                         f"{domain:<42}"
                         f"{C_CYAN}{location}{C_RESET}")
                     print(f"{C_CYAN}│{C_RESET}{row}")
