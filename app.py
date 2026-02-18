@@ -2128,186 +2128,6 @@ def list_backups():
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
 # ==============================================================================
-#   Core Recovery Function
-# ==============================================================================
-
-def auto_health_recovery():
-    """
-    Background daemon — checks all services every 60 seconds.
-    If a service fails 3 consecutive health checks → auto restart.
-    Logs every action to health_recovery_log table.
-    """
-    from datetime import datetime
-
-    FAIL_THRESHOLD = 3
-    CHECK_INTERVAL = 60
-    RESTART_WAIT   = 10
-
-    # ── Use correct constant + auto-create logs folder ─────────────────────────
-    log_dir  = os.path.join(ATS_HOME, "logs")
-    log_path = os.path.join(log_dir, "health_recovery.log")
-    os.makedirs(log_dir, exist_ok=True)   # creates /home/gaia/ats/logs/ if missing
-
-    def log(msg, level="INFO"):
-        timestamp = datetime.now().strftime("%d %b %Y %H:%M:%S")
-        line      = f"[{timestamp}] [{level}] {msg}"
-        with open(log_path, "a") as f:
-            f.write(line + "\n")
-        if level == "CRITICAL":
-            print(f"{C_RED}{line}{C_RESET}")
-        elif level == "WARNING":
-            print(f"{C_YELLOW}{line}{C_RESET}")
-        elif level == "RECOVERY":
-            print(f"{C_GREEN}{line}{C_RESET}")
-
-    def get_fail_count(service_name):
-        row = db.query(
-            "SELECT fail_count FROM health_fail_counters WHERE service_name=?",
-            (service_name,), fetch_one=True
-        )
-        return row['fail_count'] if row else 0
-
-    def set_fail_count(service_name, count):
-        existing = db.query(
-            "SELECT service_name FROM health_fail_counters WHERE service_name=?",
-            (service_name,), fetch_one=True
-        )
-        now = datetime.now().isoformat()
-        if existing:
-            db.query(
-                "UPDATE health_fail_counters SET fail_count=?, last_checked=? WHERE service_name=?",
-                (count, now, service_name)
-            )
-        else:
-            db.query(
-                "INSERT INTO health_fail_counters (service_name, fail_count, last_checked) VALUES (?,?,?)",
-                (service_name, count, now)
-            )
-
-    def reset_fail_count(service_name):
-        set_fail_count(service_name, 0)
-
-    def log_recovery_event(service_name, fail_count, restarted, recovered, note):
-        now = datetime.now().isoformat()
-        db.query(
-            """INSERT INTO health_recovery_log
-               (service_name, fail_count, last_fail, restarted_at, recovered, note)
-               VALUES (?,?,?,?,?,?)""",
-            (service_name, fail_count, now,
-             now if restarted else None,
-             1 if recovered else 0,
-             note)
-        )
-
-    def restart_service(service_name):
-        result = subprocess.run(
-            ["sudo", "systemctl", "restart", service_name],
-            capture_output=True, text=True
-        )
-        return result.returncode == 0
-
-    def is_service_healthy(svc):
-        try:
-            import urllib.request
-            url      = f"http://localhost:{svc['port']}/health"
-            req      = urllib.request.Request(url, headers={"User-Agent": "ATS-HealthCheck"})
-            response = urllib.request.urlopen(req, timeout=5)
-            return response.status == 200
-        except Exception:
-            return False
-
-    log("Auto Health Recovery daemon started.", "INFO")
-
-    while True:
-        try:
-            services = db.query("SELECT * FROM services", fetch_all=True)
-
-            if services:
-                for svc in services:
-                    name    = svc['name']
-                    healthy = is_service_healthy(svc)
-
-                    if healthy:
-                        prev_count = get_fail_count(name)
-                        if prev_count > 0:
-                            log(f"{name} → recovered (was at {prev_count} fails). Counter reset.", "RECOVERY")
-                            log_recovery_event(name, prev_count, False, True, "Self-recovered")
-                        reset_fail_count(name)
-
-                    else:
-                        fail_count = get_fail_count(name) + 1
-                        set_fail_count(name, fail_count)
-                        log(f"{name} → health check FAILED ({fail_count}/{FAIL_THRESHOLD})", "WARNING")
-
-                        if fail_count >= FAIL_THRESHOLD:
-                            log(f"{name} → {FAIL_THRESHOLD} consecutive failures. AUTO RESTARTING...", "WARNING")
-                            restarted = restart_service(name)
-
-                            if restarted:
-                                log(f"{name} → restart command sent. Waiting {RESTART_WAIT}s...", "INFO")
-                                time.sleep(RESTART_WAIT)
-                                recovered = is_service_healthy(svc)
-
-                                if recovered:
-                                    log(f"{name} → RECOVERED after restart ✓", "RECOVERY")
-                                    log_recovery_event(name, fail_count, True, True, "Auto-restarted and recovered")
-                                    reset_fail_count(name)
-                                else:
-                                    log(f"{name} → STILL FAILING after restart. Manual intervention needed!", "CRITICAL")
-                                    log_recovery_event(name, fail_count, True, False, "Auto-restarted but still failing")
-                                    reset_fail_count(name)
-                            else:
-                                log(f"{name} → restart FAILED (systemd error). Check sudo permissions.", "CRITICAL")
-                                log_recovery_event(name, fail_count, False, False, "Restart command failed")
-                                reset_fail_count(name)
-
-        except Exception as e:
-            log(f"Recovery daemon error: {e}", "CRITICAL")
-
-        time.sleep(CHECK_INTERVAL)
-
-def view_health_recovery_log():
-    """Show last 20 recovery events"""
-    print_header()
-    print(f"{C_CYAN}{C_BOLD}═══ HEALTH RECOVERY LOG ═══{C_RESET}\n")
-
-    events = db.query(
-        """SELECT * FROM health_recovery_log
-           ORDER BY last_fail DESC LIMIT 20""",
-        fetch_all=True
-    )
-
-    if not events:
-        print_status("No recovery events yet. All services have been stable.", "success")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-        return
-
-    for e in events:
-        # Status icon
-        if e['recovered'] and e['restarted_at']:
-            icon  = f"{C_GREEN}✓ RECOVERED{C_RESET}"
-        elif not e['recovered'] and e['restarted_at']:
-            icon  = f"{C_RED}✗ STILL FAILING{C_RESET}"
-        else:
-            icon  = f"{C_GREEN}✓ SELF-RECOVERED{C_RESET}"
-
-        from datetime import datetime
-        try:
-            dt   = datetime.fromisoformat(e['last_fail'])
-            when = dt.strftime("%d %b %Y  %H:%M:%S")
-        except Exception:
-            when = str(e['last_fail'])
-
-        print(f"{C_CYAN}┌─ {e['service_name']} {'─' * max(0, 50 - len(e['service_name']))}{C_RESET}")
-        print(f"{C_CYAN}│{C_RESET}  Status     {icon}")
-        print(f"{C_CYAN}│{C_RESET}  Fails      {e['fail_count']} consecutive")
-        print(f"{C_CYAN}│{C_RESET}  When       {when}")
-        print(f"{C_CYAN}│{C_RESET}  Note       {e['note']}")
-        print(f"{C_CYAN}└{'─' * 54}{C_RESET}\n")
-
-    input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
-
-# ==============================================================================
 #   METRICS & MONITORING
 # ==============================================================================
 
@@ -2970,7 +2790,6 @@ def mainmenu():
             print(menu_row("2", "List Services", "6", "Backup Service"))
             print(menu_row("3", "Destroy Service", "7", "List Backups"))
             print(menu_row("4", "View Logs", "8", "Export Metrics"))
-            print(menu_row("12", "Health Recovery Logs", "13", "Future"))
             print(f"{C_CYAN}╠{'═' * W}╬{'═' * W}╣{C_RESET}")
             print(menu_row("9", "Deployment History", "D", "System Diagnostics"))
             print(menu_row("10", "View Database", "11", "Database Cleanup"))
@@ -3002,8 +2821,6 @@ def mainmenu():
                 view_database()
             elif choice == "11":
                 database_cleanup()
-            elif choice == "12":
-                view_health_recovery_log()
             elif choice == "d":
                 ats_doctor()
             elif choice == "0":
