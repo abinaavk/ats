@@ -1244,62 +1244,158 @@ def deploy_service():
 # ==============================================================================
 
 def list_services_detailed():
-    """Display detailed service information"""
-    print_header()
-    print(f"{C_CYAN}{C_BOLD}═══ SERVICE REGISTRY ═══{C_RESET}\n")
-
+    """Display detailed service information with pagination"""
     services = db.query("SELECT * FROM services ORDER BY created_at DESC", fetch_all=True)
 
     if not services:
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ SERVICE REGISTRY ═══{C_RESET}\n")
         print_status("No services deployed yet", "warning")
         print(f"\n{C_CYAN}Use option [1] to deploy your first service.{C_RESET}\n")
         input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
         return
 
-    print(f"{C_CYAN}Total Services: {C_BOLD}{len(services)}{C_RESET}\n")
-
+    # ── Health check once before pagination loop ──────────────────────────────
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ SERVICE REGISTRY ═══{C_RESET}\n")
+    print(f"{C_CYAN}  Total Services: {C_BOLD}{len(services)}{C_RESET}")
+    print()
     print_status("Checking service health...", "info")
     health_results = asyncio.run(parallel_health_checks(services))
-    print()
 
-    for idx, svc in enumerate(services, 1):
-        is_healthy = health_results.get(svc['name'], False)
-        status_icon = f"{C_GREEN}●{C_RESET}" if is_healthy else f"{C_RED}●{C_RESET}"
-        status_text = "ONLINE" if is_healthy else "OFFLINE"
+    # ── Pagination setup ──────────────────────────────────────────────────────
+    def get_page_size():
+        """
+        Auto-detect terminal height and decide how many services fit per page.
+        Each service card = 13 lines + 1 blank line = 14 lines total.
+        Reserved lines: header(6) + total line(2) + nav bar(4) = 12 lines.
+        """
+        try:
+            terminal_rows, _ = os.get_terminal_size()
+        except OSError:
+            terminal_rows = 30          # safe fallback for weird terminals
+        reserved      = 12
+        card_height   = 14              # lines per service card
+        usable        = terminal_rows - reserved
+        per_page      = max(1, usable // card_height)
+        return per_page
 
-        print(f"{C_CYAN}┌─ SERVICE #{idx} {'─' * 55}{C_RESET}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Name:{C_RESET}          {svc['name']}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Status:{C_RESET}        {status_icon} {status_text}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Domain:{C_RESET}        https://{svc['domain']}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Port:{C_RESET}          {svc['port']}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Workers:{C_RESET}       {svc['workers']}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Memory Limit:{C_RESET}  {svc['max_memory_mb']} MB")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}CPU Quota:{C_RESET}     {svc['cpu_quota']}%")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Storage:{C_RESET}       {svc['storage_path']}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Repository:{C_RESET}    {svc['repo_url']}")
-        print(f"{C_CYAN}│{C_RESET} {C_BOLD}Created:{C_RESET}       {svc['created_at']}")
+    per_page    = get_page_size()
+    total       = len(services)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    current     = 1                     # current page (1-indexed)
 
-        deploy_stats = db.query(
-            "SELECT COUNT(*) as total, SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as successful FROM deployments WHERE service_name=?",
-            (svc['name'],),
-            fetch_one=True
-        )
-        if deploy_stats and deploy_stats['total'] > 0:
-            success_rate = (deploy_stats['successful'] / deploy_stats['total']) * 100
-            print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}Deployments:{C_RESET}   {deploy_stats['total']} ({success_rate:.0f}% success)")
+    while True:
+        os.system('clear')
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ SERVICE REGISTRY ═══{C_RESET}")
+        print(f"{C_CYAN}  Total: {C_BOLD}{total}{C_RESET}{C_CYAN} services   │   "
+              f"Page {C_BOLD}{current}{C_RESET}{C_CYAN} of {C_BOLD}{total_pages}{C_RESET}\n")
 
-        backup_count = db.query(
-            "SELECT COUNT(*) as count FROM backups WHERE service_name=?",
-            (svc['name'],),
-            fetch_one=True
-        )
-        if backup_count:
-            print(f"{C_CYAN}│{C_RESET} {C_BOLD}Backups:{C_RESET}       {backup_count['count']}")
+        # ── Slice services for current page ───────────────────────────────────
+        start = (current - 1) * per_page
+        end   = start + per_page
+        page_services = services[start:end]
 
-        print(f"{C_CYAN}└{'─' * 68}{C_RESET}\n")
+        # ── Render each service card ──────────────────────────────────────────
+        for idx, svc in enumerate(page_services, start=start + 1):
+            is_healthy  = health_results.get(svc['name'], False)
+            status_icon = f"{C_GREEN}●{C_RESET}" if is_healthy else f"{C_RED}●{C_RESET}"
+            status_text = f"{C_GREEN}ONLINE{C_RESET}" if is_healthy else f"{C_RED}OFFLINE{C_RESET}"
 
-    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+            # ── Deployment stats ──────────────────────────────────────────────
+            deploy_stats = db.query(
+                """SELECT COUNT(*) as total,
+                          SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) as successful
+                   FROM deployments WHERE service_name=?""",
+                (svc['name'],),
+                fetch_one=True
+            )
+            if deploy_stats and deploy_stats['total'] and deploy_stats['total'] > 0:
+                rate         = (deploy_stats['successful'] / deploy_stats['total']) * 100
+                rate_color   = C_GREEN if rate >= 80 else (C_YELLOW if rate >= 50 else C_RED)
+                deploy_line  = (f"{deploy_stats['total']} total  "
+                                f"{rate_color}{rate:.0f}% success{C_RESET}")
+            else:
+                deploy_line  = f"{C_YELLOW}No deployments yet{C_RESET}"
+
+            # ── Backup count ──────────────────────────────────────────────────
+            backup_row   = db.query(
+                "SELECT COUNT(*) as count FROM backups WHERE service_name=?",
+                (svc['name'],),
+                fetch_one=True
+            )
+            backup_count = backup_row['count'] if backup_row else 0
+            backup_line  = (f"{C_GREEN}{backup_count} backups{C_RESET}"
+                            if backup_count > 0
+                            else f"{C_YELLOW}No backups yet{C_RESET}")
+
+            # ── Created timestamp (clean format) ─────────────────────────────
+            try:
+                from datetime import datetime
+                raw_ts    = svc['created_at']
+                dt        = datetime.fromisoformat(str(raw_ts))
+                created   = dt.strftime("%d %b %Y  %H:%M")
+            except Exception:
+                created   = str(svc['created_at'])
+
+            # ── Print card ────────────────────────────────────────────────────
+            divider = '─' * 60
+            print(f"{C_CYAN}┌─ #{idx}  {svc['name']}  {divider[:max(0, 55 - len(svc['name']))]}{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Status     {C_RESET}  {status_icon} {status_text}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Domain     {C_RESET}  https://{svc['domain']}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Port       {C_RESET}  {svc['port']}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Workers    {C_RESET}  {svc['workers']}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Memory     {C_RESET}  {svc['max_memory_mb']} MB")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}CPU Quota  {C_RESET}  {svc['cpu_quota']}%")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Storage    {C_RESET}  {svc['storage_path']}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Repository {C_RESET}  {svc['repo_url']}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Created    {C_RESET}  {created}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Deployments{C_RESET}  {deploy_line}")
+            print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Backups    {C_RESET}  {backup_line}")
+            print(f"{C_CYAN}└{'─' * 68}{C_RESET}\n")
+
+        # ── Navigation bar ────────────────────────────────────────────────────
+        nav_parts = []
+        if current > 1:
+            nav_parts.append(f"{C_BOLD}[P]{C_RESET} Previous")
+        if current < total_pages:
+            nav_parts.append(f"{C_BOLD}[N]{C_RESET} Next")
+        nav_parts.append(f"{C_BOLD}[Q]{C_RESET} Back to menu")
+
+        print(f"{C_CYAN}{'─' * 70}{C_RESET}")
+        print(f"  {'   '.join(nav_parts)}")
+        print(f"{C_CYAN}{'─' * 70}{C_RESET}")
+
+        nav = input(f"\n  Navigation: ").strip().lower()
+
+        if nav == 'n':
+            if current < total_pages:
+                current += 1
+            else:
+                print_status("Already on last page.", "warning")
+                time.sleep(1)
+        elif nav == 'p':
+            if current > 1:
+                current -= 1
+            else:
+                print_status("Already on first page.", "warning")
+                time.sleep(1)
+        elif nav == 'q':
+            break
+        else:
+            # ── Allow jumping to a service by number ──────────────────────────
+            try:
+                chosen = int(nav)
+                if 1 <= chosen <= total:
+                    # Jump to the page that contains service #chosen
+                    current = ((chosen - 1) // per_page) + 1
+                else:
+                    print_status(f"Enter a number between 1 and {total}.", "warning")
+                    time.sleep(1)
+            except ValueError:
+                print_status("Invalid input. Use N / P / Q or a service number.", "warning")
+                time.sleep(1)
 
 
 # ==============================================================================
@@ -1869,7 +1965,7 @@ def service_operations():
 # ==============================================================================
 
 def backup_service():
-    """Create backup of service"""
+    """Create backup of service database only"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ BACKUP SERVICE ═══{C_RESET}\n")
 
@@ -1882,28 +1978,46 @@ def backup_service():
         return
 
     try:
+        db_path = os.path.join(svc['storage_path'], "database", name)
+
+        # Check database directory exists and has files
+        if not os.path.exists(db_path):
+            print_status(f"No database directory found at: {db_path}", "warning")
+            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+            return
+
+        db_files = [f for f in os.listdir(db_path) if os.path.isfile(os.path.join(db_path, f))]
+
+        if not db_files:
+            print_status("Database directory is empty, nothing to backup", "warning")
+            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+            return
+
+        # Create backup dir if needed
         if not os.path.exists(BACKUP_DIR):
             os.makedirs(BACKUP_DIR, exist_ok=True)
             shutil.chown(BACKUP_DIR, user=SERVICE_USER, group=SERVICE_GROUP)
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_filename = f"{name}_backup_{timestamp}.zip"
+        backup_filename = f"{name}_db_backup_{timestamp}.zip"
         backup_path = os.path.join(BACKUP_DIR, backup_filename)
 
-        service_path = get_service_path(svc['storage_path'], name)
+        print(f"\n{C_CYAN}Database files found:{C_RESET}")
+        for f in db_files:
+            fsize = os.path.getsize(os.path.join(db_path, f))
+            print(f"  → {f:<30} {fsize / 1024:.1f} KB")
 
-        print(f"\n{C_YELLOW}Creating backup...{C_RESET}")
-        print(f"  Source: {service_path}")
-        print(f"  Target: {backup_path}\n")
+        print()
 
-        shutil.make_archive(
-            backup_path.replace('.zip', ''),
-            'zip',
-            service_path
-        )
+        # Zip only the database files
+        import zipfile
+        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for f in db_files:
+                filepath = os.path.join(db_path, f)
+                zf.write(filepath, f)
 
         file_size = os.path.getsize(backup_path)
-        checksum = calculate_file_hash(backup_path)
+        checksum  = calculate_file_hash(backup_path)
 
         db.query(
             "INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
@@ -1915,23 +2029,25 @@ def backup_service():
 
         audit_log("BACKUP_CREATE", name, {
             "filename": backup_filename,
-            "size_mb": file_size / 1024 / 1024
+            "size_mb":  round(file_size / 1024 / 1024, 2),
+            "type":     "database_only"
         })
 
-        print(f"{C_GREEN}{'=' * 70}{C_RESET}")
-        print(f"{C_GREEN}✓ BACKUP CREATED{C_RESET}")
-        print(f"\n  File:     {backup_filename}")
-        print(f"  Size:     {file_size / 1024 / 1024:.2f} MB")
-        print(f"  Location: {backup_path}")
-        print(f"  Checksum: {checksum[:16]}...")
-        print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
+        print(f"{C_GREEN}{'=' * 60}{C_RESET}")
+        print(f"{C_GREEN}{C_BOLD}✓ DATABASE BACKUP COMPLETE{C_RESET}")
+        print(f"{C_GREEN}{'=' * 60}{C_RESET}")
+        print(f"\n  {C_BOLD}File:{C_RESET}      {backup_filename}")
+        print(f"  {C_BOLD}Size:{C_RESET}      {file_size / 1024 / 1024:.2f} MB")
+        print(f"  {C_BOLD}Location:{C_RESET}  {backup_path}")
+        print(f"  {C_BOLD}Checksum:{C_RESET}  {checksum[:16]}...")
+        print(f"  {C_BOLD}Files:{C_RESET}     {len(db_files)} database file(s)")
+        print(f"{C_GREEN}{'=' * 60}{C_RESET}\n")
 
     except Exception as e:
         logger.error(f"Backup failed: {e}")
         print_status(f"Backup failed: {e}", "error")
 
     input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
-
 
 def list_backups():
     """List all backups"""
