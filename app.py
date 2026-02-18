@@ -116,19 +116,19 @@ def print_header():
     os.system('clear')
     print(f"{C_CYAN}{C_BOLD}")
     print(r"""
-        █████╗ ████████╗███████╗
-       ██╔══██╗╚══██╔══╝██╔════╝
-       ███████║   ██║   ███████╗
-       ██╔══██║   ██║   ╚════██║
-       ██║  ██║   ██║   ███████║
-       ╚═╝  ╚═╝   ╚═╝   ╚══════╝
+                   █████╗ ████████╗███████╗
+                   ██╔══██╗╚══██╔══╝██╔════╝
+                   ███████║   ██║   ███████╗
+                   ██╔══██║   ██║   ╚════██║
+                   ██║  ██║   ██║   ███████║
+                   ╚═╝  ╚═╝   ╚═╝   ╚══════╝
 
-      ░▒▓ AUTOMATED TECH STACK ▓▒░
-      ─────────────────────────────
-            Version 7.0 | ATS
-    Hardened • Automated • Scalable
+      ░▒▓ AUTOMATED TECH STACK (or) ABINAAV TIME SAVER ▓▒░
+      ────────────────────────────────────────────────────
+                        Version 1.0.2 | ATS
+                    Hardened • Automated • Scalable
     """ + f"{C_RESET}")
-    print(f"{C_CYAN}{'=' * 70}{C_RESET}")
+    print(f"{C_CYAN}{'=' * 170}{C_RESET}")
 
 
 def print_status(msg: str, status: str = "info"):
@@ -2568,7 +2568,7 @@ def mainmenu():
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
             print(f"{C_CYAN}│{C_RESET} {C_BOLD}System{C_RESET}: CPU {cpu:.1f}% | RAM {ram} | Disk {disk} | Services {svccount} {C_CYAN}│{C_RESET}")
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
-            print(f"{C_CYAN}{'=' * 70}{C_RESET}")
+            print(f"{C_CYAN}{'=' * 170}{C_RESET}")
 
             services = db.query("SELECT * FROM services ORDER BY name", fetch_all=True)
 
@@ -2603,13 +2603,13 @@ def mainmenu():
             else:
                 print(f"{C_CYAN}│{C_RESET}  {C_YELLOW}No services deployed yet — use Option 1 to get started{C_RESET}")
 
-            print(f"{C_CYAN}{'─' * 180}{C_RESET}")
+            print(f"{C_CYAN}{'─' * 170}{C_RESET}")
 
             # ════ MENU ════
             W = 55
             T = 113
-            
-            def menu_row(left_num, left_text, right_num, right_text, col_width=W):
+
+            def menu_row(left_num, left_text, right_num, right_text, col_width=53):
                 left = f"{C_BOLD}{left_num}{C_RESET}  {left_text}"
                 right = f"{C_BOLD}{right_num}{C_RESET}  {right_text}"
 
@@ -2626,7 +2626,7 @@ def mainmenu():
                     f"{C_CYAN}║{C_RESET}"
                 )
 
-            def menu_single_row(num, text, total_width=T):
+            def menu_single_row(num, text, total_width=113):
                 content = f"{C_RED}{C_BOLD}{num}{C_RESET}  {text}"
                 visible = len(num) + 2 + len(text)
                 pad = total_width - visible - 2
@@ -2644,7 +2644,7 @@ def mainmenu():
             print(menu_row("9", "Deployment History", "D", "System Diagnostics"))
             print(menu_row("10", "View Database", "11", "Database Cleanup"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
-            print(menu_single_row("[0]", "Exit ATS"))
+            print(menu_single_row("[ 0 ]", "Exit ATS"))
             print(f"{C_CYAN}╚{'═' * (T-1)}╝{C_RESET}")
 
             choice = input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} ").strip().lower()
