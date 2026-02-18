@@ -1266,43 +1266,35 @@ def list_services_detailed():
     try:
         terminal_rows, terminal_cols = os.get_terminal_size()
     except OSError:
-        terminal_rows, terminal_cols = 30, 100
+        terminal_rows, terminal_cols = 40, 100
 
-    # ── Decide card mode based on terminal height ──────────────────────────────
-    # Full card  = 14 lines (12 fields + border top/bottom + 1 blank)
-    # Compact card = 8 lines (6 fields + border top/bottom + 1 blank)
-    USE_COMPACT = terminal_rows < 45
+    # ── Card mode ─────────────────────────────────────────────────────────────
+    # Full card  = 14 lines (12 data lines + top border + bottom border + 1 blank)
+    # Compact    =  8 lines ( 6 data lines + top border + bottom border + 1 blank)
+    USE_COMPACT = terminal_rows < 50
+    CARD_HEIGHT = 8  if USE_COMPACT else 14
+    RESERVED    = 23 # exactly counted above
 
-    CARD_HEIGHT = 8 if USE_COMPACT else 14
-
-    # Lines used outside cards:
-    # print_header ~5 + title 1 + total/page 1 + blank 1 +
-    # nav divider top 1 + nav line 1 + nav divider bottom 1 + prompt 1 + buffer 2
-    RESERVED = 14
-
-    usable      = max(CARD_HEIGHT, terminal_rows - RESERVED)
+    usable      = terminal_rows - RESERVED
     per_page    = max(1, usable // CARD_HEIGHT)
     total       = len(services)
     total_pages = max(1, (total + per_page - 1) // per_page)
     current     = 1
 
-    # ── Pagination loop ────────────────────────────────────────────────────────
     while True:
         os.system('clear')
         print_header()
 
         print(f"{C_CYAN}{C_BOLD}═══ SERVICE REGISTRY ═══{C_RESET}")
         print(f"{C_CYAN}  Total: {C_BOLD}{total}{C_RESET}{C_CYAN} services"
-              f"   │   Page {C_BOLD}{current}{C_RESET}{C_CYAN} of {C_BOLD}{total_pages}{C_RESET}"
-              f"   │   {per_page} per page"
+              f"   │   Page {C_BOLD}{current}{C_RESET}{C_CYAN}/{C_BOLD}{total_pages}{C_RESET}"
+              f"   │   {C_BOLD}{per_page}{C_RESET}{C_CYAN} per page"
               f"   │   {'Compact' if USE_COMPACT else 'Full'} view{C_RESET}\n")
 
-        # ── Slice for current page ─────────────────────────────────────────────
         start         = (current - 1) * per_page
         end           = start + per_page
         page_services = services[start:end]
 
-        # ── Render each service card ───────────────────────────────────────────
         for idx, svc in enumerate(page_services, start=start + 1):
 
             is_healthy  = health_results.get(svc['name'], False)
@@ -1317,8 +1309,8 @@ def list_services_detailed():
                 (svc['name'],), fetch_one=True
             )
             if deploy_stats and deploy_stats['total'] and deploy_stats['total'] > 0:
-                rate       = (deploy_stats['successful'] / deploy_stats['total']) * 100
-                rate_color = C_GREEN if rate >= 80 else (C_YELLOW if rate >= 50 else C_RED)
+                rate        = (deploy_stats['successful'] / deploy_stats['total']) * 100
+                rate_color  = C_GREEN if rate >= 80 else (C_YELLOW if rate >= 50 else C_RED)
                 deploy_line = (f"{deploy_stats['total']} total  "
                                f"{rate_color}{rate:.0f}% success{C_RESET}")
             else:
@@ -1342,16 +1334,16 @@ def list_services_detailed():
             except Exception:
                 created = str(svc['created_at'])
 
-            # ── Truncate long strings to fit terminal width ────────────────────
-            max_val   = max(20, terminal_cols - 20)
-            repo_url  = (svc['repo_url'][:max_val]  + "..") if len(svc['repo_url'])  > max_val else svc['repo_url']
-            domain    = (svc['domain'][:max_val]    + "..") if len(svc['domain'])    > max_val else svc['domain']
-            storage   = (svc['storage_path'][:max_val] + "..") if len(svc['storage_path']) > max_val else svc['storage_path']
+            # ── Truncate long strings ──────────────────────────────────────────
+            max_val  = max(20, terminal_cols - 22)
+            repo_url = (svc['repo_url'][:max_val]      + "..") if len(svc['repo_url'])      > max_val else svc['repo_url']
+            domain   = (svc['domain'][:max_val]        + "..") if len(svc['domain'])        > max_val else svc['domain']
+            storage  = (svc['storage_path'][:max_val]  + "..") if len(svc['storage_path'])  > max_val else svc['storage_path']
 
             top_label = f"#{idx}  {svc['name']}"
-            top_line  = f"─ {top_label} {'─' * max(0, 60 - len(top_label))}"
+            top_line  = f"─ {top_label} {'─' * max(0, 58 - len(top_label))}"
 
-            # ── FULL card (terminal >= 45 rows) ────────────────────────────────
+            # ── FULL card ──────────────────────────────────────────────────────
             if not USE_COMPACT:
                 print(f"{C_CYAN}┌{top_line}{C_RESET}")
                 print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Status     {C_RESET}  {status_icon} {status_text}")
@@ -1367,7 +1359,7 @@ def list_services_detailed():
                 print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Backups    {C_RESET}  {backup_line}")
                 print(f"{C_CYAN}└{'─' * 62}{C_RESET}\n")
 
-            # ── COMPACT card (terminal < 45 rows) ──────────────────────────────
+            # ── COMPACT card ───────────────────────────────────────────────────
             else:
                 print(f"{C_CYAN}┌{top_line}{C_RESET}")
                 print(f"{C_CYAN}│{C_RESET}  {status_icon} {status_text}"
@@ -1377,25 +1369,22 @@ def list_services_detailed():
                       f"   {C_BOLD}CPU:{C_RESET} {svc['cpu_quota']}%")
                 print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Domain  {C_RESET}  https://{domain}")
                 print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Repo    {C_RESET}  {repo_url}")
-                print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Deploy  {C_RESET}  {deploy_line}"
-                      f"   {C_BOLD}Backups:{C_RESET} {backup_line}")
-                print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Created {C_RESET}  {created}"
-                      f"   {C_BOLD}Storage:{C_RESET} {storage}")
+                print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Deploy  {C_RESET}  {deploy_line}")
+                print(f"{C_CYAN}│{C_RESET}  {C_BOLD}Backups {C_RESET}  {backup_line}   {C_BOLD}Created:{C_RESET} {created}")
                 print(f"{C_CYAN}└{'─' * 62}{C_RESET}\n")
 
-        # ── Navigation bar ─────────────────────────────────────────────────────
+        # ── Nav bar ────────────────────────────────────────────────────────────
         nav_parts = []
         if current > 1:
             nav_parts.append(f"{C_BOLD}[P]{C_RESET} Prev")
         if current < total_pages:
             nav_parts.append(f"{C_BOLD}[N]{C_RESET} Next")
-        nav_parts.append(f"{C_BOLD}[1-{total}]{C_RESET} Jump to #")
+        nav_parts.append(f"{C_BOLD}[1-{total}]{C_RESET} Jump")
         nav_parts.append(f"{C_BOLD}[Q]{C_RESET} Back")
 
         print(f"{C_CYAN}{'─' * 62}{C_RESET}")
         print(f"  {'   '.join(nav_parts)}")
         print(f"{C_CYAN}{'─' * 62}{C_RESET}")
-
         nav = input(f"\n  Navigation: ").strip().lower()
 
         if nav == 'n':
@@ -1404,19 +1393,15 @@ def list_services_detailed():
             else:
                 print_status("Already on last page.", "warning")
                 time.sleep(1)
-
         elif nav == 'p':
             if current > 1:
                 current -= 1
             else:
                 print_status("Already on first page.", "warning")
                 time.sleep(1)
-
         elif nav == 'q':
             break
-
         else:
-            # ── Jump to service number ─────────────────────────────────────────
             try:
                 chosen = int(nav)
                 if 1 <= chosen <= total:
@@ -1427,7 +1412,6 @@ def list_services_detailed():
             except ValueError:
                 print_status("Invalid input. Use N / P / Q or a service number.", "warning")
                 time.sleep(1)
-
 
 
 # ==============================================================================
