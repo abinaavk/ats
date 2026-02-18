@@ -2568,7 +2568,7 @@ def mainmenu():
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
             print(f"{C_CYAN}│{C_RESET} {C_BOLD}System{C_RESET}: CPU {cpu:.1f}% | RAM {ram} | Disk {disk} | Services {svccount} {C_CYAN}│{C_RESET}")
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
-            print(f"{C_CYAN}{'=' * 173}{C_RESET}")
+            print(f"{C_CYAN}{'=' * 174}{C_RESET}")
 
             services = db.query("SELECT * FROM services ORDER BY name", fetch_all=True)
 
@@ -2603,7 +2603,7 @@ def mainmenu():
             else:
                 print(f"{C_CYAN}│{C_RESET}  {C_YELLOW}No services deployed yet — use Option 1 to get started{C_RESET}")
 
-            print(f"{C_CYAN}{'─' * 173}{C_RESET}")
+            print(f"{C_CYAN}{'─' * 174}{C_RESET}")
 
             # ════ MENU ════
             W = 55
