@@ -25,6 +25,8 @@ import getpass
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
+import threading
+
 
 # --- DEPENDENCY SAFEGUARD ---
 try:
