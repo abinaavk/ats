@@ -259,26 +259,6 @@ class DatabaseManager:
             )
         ''')
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS health_recovery_log (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                service_name  TEXT NOT NULL,
-                fail_count    INTEGER DEFAULT 0,
-                last_fail     TEXT,
-                restarted_at  TEXT,
-                recovered     INTEGER DEFAULT 0,  -- 1=yes 0=no
-                note          TEXT
-            )
-        """)
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS health_fail_counters (
-                service_name  TEXT PRIMARY KEY,
-                fail_count    INTEGER DEFAULT 0,
-                last_checked  TEXT
-            )
-        """)
-
         conn.commit()
         conn.close()
         try:
@@ -311,7 +291,6 @@ class DatabaseManager:
             logger.error(f"SQL: {sql}")
             logger.error(f"Args: {args}")
             return None
-
 
 db = DatabaseManager(DB_FILE)
 
@@ -2136,84 +2115,155 @@ def export_metrics():
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ EXPORT METRICS ═══{C_RESET}\n")
 
+    # ── Prometheus availability check ──────────────────────────────────────────
     if not PROMETHEUS_AVAILABLE:
-        print_status("Prometheus client not installed", "warning")
-        print(f"\nInstall with: {C_CYAN}pip install prometheus-client{C_RESET}")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        print_status("Prometheus client not installed.", "warning")
+        print(f"\n  Install with: {C_CYAN}pip install prometheus-client{C_RESET}")
+        input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}")
         return
 
     try:
         services = db.query("SELECT * FROM services", fetch_all=True)
 
         if not services:
-            print_status("No services to monitor", "warning")
-            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+            print_status("No services to export metrics for.", "warning")
+            input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}")
             return
 
+        # ── Health checks ──────────────────────────────────────────────────────
         print_status("Checking service health...", "info")
         health_results = asyncio.run(parallel_health_checks(services))
+
+        online_count  = 0
+        offline_count = 0
 
         for svc in services:
             is_healthy = health_results.get(svc['name'], False)
             SERVICE_STATUS.labels(service=svc['name']).set(1 if is_healthy else 0)
+            if is_healthy:
+                online_count += 1
+            else:
+                offline_count += 1
 
-        metrics_count = len(services)
-        online_count = sum(1 for healthy in health_results.values() if healthy)
-        offline_count = metrics_count - online_count
+        # ── System metrics via psutil ──────────────────────────────────────────
+        cpu_pct  = None
+        mem_pct  = None
+        disk_pct = None
 
         if psutil:
             print_status("Collecting system metrics...", "info")
             try:
-                cpu_percent = psutil.cpu_percent(interval=0.5)
-                mem = psutil.virtual_memory()
-                disk = psutil.disk_usage('/')
+                cpu_pct   = psutil.cpu_percent(interval=0.5)
+                mem       = psutil.virtual_memory()
+                disk      = psutil.disk_usage('/')
+                mem_pct   = mem.percent
+                disk_pct  = disk.percent
 
-                print(
-                    f"  {C_CYAN}CPU: {cpu_percent:.1f}%, Memory: {mem.percent:.1f}%, Disk: {disk.percent:.1f}%{C_RESET}")
+                cpu_color  = C_RED    if cpu_pct  > 80 else (C_YELLOW if cpu_pct  > 60 else C_GREEN)
+                mem_color  = C_RED    if mem_pct  > 90 else (C_YELLOW if mem_pct  > 75 else C_GREEN)
+                disk_color = C_RED    if disk_pct > 90 else (C_YELLOW if disk_pct > 75 else C_GREEN)
+
+                print(f"  {C_BOLD}CPU:  {C_RESET}{cpu_color}{cpu_pct:.1f}%{C_RESET}"
+                      f"   {C_BOLD}RAM:  {C_RESET}{mem_color}{mem_pct:.1f}%{C_RESET}"
+                      f"   {C_BOLD}Disk: {C_RESET}{disk_color}{disk_pct:.1f}%{C_RESET}")
             except Exception as e:
                 logger.debug(f"Could not collect system metrics: {e}")
+        else:
+            print(f"  {C_YELLOW}psutil not available — system metrics skipped{C_RESET}")
 
+        # ── Write metrics file ─────────────────────────────────────────────────
         print_status("Writing metrics to file...", "info")
+        os.makedirs(ATS_HOME, exist_ok=True)
 
-        if not os.path.exists(ATS_HOME):
-            os.makedirs(ATS_HOME, exist_ok=True)
-            os.chmod(ATS_HOME, 0o755)
+        metrics_data = generate_latest(REGISTRY)
+        with open(METRICS_FILE, 'wb') as f:
+            f.write(metrics_data)
 
         try:
-            metrics_data = generate_latest(REGISTRY)
-            with open(METRICS_FILE, 'wb') as f:
-                f.write(metrics_data)
+            os.chmod(METRICS_FILE, 0o644)
+        except Exception:
+            pass
 
-            try:
-                os.chmod(METRICS_FILE, 0o644)
-            except:
-                pass
+        file_size = os.path.getsize(METRICS_FILE)
 
-            file_size = os.path.getsize(METRICS_FILE)
+        # ── Also save snapshot to metrics history DB ───────────────────────────
+        if psutil and cpu_pct is not None:
+            from datetime import datetime
+            for svc in services:
+                try:
+                    proc_name = svc['name']
+                    svc_cpu   = None
+                    svc_mem   = None
 
-            print(f"  {C_CYAN}{file_size} bytes written{C_RESET}")
+                    # Try to find the gunicorn process for this service by port
+                    for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent', 'memory_info']):
+                        try:
+                            cmdline = " ".join(proc.info['cmdline'] or [])
+                            if str(svc['port']) in cmdline and 'gunicorn' in cmdline:
+                                svc_cpu = proc.info['cpu_percent']
+                                svc_mem = proc.info['memory_info'].rss / 1024 / 1024
+                                break
+                        except Exception:
+                            continue
 
-        except Exception as e:
-            raise RuntimeError(f"Failed to write metrics file: {e}")
+                    if svc_cpu is not None:
+                        db.query(
+                            """INSERT INTO metrics_history
+                               (service_name, cpu_percent, memory_mb, requests_per_min)
+                               VALUES (?, ?, ?, ?)""",
+                            (svc['name'], svc_cpu, svc_mem, 0)
+                        )
+                except Exception:
+                    continue
 
-        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
-        print(f"{C_GREEN}{C_BOLD}✓ METRICS EXPORTED SUCCESSFULLY{C_RESET}")
-        print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
+        # ── Success output ─────────────────────────────────────────────────────
+        print()
+        print(f"  {C_CYAN}{'─' * 55}{C_RESET}")
+        print(f"  {C_GREEN}{C_BOLD}✓ Metrics exported successfully{C_RESET}")
+        print(f"  {C_CYAN}{'─' * 55}{C_RESET}\n")
 
-        print(f"{C_CYAN}Export Details:{C_RESET}")
-        print(f"  {C_BOLD}File:{C_RESET}     {METRICS_FILE}")
-        print(f"  {C_BOLD}Size:{C_RESET}     {file_size} bytes")
-        print(f"  {C_BOLD}Services:{C_RESET} {metrics_count} total")
-        print(f"  {C_BOLD}Online:{C_RESET}   {online_count}")
-        print(f"  {C_BOLD}Offline:{C_RESET}  {offline_count}")
+        print(f"  {C_BOLD}File        {C_RESET}  {METRICS_FILE}")
+        print(f"  {C_BOLD}File Size   {C_RESET}  {file_size} bytes  ({file_size/1024:.2f} KB)")
+        print()
+        print(f"  {C_BOLD}Services    {C_RESET}  {len(services)} total")
+        print(f"  {C_BOLD}Online      {C_RESET}  {C_GREEN}{online_count}{C_RESET}")
+        print(f"  {C_BOLD}Offline     {C_RESET}  {C_RED}{offline_count}{C_RESET}")
+        print()
 
-        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
+        # ── Per-service status table ───────────────────────────────────────────
+        print(f"  {C_BOLD}{'SERVICE':<25} {'STATUS':<12} {'PORT':<8}{C_RESET}")
+        print(f"  {C_CYAN}{'─' * 48}{C_RESET}")
+        for svc in services:
+            is_healthy = health_results.get(svc['name'], False)
+            status_col = f"{C_GREEN}● ONLINE{C_RESET}" if is_healthy else f"{C_RED}● OFFLINE{C_RESET}"
+            name       = (svc['name'][:23] + "..") if len(svc['name']) > 23 else svc['name']
+            print(f"  {name:<25} {status_col:<20} {svc['port']:<8}")
+
+        # ── System metrics summary if available ────────────────────────────────
+        if cpu_pct is not None:
+            print()
+            print(f"  {C_BOLD}{'RESOURCE':<15} {'USAGE':<10} {'STATUS':<10}{C_RESET}")
+            print(f"  {C_CYAN}{'─' * 38}{C_RESET}")
+
+            for label, val, warn, crit in [
+                ("CPU",  cpu_pct,  60, 80),
+                ("RAM",  mem_pct,  75, 90),
+                ("Disk", disk_pct, 75, 90),
+            ]:
+                color  = C_RED if val > crit else (C_YELLOW if val > warn else C_GREEN)
+                status = "CRITICAL" if val > crit else ("WARNING" if val > warn else "OK")
+                print(f"  {label:<15} {color}{val:.1f}%{C_RESET:<10} {color}{status}{C_RESET}")
+
+        print(f"\n  {C_CYAN}{'─' * 55}{C_RESET}")
+        from datetime import datetime
+        print(f"  {C_CYAN}Exported at: {datetime.now().strftime('%d %b %Y  %H:%M:%S')}{C_RESET}")
+        print(f"  {C_CYAN}{'─' * 55}{C_RESET}")
 
     except Exception as e:
         logger.error(f"Metrics export failed: {e}")
         print_status(f"Export failed: {e}", "error")
 
-    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+    input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}")
 
 def view_deployment_history():
     """View deployment history"""
@@ -2259,130 +2309,352 @@ def view_deployment_history():
 
 async def run_diagnostics():
     """Comprehensive system diagnostics"""
+    from datetime import datetime
+
     print_header()
     print(f"{C_YELLOW}{C_BOLD}═══ ATS SYSTEM DIAGNOSTICS ═══{C_RESET}\n")
-
-    checks = []
-
     print_status("Running diagnostic checks...", "info")
     print()
 
-    # Root Access
+    checks  = []   # (label, passed, detail)
+    PASS    = f"{C_GREEN}✓ PASS{C_RESET}"
+    FAIL    = f"{C_RED}✗ FAIL{C_RESET}"
+    WARN    = f"{C_YELLOW}⚠ WARN{C_RESET}"
+
+    def check_line(label, status, detail=""):
+        col = {"pass": PASS, "fail": FAIL, "warn": WARN}.get(status, WARN)
+        detail_str = f"  {C_CYAN}{detail}{C_RESET}" if detail else ""
+        print(f"  {label:<35} {col}{detail_str}")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 1 — SYSTEM CHECKS
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"{C_CYAN}{C_BOLD}── System ─────────────────────────────────────────{C_RESET}")
+
+    # Root access
     root_ok = os.geteuid() == 0
     checks.append(("Root Access", root_ok))
-    print(
-        f"Root Access{' ' * 30}{C_GREEN}✓ PASS{C_RESET}" if root_ok else f"Root Access{' ' * 30}{C_RED}✗ FAIL{C_RESET}")
+    check_line("Root Access", "pass" if root_ok else "fail",
+               "Running as root" if root_ok else "Not root — some features may fail")
+
+    # OS info
+    try:
+        with open("/etc/os-release") as f:
+            os_info = {}
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    os_info[k] = v.strip('"')
+        os_name = os_info.get("PRETTY_NAME", "Unknown")
+        check_line("Operating System", "pass", os_name)
+    except Exception:
+        check_line("Operating System", "warn", "Could not read /etc/os-release")
+
+    # Python version
+    import sys
+    py_ver = sys.version.split()[0]
+    py_ok  = int(py_ver.split(".")[1]) >= 8
+    checks.append(("Python Version", py_ok))
+    check_line("Python Version", "pass" if py_ok else "warn",
+               f"Python {py_ver}")
+
+    # Systemd available
+    systemd_ok = subprocess.call(
+        ["which", "systemctl"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) == 0
+    checks.append(("Systemd", systemd_ok))
+    check_line("Systemd Available", "pass" if systemd_ok else "fail",
+               "systemctl found" if systemd_ok else "systemctl not found")
+
+    # Git available
+    git_ok = subprocess.call(
+        ["which", "git"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) == 0
+    checks.append(("Git", git_ok))
+    check_line("Git Available", "pass" if git_ok else "fail",
+               "git found" if git_ok else "git not installed")
+
+    # Nginx available
+    nginx_ok = subprocess.call(
+        ["which", "nginx"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) == 0
+    check_line("Nginx Available", "pass" if nginx_ok else "warn",
+               "nginx found" if nginx_ok else "nginx not installed")
+
+    # Gunicorn available
+    gunicorn_ok = subprocess.call(
+        ["which", "gunicorn"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) == 0
+    checks.append(("Gunicorn", gunicorn_ok))
+    check_line("Gunicorn Available", "pass" if gunicorn_ok else "fail",
+               "gunicorn found" if gunicorn_ok else "gunicorn not installed")
+
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — ATS FILES & PATHS
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"{C_CYAN}{C_BOLD}── ATS Paths ──────────────────────────────────────{C_RESET}")
+
+    # ATS home
+    ats_home_ok = os.path.exists(ATS_HOME) and os.access(ATS_HOME, os.W_OK)
+    checks.append(("ATS Home", ats_home_ok))
+    check_line("ATS Home Dir", "pass" if ats_home_ok else "fail", ATS_HOME)
 
     # Database
     db_ok = os.path.exists(DB_FILE) and os.access(DB_FILE, os.W_OK)
     checks.append(("Database", db_ok))
-    print(
-        f"Database Access{' ' * 25}{C_GREEN}✓ PASS{C_RESET}" if db_ok else f"Database Access{' ' * 25}{C_RED}✗ FAIL{C_RESET}")
+    if db_ok:
+        db_size = os.path.getsize(DB_FILE) / 1024
+        check_line("Database File", "pass", f"{DB_FILE}  ({db_size:.1f} KB)")
+    else:
+        check_line("Database File", "fail", f"{DB_FILE} — missing or not writable")
 
-    # Cloudflare Config
-    cf_ok = os.path.exists(CLOUDFLARE_CONFIG)
-    checks.append(("Cloudflare Config", cf_ok))
-    print(
-        f"Cloudflare Configuration{' ' * 16}{C_GREEN}✓ PASS{C_RESET}" if cf_ok else f"Cloudflare Configuration{' ' * 16}{C_RED}✗ FAIL{C_RESET}")
+    # Log file
+    log_ok = os.path.exists(LOG_FILE) or os.access(os.path.dirname(LOG_FILE), os.W_OK)
+    check_line("Log File", "pass" if log_ok else "warn", LOG_FILE)
 
-    # Default Storage
+    # Backup dir
+    backup_ok = os.path.exists(BACKUP_DIR) and os.access(BACKUP_DIR, os.W_OK)
+    checks.append(("Backup Dir", backup_ok))
+    check_line("Backup Directory", "pass" if backup_ok else "warn",
+               BACKUP_DIR if backup_ok else f"{BACKUP_DIR} — missing or not writable")
+
+    # Default storage
     storage_ok = os.path.exists(DEFAULT_STORAGE) and os.access(DEFAULT_STORAGE, os.W_OK)
     checks.append(("Default Storage", storage_ok))
-    print(
-        f"Default Storage{' ' * 25}{C_GREEN}✓ PASS{C_RESET}" if storage_ok else f"Default Storage{' ' * 25}{C_RED}✗ FAIL{C_RESET}")
+    check_line("Default Storage", "pass" if storage_ok else "fail", DEFAULT_STORAGE)
 
-    # Internet Connectivity
+    # Cloudflare config
+    cf_ok = os.path.exists(CLOUDFLARE_CONFIG)
+    checks.append(("Cloudflare Config", cf_ok))
+    check_line("Cloudflare Config", "pass" if cf_ok else "warn",
+               CLOUDFLARE_CONFIG if cf_ok else f"{CLOUDFLARE_CONFIG} — not found")
+
+    # Audit file
+    audit_ok = os.path.exists(AUDIT_FILE) or os.access(ATS_HOME, os.W_OK)
+    check_line("Audit Trace File", "pass" if audit_ok else "warn", AUDIT_FILE)
+
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 3 — DISK SPACE
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"{C_CYAN}{C_BOLD}── Disk Space ─────────────────────────────────────{C_RESET}")
+
+    def check_disk(path, label):
+        try:
+            usage   = os.statvfs(path)
+            total   = usage.f_frsize * usage.f_blocks  / (1024**3)
+            free    = usage.f_frsize * usage.f_bfree   / (1024**3)
+            used    = total - free
+            percent = (used / total * 100) if total > 0 else 0
+            status  = "fail" if percent > 90 else ("warn" if percent > 75 else "pass")
+            check_line(f"Disk ({label})", status,
+                       f"{used:.1f} GB / {total:.1f} GB  ({percent:.1f}% used)  {free:.1f} GB free")
+            return status != "fail"
+        except Exception as e:
+            check_line(f"Disk ({label})", "warn", f"Could not check: {e}")
+            return True
+
+    checks.append(("Root Disk",    check_disk("/",              "/")))
+    checks.append(("Storage Disk", check_disk(DEFAULT_STORAGE, DEFAULT_STORAGE)))
+
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 4 — NETWORK & CONNECTIVITY
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"{C_CYAN}{C_BOLD}── Network ────────────────────────────────────────{C_RESET}")
+
+    # Internet
     inet_ok = subprocess.call(
         ["ping", "-c", "1", "-W", "2", "1.1.1.1"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     ) == 0
     checks.append(("Internet", inet_ok))
-    print(
-        f"Internet Connectivity{' ' * 19}{C_GREEN}✓ PASS{C_RESET}" if inet_ok else f"Internet Connectivity{' ' * 19}{C_RED}✗ FAIL{C_RESET}")
+    check_line("Internet Connectivity", "pass" if inet_ok else "fail",
+               "1.1.1.1 reachable" if inet_ok else "No internet connection")
 
-    # Service Health Checks
-    print(f"\n{C_CYAN}Service Health Checks{C_RESET}")
+    # DNS resolution
+    dns_ok = subprocess.call(
+        ["ping", "-c", "1", "-W", "2", "github.com"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) == 0
+    checks.append(("DNS", dns_ok))
+    check_line("DNS Resolution", "pass" if dns_ok else "fail",
+               "github.com reachable" if dns_ok else "DNS not resolving")
+
+    # Cloudflared tunnel
+    cf_tunnel = subprocess.call(
+        ["systemctl", "is-active", "--quiet", "cloudflared"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) == 0
+    checks.append(("Cloudflare Tunnel", cf_tunnel))
+    check_line("Cloudflare Tunnel", "pass" if cf_tunnel else "warn",
+               "cloudflared active" if cf_tunnel else "cloudflared not running")
+
+    # Port conflicts — check if any non-ATS process is using a registered port
+    services_for_ports = db.query("SELECT name, port FROM services", fetch_all=True)
+    port_conflicts = []
+    if services_for_ports:
+        for svc in services_for_ports:
+            result = subprocess.run(
+                ["sudo", "lsof", "-i", f":{svc['port']}", "-t"],
+                capture_output=True, text=True
+            )
+            pids = result.stdout.strip().split("\n")
+            pids = [p for p in pids if p]
+            if len(pids) > 1:
+                port_conflicts.append(f":{svc['port']} ({svc['name']}) — {len(pids)} processes")
+
+    if port_conflicts:
+        check_line("Port Conflicts", "warn", f"{len(port_conflicts)} conflict(s) found")
+        for conflict in port_conflicts:
+            print(f"    {C_YELLOW}│  {conflict}{C_RESET}")
+    else:
+        check_line("Port Conflicts", "pass", "No conflicts detected")
+
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 5 — SERVICE HEALTH
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"{C_CYAN}{C_BOLD}── Service Health ─────────────────────────────────{C_RESET}")
+
     services = db.query("SELECT * FROM services", fetch_all=True)
-
-    if services:
-        health_results = await parallel_health_checks(services)
-        healthy_count = 0
+    if not services:
+        print(f"  {C_YELLOW}No services deployed yet.{C_RESET}")
+    else:
+        health_results  = await parallel_health_checks(services)
+        healthy_count   = 0
         unhealthy_count = 0
 
         for svc in services:
             is_healthy = health_results.get(svc['name'], False)
-            status_str = f"{C_GREEN}✓ HEALTHY{C_RESET}" if is_healthy else f"{C_RED}✗ UNHEALTHY{C_RESET}"
-            port_info = f"(port {svc['port']})"
-            print(f"  {svc['name']:<20} {status_str:<18} {C_CYAN}{port_info}{C_RESET}")
-
+            label      = f"{svc['name']} (:{svc['port']})"
+            check_line(label, "pass" if is_healthy else "fail",
+                       "Online" if is_healthy else "Offline / not responding")
             if is_healthy:
                 healthy_count += 1
             else:
                 unhealthy_count += 1
 
-        print(
-            f"\n  {C_BOLD}Summary:{C_RESET} {C_GREEN}{healthy_count} healthy{C_RESET}, {C_RED}{unhealthy_count} unhealthy{C_RESET}")
-    else:
-        print("  No services deployed")
+        print(f"\n  {C_BOLD}Summary:{C_RESET}  "
+              f"{C_GREEN}{healthy_count} healthy{C_RESET}   "
+              f"{C_RED}{unhealthy_count} unhealthy{C_RESET}")
 
-    # System Resources
-    print(f"\n{C_CYAN}System Resources{C_RESET}")
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 6 — SYSTEM RESOURCES
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"{C_CYAN}{C_BOLD}── System Resources ───────────────────────────────{C_RESET}")
+
     if psutil:
-        cpu_percent = psutil.cpu_percent(interval=1)
-        mem = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
+        cpu_pct = psutil.cpu_percent(interval=1)
+        mem     = psutil.virtual_memory()
+        swap    = psutil.swap_memory()
 
-        cpu_color = C_RED if cpu_percent > 80 else (C_YELLOW if cpu_percent > 60 else C_GREEN)
-        print(f"  {C_BOLD}CPU Usage:{C_RESET}   {cpu_color}{cpu_percent:.1f}%{C_RESET}")
+        cpu_status = "fail" if cpu_pct > 80 else ("warn" if cpu_pct > 60 else "pass")
+        mem_status = "fail" if mem.percent > 90 else ("warn" if mem.percent > 75 else "pass")
+        swp_status = "warn" if swap.percent > 50 else "pass"
 
-        mem_color = C_RED if mem.percent > 90 else (C_YELLOW if mem.percent > 75 else C_GREEN)
-        print(
-            f"  {C_BOLD}Memory:{C_RESET}      {mem.used / 1024 ** 3:.1f} GB / {mem.total / 1024 ** 3:.1f} GB {mem_color}({mem.percent:.1f}%){C_RESET}")
+        check_line("CPU Usage",  cpu_status,
+                   f"{cpu_pct:.1f}%  ({psutil.cpu_count(logical=False)} cores / "
+                   f"{psutil.cpu_count(logical=True)} logical)")
+        check_line("RAM Usage",  mem_status,
+                   f"{mem.used/1024**3:.1f} GB / {mem.total/1024**3:.1f} GB  ({mem.percent:.1f}%)")
+        check_line("Swap Usage", swp_status,
+                   f"{swap.used/1024**2:.0f} MB / {swap.total/1024**2:.0f} MB  ({swap.percent:.1f}%)")
 
-        disk_color = C_RED if disk.percent > 90 else (C_YELLOW if disk.percent > 75 else C_GREEN)
-        print(
-            f"  {C_BOLD}Root Disk:{C_RESET}   {disk.used / 1024 ** 3:.1f} GB / {disk.total / 1024 ** 3:.1f} GB {disk_color}({disk.percent:.1f}%){C_RESET}")
-
-        print(f"\n  {C_BOLD}System Info:{C_RESET}")
+        # Uptime
         try:
-            boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
-            uptime = datetime.datetime.now() - boot_time
-            uptime_str = f"{uptime.days}d {uptime.seconds // 3600}h {(uptime.seconds % 3600) // 60}m"
-            print(f"    Uptime:    {uptime_str}")
-            print(f"    Boot Time: {boot_time.strftime('%Y-%m-%d %H:%M:%S')}")
-        except:
+            boot_time  = datetime.fromtimestamp(psutil.boot_time())
+            uptime     = datetime.now() - boot_time
+            uptime_str = f"{uptime.days}d {uptime.seconds//3600}h {(uptime.seconds%3600)//60}m"
+            check_line("System Uptime", "pass", uptime_str)
+        except Exception:
             pass
 
+        # Load average
         try:
-            cpu_count = psutil.cpu_count(logical=False)
-            cpu_count_logical = psutil.cpu_count(logical=True)
-            print(f"    CPU Cores: {cpu_count} physical, {cpu_count_logical} logical")
-        except:
+            load1, load5, load15 = os.getloadavg()
+            load_status = "warn" if load1 > psutil.cpu_count() else "pass"
+            check_line("Load Average", load_status,
+                       f"1m: {load1:.2f}  5m: {load5:.2f}  15m: {load15:.2f}")
+        except Exception:
             pass
+
     else:
-        print(f"  {C_YELLOW}psutil not available - install for detailed metrics{C_RESET}")
-        print(f"  Install with: {C_CYAN}pip install psutil{C_RESET}")
+        check_line("psutil", "warn", "Not installed — run: pip install psutil")
 
-    # Summary
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 7 — DATABASE INTEGRITY
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"{C_CYAN}{C_BOLD}── Database Integrity ─────────────────────────────{C_RESET}")
+
+    try:
+        integrity = db.query("PRAGMA integrity_check", fetch_one=True)
+        integrity_ok = integrity and list(integrity)[0] == "ok"
+        checks.append(("DB Integrity", integrity_ok))
+        check_line("Integrity Check", "pass" if integrity_ok else "fail",
+                   "ok" if integrity_ok else "Errors found — run cleanup")
+    except Exception as e:
+        check_line("Integrity Check", "warn", f"Could not run: {e}")
+
+    try:
+        wal_file = DB_FILE + "-wal"
+        if os.path.exists(wal_file):
+            wal_size = os.path.getsize(wal_file) / 1024
+            wal_status = "warn" if wal_size > 1024 else "pass"
+            check_line("WAL File", wal_status, f"{wal_size:.1f} KB")
+        else:
+            check_line("WAL File", "pass", "Not present (clean)")
+    except Exception:
+        pass
+
+    # Table record counts
+    for table in ['services', 'backups', 'deployments', 'metrics_history']:
+        result = db.query(f"SELECT COUNT(*) as count FROM {table}", fetch_one=True)
+        count  = result['count'] if result else 0
+        flag   = "warn" if count > 500 else "pass"
+        check_line(f"Table: {table}", flag, f"{count} records")
+
+    print()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # FINAL SUMMARY
+    # ══════════════════════════════════════════════════════════════════════════
     passed = sum(1 for _, ok in checks if ok)
-    total = len(checks)
+    failed = sum(1 for _, ok in checks if not ok)
+    total  = len(checks)
 
-    print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
-    if passed == total:
-        print(f"{C_GREEN}{C_BOLD}✓ ALL CHECKS PASSED ({passed}/{total}){C_RESET}")
+    print(f"{C_CYAN}{'═' * 55}{C_RESET}")
+    if failed == 0:
+        print(f"  {C_GREEN}{C_BOLD}✓ ALL CHECKS PASSED  ({passed}/{total}){C_RESET}")
+    elif failed <= 2:
+        print(f"  {C_YELLOW}{C_BOLD}⚠ {passed}/{total} PASSED — Minor issues detected{C_RESET}")
     else:
-        print(f"{C_YELLOW}{C_BOLD}⚠ {passed}/{total} CHECKS PASSED{C_RESET}")
+        print(f"  {C_RED}{C_BOLD}✗ {passed}/{total} PASSED — Attention required{C_RESET}")
 
-        failed = [name for name, ok in checks if not ok]
-        if failed:
-            print(f"\n{C_RED}Failed checks:{C_RESET}")
-            for check in failed:
-                print(f"  - {check}")
+    if failed > 0:
+        print(f"\n  {C_RED}Failed checks:{C_RESET}")
+        for name, ok in checks:
+            if not ok:
+                print(f"    {C_RED}✗{C_RESET}  {name}")
 
-    print(f"{C_CYAN}{'=' * 70}{C_RESET}\n")
+    print(f"{C_CYAN}{'═' * 55}{C_RESET}")
+    print(f"  {C_CYAN}Completed at: {datetime.now().strftime('%d %b %Y  %H:%M:%S')}{C_RESET}")
+    print(f"{C_CYAN}{'═' * 55}{C_RESET}\n")
 
-    input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
+    input(f"  {C_CYAN}Press Enter to continue...{C_RESET}")
 
 def ats_doctor():
     """Wrapper for async diagnostics"""
@@ -2394,145 +2666,150 @@ def ats_doctor():
 
 def view_database():
     """View and browse ATS database tables"""
-    print_header()
-    print(f"{C_CYAN}{C_BOLD}═══ DATABASE VIEWER ═══{C_RESET}\n")
 
-    print(f"{C_CYAN}Available Tables:{C_RESET}")
-    print("  1. Services")
-    print("  2. Backups")
-    print("  3. Deployments")
-    print("  4. Metrics History")
-    print("  5. All Tables (Summary)")
-    print("  0. Back")
+    while True:
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ DATABASE VIEWER ═══{C_RESET}\n")
+        print(f"  {C_BOLD}[1]{C_RESET} Services")
+        print(f"  {C_BOLD}[2]{C_RESET} Backups")
+        print(f"  {C_BOLD}[3]{C_RESET} Deployments")
+        print(f"  {C_BOLD}[4]{C_RESET} Metrics History")
+        print(f"  {C_BOLD}[5]{C_RESET} All Tables Summary")
+        print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-    choice = input(f"\n{C_BOLD}Select table:{C_RESET} ").strip()
+        choice = input(f"  {C_BOLD}Select table:{C_RESET} ").strip()
 
-    if choice == "0":
-        return
+        if choice == "0":
+            return
 
-    print(f"\n{C_CYAN}{'=' * 100}{C_RESET}")
+        os.system('clear')
+        print_header()
 
-    try:
-        if choice == "1":
-            services = db.query("SELECT * FROM services ORDER BY created_at DESC", fetch_all=True)
-            if not services:
-                print_status("No services in database", "warning")
-            else:
-                print(f"{C_GREEN}Total Services: {len(services)}{C_RESET}\n")
-                print(f"{C_BOLD}{'ID':<4} {'NAME':<15} {'PORT':<6} {'DOMAIN':<30} {'CREATED':<20}{C_RESET}")
-                print(f"{C_CYAN}{'─' * 100}{C_RESET}")
+        try:
+            # ── SERVICES ───────────────────────────────────────────────────────
+            if choice == "1":
+                rows = db.query("SELECT * FROM services ORDER BY created_at DESC", fetch_all=True)
+                if not rows:
+                    print_status("No services in database", "warning")
+                else:
+                    print(f"{C_CYAN}{C_BOLD}═══ SERVICES ({len(rows)} total) ═══{C_RESET}\n")
+                    print(f"  {C_BOLD}{'ID':<4} {'NAME':<18} {'PORT':<6} {'DOMAIN':<32} {'WORKERS':<8} {'STATUS':<10} {'CREATED':<20}{C_RESET}")
+                    print(f"  {C_CYAN}{'─' * 100}{C_RESET}")
+                    for svc in rows:
+                        created   = svc['created_at'][:19] if svc['created_at'] else "Unknown"
+                        name      = (svc['name'][:16]   + "..") if len(svc['name'])   > 16 else svc['name']
+                        domain    = (svc['domain'][:30] + "..") if len(svc['domain']) > 30 else svc['domain']
+                        status_col = (f"{C_GREEN}{svc['status']}{C_RESET}"
+                                      if svc['status'] == 'active'
+                                      else f"{C_RED}{svc['status']}{C_RESET}")
+                        print(f"  {svc['id']:<4} {name:<18} {svc['port']:<6} {domain:<32} "
+                              f"{svc['workers']:<8} {status_col:<18} {created:<20}")
 
-                for svc in services:
-                    created = svc['created_at'][:19] if svc['created_at'] else "Unknown"
-                    print(f"{svc['id']:<4} {svc['name']:<15} {svc['port']:<6} {svc['domain']:<30} {created:<20}")
+                    print(f"\n  {C_CYAN}Enter service ID for full details (or Enter to skip):{C_RESET} ", end='')
+                    detail_id = input().strip()
+                    if detail_id.isdigit():
+                        svc = db.query("SELECT * FROM services WHERE id=?", (int(detail_id),), fetch_one=True)
+                        if svc:
+                            print(f"\n  {C_CYAN}{'─' * 60}{C_RESET}")
+                            print(f"  {C_BOLD}Full Details — Service ID {svc['id']}{C_RESET}")
+                            print(f"  {C_CYAN}{'─' * 60}{C_RESET}")
+                            for key in svc.keys():
+                                print(f"    {C_BOLD}{key:<25}{C_RESET} {svc[key]}")
+                        else:
+                            print_status("Service ID not found", "error")
 
-                print(f"\n{C_CYAN}Enter service ID for details (or press Enter to skip):{C_RESET} ", end='')
-                detail_id = input().strip()
+            # ── BACKUPS ────────────────────────────────────────────────────────
+            elif choice == "2":
+                rows = db.query("SELECT * FROM backups ORDER BY timestamp DESC LIMIT 50", fetch_all=True)
+                if not rows:
+                    print_status("No backups in database", "warning")
+                else:
+                    print(f"{C_CYAN}{C_BOLD}═══ BACKUPS ({len(rows)} shown) ═══{C_RESET}\n")
+                    print(f"  {C_BOLD}{'ID':<4} {'SERVICE':<18} {'SIZE':<12} {'CHECKSUM':<16} {'TIMESTAMP':<20}{C_RESET}")
+                    print(f"  {C_CYAN}{'─' * 80}{C_RESET}")
+                    for b in rows:
+                        size_mb   = f"{(b['size_bytes']/1024/1024):.2f} MB" if b['size_bytes'] else "0 MB"
+                        timestamp = b['timestamp'][:19] if b['timestamp'] else "Unknown"
+                        checksum  = (b['checksum'][:13] + "..") if b['checksum'] and len(b['checksum']) > 13 else (b['checksum'] or "None")
+                        svc_name  = (b['service_name'][:16] + "..") if b['service_name'] and len(b['service_name']) > 16 else (b['service_name'] or "—")
+                        print(f"  {b['id']:<4} {svc_name:<18} {size_mb:<12} {checksum:<16} {timestamp:<20}")
 
-                if detail_id.isdigit():
-                    svc = db.query("SELECT * FROM services WHERE id=?", (int(detail_id),), fetch_one=True)
-                    if svc:
-                        print(f"\n{C_GREEN}{'=' * 100}{C_RESET}")
-                        print(f"{C_GREEN}Service Details (ID: {svc['id']}){C_RESET}")
-                        print(f"{C_GREEN}{'=' * 100}{C_RESET}")
-                        for key in svc.keys():
-                            print(f"  {C_BOLD}{key:<20}{C_RESET}: {svc[key]}")
-                    else:
-                        print_status("Service ID not found", "error")
+            # ── DEPLOYMENTS ────────────────────────────────────────────────────
+            elif choice == "3":
+                rows = db.query("SELECT * FROM deployments ORDER BY timestamp DESC LIMIT 50", fetch_all=True)
+                if not rows:
+                    print_status("No deployment history", "warning")
+                else:
+                    success = sum(1 for d in rows if d['status'] == 'success')
+                    failed  = len(rows) - success
+                    print(f"{C_CYAN}{C_BOLD}═══ DEPLOYMENTS ({len(rows)} shown) ═══{C_RESET}")
+                    print(f"  {C_GREEN}✓ Successful: {success}{C_RESET}   {C_RED}✗ Failed: {failed}{C_RESET}\n")
+                    print(f"  {C_BOLD}{'ID':<4} {'SERVICE':<18} {'STATUS':<10} {'DURATION':<10} {'TIMESTAMP':<20} {'ERROR':<30}{C_RESET}")
+                    print(f"  {C_CYAN}{'─' * 100}{C_RESET}")
+                    for d in rows:
+                        status_col = (f"{C_GREEN}SUCCESS{C_RESET}"
+                                      if d['status'] == 'success'
+                                      else f"{C_RED}FAILED{C_RESET}")
+                        duration  = f"{d['duration_seconds']:.1f}s" if d['duration_seconds'] else "N/A"
+                        timestamp = d['timestamp'][:19] if d['timestamp'] else "Unknown"
+                        error     = (d['error_message'][:28] + "..") if d['error_message'] and len(d['error_message']) > 28 else (d['error_message'] or "—")
+                        svc_name  = (d['service_name'][:16] + "..") if d['service_name'] and len(d['service_name']) > 16 else (d['service_name'] or "—")
+                        print(f"  {d['id']:<4} {svc_name:<18} {status_col:<18} {duration:<10} {timestamp:<20} {C_YELLOW}{error}{C_RESET}")
 
-        elif choice == "2":
-            backups = db.query("SELECT * FROM backups ORDER BY timestamp DESC LIMIT 50", fetch_all=True)
-            if not backups:
-                print_status("No backups in database", "warning")
-            else:
-                print(f"{C_GREEN}Total Backups: {len(backups)}{C_RESET}\n")
-                print(
-                    f"{C_BOLD}{'ID':<4} {'SERVICE':<15} {'SIZE (MB)':<12} {'TIMESTAMP':<20} {'CHECKSUM':<16}{C_RESET}")
-                print(f"{C_CYAN}{'─' * 100}{C_RESET}")
+            # ── METRICS HISTORY ────────────────────────────────────────────────
+            elif choice == "4":
+                rows = db.query("SELECT * FROM metrics_history ORDER BY timestamp DESC LIMIT 50", fetch_all=True)
+                if not rows:
+                    print_status("No metrics history", "warning")
+                else:
+                    print(f"{C_CYAN}{C_BOLD}═══ METRICS HISTORY ({len(rows)} shown) ═══{C_RESET}\n")
+                    print(f"  {C_BOLD}{'ID':<4} {'SERVICE':<18} {'CPU %':<8} {'MEM MB':<10} {'REQ/MIN':<10} {'TIMESTAMP':<20}{C_RESET}")
+                    print(f"  {C_CYAN}{'─' * 80}{C_RESET}")
+                    for m in rows:
+                        timestamp = m['timestamp'][:19] if m['timestamp'] else "Unknown"
+                        cpu       = f"{m['cpu_percent']:.1f}%" if m['cpu_percent'] else "N/A"
+                        mem       = f"{m['memory_mb']:.0f}"    if m['memory_mb']    else "N/A"
+                        req       = str(m['requests_per_min']) if m['requests_per_min'] else "N/A"
+                        svc_name  = (m['service_name'][:16] + "..") if m['service_name'] and len(m['service_name']) > 16 else (m['service_name'] or "—")
+                        cpu_col   = (f"{C_RED}{cpu}{C_RESET}"
+                                     if m['cpu_percent'] and m['cpu_percent'] > 80
+                                     else f"{C_GREEN}{cpu}{C_RESET}")
+                        mem_col   = (f"{C_RED}{mem}{C_RESET}"
+                                     if m['memory_mb'] and m['memory_mb'] > 400
+                                     else f"{C_GREEN}{mem}{C_RESET}")
+                        print(f"  {m['id']:<4} {svc_name:<18} {cpu_col:<16} {mem_col:<18} {req:<10} {timestamp:<20}")
 
-                for backup in backups:
-                    size_mb = (backup['size_bytes'] / 1024 / 1024) if backup['size_bytes'] else 0
-                    timestamp = backup['timestamp'][:19] if backup['timestamp'] else "Unknown"
-                    checksum = backup['checksum'][:12] + "..." if backup['checksum'] else "None"
-                    print(
-                        f"{backup['id']:<4} {backup['service_name']:<15} {size_mb:<12.2f} {timestamp:<20} {checksum:<16}")
-
-        elif choice == "3":
-            deployments = db.query("SELECT * FROM deployments ORDER BY timestamp DESC LIMIT 50", fetch_all=True)
-            if not deployments:
-                print_status("No deployment history", "warning")
-            else:
-                print(f"{C_GREEN}Total Deployments: {len(deployments)}{C_RESET}\n")
-
-                success_count = sum(1 for d in deployments if d['status'] == 'success')
-                failed_count = len(deployments) - success_count
-
-                print(f"{C_GREEN}✓ Successful: {success_count}{C_RESET}  |  {C_RED}✗ Failed: {failed_count}{C_RESET}\n")
-
-                print(f"{C_BOLD}{'ID':<4} {'SERVICE':<15} {'STATUS':<10} {'DURATION':<12} {'TIMESTAMP':<20}{C_RESET}")
-                print(f"{C_CYAN}{'─' * 100}{C_RESET}")
-
-                for deploy in deployments:
-                    status_icon = f"{C_GREEN}SUCCESS{C_RESET}" if deploy[
-                                                                      'status'] == 'success' else f"{C_RED}FAILED{C_RESET}"
-                    duration = f"{deploy['duration_seconds']:.1f}s" if deploy['duration_seconds'] else "N/A"
-                    timestamp = deploy['timestamp'][:19] if deploy['timestamp'] else "Unknown"
-                    print(
-                        f"{deploy['id']:<4} {deploy['service_name']:<15} {status_icon:<18} {duration:<12} {timestamp:<20}")
-
-                    if deploy['error_message']:
-                        print(f"     {C_YELLOW}Error: {deploy['error_message'][:60]}{C_RESET}")
-
-        elif choice == "4":
-            metrics = db.query("SELECT * FROM metrics_history ORDER BY timestamp DESC LIMIT 50", fetch_all=True)
-            if not metrics:
-                print_status("No metrics history", "warning")
-            else:
-                print(f"{C_GREEN}Total Metrics Records: {len(metrics)}{C_RESET}\n")
-                print(
-                    f"{C_BOLD}{'ID':<4} {'SERVICE':<15} {'CPU %':<8} {'MEMORY MB':<12} {'REQ/MIN':<10} {'TIMESTAMP':<20}{C_RESET}")
-                print(f"{C_CYAN}{'─' * 100}{C_RESET}")
-
-                for metric in metrics:
-                    timestamp = metric['timestamp'][:19] if metric['timestamp'] else "Unknown"
-                    cpu = f"{metric['cpu_percent']:.1f}" if metric['cpu_percent'] else "N/A"
-                    mem = f"{metric['memory_mb']:.0f}" if metric['memory_mb'] else "N/A"
-                    req = f"{metric['requests_per_min']}" if metric['requests_per_min'] else "N/A"
-                    print(
-                        f"{metric['id']:<4} {metric['service_name']:<15} {cpu:<8} {mem:<12} {req:<10} {timestamp:<20}")
-
-        elif choice == "5":
-            tables = ['services', 'backups', 'deployments', 'metrics_history']
-
-            print(f"{C_CYAN}Database Summary{C_RESET}\n")
-            print(f"{C_BOLD}{'TABLE':<20} {'RECORDS':<10} {'SIZE (KB)':<12}{C_RESET}")
-            print(f"{C_CYAN}{'─' * 50}{C_RESET}")
-
-            for table in tables:
-                try:
+            # ── ALL TABLES SUMMARY ─────────────────────────────────────────────
+            elif choice == "5":
+                all_tables = ['services', 'backups', 'deployments', 'metrics_history']
+                print(f"{C_CYAN}{C_BOLD}═══ DATABASE SUMMARY ═══{C_RESET}\n")
+                print(f"  {C_BOLD}{'TABLE':<28} {'RECORDS':<12} {'EST. SIZE':<12}{C_RESET}")
+                print(f"  {C_CYAN}{'─' * 55}{C_RESET}")
+                total_records = 0
+                for table in all_tables:
                     result = db.query(f"SELECT COUNT(*) as count FROM {table}", fetch_one=True)
-                    count = result['count'] if result else 0
-                    size_kb = count * 0.5
-                    print(f"{table:<20} {count:<10} {size_kb:<12.1f}")
-                except Exception as e:
-                    print(f"{table:<20} {C_RED}Error{C_RESET}")
+                    count  = result['count'] if result else 0
+                    total_records += count
+                    size_kb = f"{count * 0.5:.1f} KB"
+                    print(f"  {table:<28} {count:<12} {size_kb:<12}")
+                print(f"  {C_CYAN}{'─' * 55}{C_RESET}")
+                print(f"  {'TOTAL':<28} {C_BOLD}{total_records}{C_RESET}")
+                if os.path.exists(DB_FILE):
+                    db_size = os.path.getsize(DB_FILE) / 1024
+                    print(f"\n  {C_BOLD}File:{C_RESET}  {DB_FILE}")
+                    print(f"  {C_BOLD}Size:{C_RESET}  {db_size:.2f} KB")
+                    print(f"  {C_BOLD}Mode:{C_RESET}  WAL (concurrent access enabled)")
 
-            print(f"{C_CYAN}{'─' * 50}{C_RESET}")
+            else:
+                print_status("Invalid choice. Enter 1-5 or 0 to go back.", "warning")
 
-            if os.path.exists(DB_FILE):
-                db_size = os.path.getsize(DB_FILE) / 1024
-                print(f"\n{C_BOLD}Database File:{C_RESET} {DB_FILE}")
-                print(f"{C_BOLD}File Size:{C_RESET} {db_size:.2f} KB")
+        except Exception as e:
+            logger.error(f"Database view error: {e}")
+            print_status(f"Error: {e}", "error")
 
-        else:
-            print_status("Invalid choice", "warning")
+        print(f"\n  {C_CYAN}{'─' * 70}{C_RESET}")
+        input(f"  {C_CYAN}Press Enter to go back...{C_RESET}")
 
-    except Exception as e:
-        logger.error(f"Database view error: {e}")
-        print_status(f"Error: {e}", "error")
-
-    print(f"{C_CYAN}{'=' * 100}{C_RESET}\n")
-    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
 # ==============================================================================
 #   OPTION 11: DATABASE CLEANUP
@@ -2540,145 +2817,346 @@ def view_database():
 
 def database_cleanup():
     """Clean up old/orphaned database records"""
-    print_header()
-    print(f"{C_RED}{C_BOLD}═══ DATABASE CLEANUP ═══{C_RESET}\n")
-    print(f"{C_YELLOW}WARNING: This will permanently delete selected database records.{C_RESET}\n")
 
-    print(f"{C_CYAN}Cleanup Options:{C_RESET}")
-    print("  1. Delete old deployment history (keep last 100)")
-    print("  2. Delete old metrics (keep last 1000)")
-    print("  3. Delete orphaned backups (service no longer exists)")
-    print("  4. Delete specific service completely")
-    print("  5. Vacuum database (optimize)")
-    print("  6. Complete cleanup (all of the above)")
-    print("  0. Cancel")
+    while True:
+        print_header()
+        print(f"{C_RED}{C_BOLD}═══ DATABASE CLEANUP ═══{C_RESET}\n")
+        print(f"{C_YELLOW}  WARNING: Deleted records cannot be recovered.{C_RESET}\n")
+        print(f"  {C_BOLD}[1]{C_RESET} Delete old deployment history      (keep last 100)")
+        print(f"  {C_BOLD}[2]{C_RESET} Delete old metrics history         (keep last 1000)")
+        print(f"  {C_BOLD}[3]{C_RESET} Delete orphaned backup records     (service no longer exists)")
+        print(f"  {C_BOLD}[4]{C_RESET} Delete specific service            (all records)")
+        print(f"  {C_BOLD}[5]{C_RESET} Vacuum database                    (optimize file size)")
+        print(f"  {C_BOLD}[6]{C_RESET} Full cleanup                       (1 + 2 + 3 + 5)")
+        print(f"  {C_BOLD}[7]{C_RESET} Delete failed deployments only     (keep successful ones)")
+        print(f"  {C_BOLD}[8]{C_RESET} Reset metrics for one service      (clear its history)")
+        print(f"  {C_BOLD}[9]{C_RESET} Delete backups older than N days   (custom retention)")
+        print(f"  {C_BOLD}[D]{C_RESET} Database health report             (stats + warnings)")
+        print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-    choice = input(f"\n{C_BOLD}Select cleanup action:{C_RESET} ").strip()
+        choice = input(f"  {C_BOLD}Select action:{C_RESET} ").strip().lower()
 
-    if choice == "0":
-        return
+        if choice == "0":
+            return
 
-    print(f"\n{C_RED}This action cannot be undone!{C_RESET}")
-    confirm = input(f"{C_YELLOW}Type 'CLEANUP' to confirm:{C_RESET} ").strip()
+        if choice not in ("1","2","3","4","5","6","7","8","9","d"):
+            print_status("Invalid choice.", "warning")
+            time.sleep(1)
+            continue
 
-    if confirm != "CLEANUP":
-        print_status("Cleanup cancelled", "warning")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-        return
+        # ── Database Health Report (no confirmation needed) ────────────────────
+        if choice == "d":
+            os.system('clear')
+            print_header()
+            print(f"{C_CYAN}{C_BOLD}═══ DATABASE HEALTH REPORT ═══{C_RESET}\n")
 
-    print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
-    deleted_count = 0
+            tables = ['services', 'backups', 'deployments', 'metrics_history']
 
-    try:
-        if choice == "1" or choice == "6":
-            print_status("Cleaning old deployment history...", "info")
-            db.query("""
-                DELETE FROM deployments 
-                WHERE id NOT IN (
-                    SELECT id FROM deployments 
-                    ORDER BY timestamp DESC 
-                    LIMIT 100
-                )
-            """)
-            print_status("Old deployment records deleted", "success")
+            print(f"  {C_BOLD}{'TABLE':<25} {'RECORDS':<12} {'EST. SIZE':<12}{C_RESET}")
+            print(f"  {C_CYAN}{'─' * 52}{C_RESET}")
 
-        if choice == "2" or choice == "6":
-            print_status("Cleaning old metrics history...", "info")
-            db.query("""
-                DELETE FROM metrics_history 
-                WHERE id NOT IN (
-                    SELECT id FROM metrics_history 
-                    ORDER BY timestamp DESC 
-                    LIMIT 1000
-                )
-            """)
-            print_status("Old metrics records deleted", "success")
+            total_records = 0
+            for table in tables:
+                result = db.query(f"SELECT COUNT(*) as count FROM {table}", fetch_one=True)
+                count  = result['count'] if result else 0
+                total_records += count
+                size_kb = count * 0.5
+                flag = f"  {C_YELLOW}⚠ Large{C_RESET}" if count > 500 else ""
+                print(f"  {table:<25} {count:<12} {size_kb:<8.1f} KB{flag}")
 
-        if choice == "3" or choice == "6":
-            print_status("Checking for orphaned backups...", "info")
+            print(f"  {C_CYAN}{'─' * 52}{C_RESET}")
+            print(f"  {'TOTAL':<25} {C_BOLD}{total_records}{C_RESET}\n")
 
+            # DB file size
+            if os.path.exists(DB_FILE):
+                db_size = os.path.getsize(DB_FILE) / 1024
+                print(f"  {C_BOLD}File size:{C_RESET}     {db_size:.2f} KB")
+                if db_size > 10240:
+                    print(f"  {C_YELLOW}⚠ DB file is over 10 MB — consider vacuum{C_RESET}")
+
+            # Failed deployments
+            failed = db.query(
+                "SELECT COUNT(*) as count FROM deployments WHERE status != 'success'",
+                fetch_one=True
+            )
+            failed_count = failed['count'] if failed else 0
+            if failed_count > 0:
+                print(f"  {C_YELLOW}⚠ {failed_count} failed deployment records found{C_RESET}")
+            else:
+                print(f"  {C_GREEN}✓ No failed deployment records{C_RESET}")
+
+            # Orphaned backups
             orphaned = db.query("""
-                SELECT b.id, b.service_name, b.filename 
-                FROM backups b 
-                WHERE b.service_name NOT IN (SELECT name FROM services)
-            """, fetch_all=True)
-
-            if orphaned:
-                print(f"  Found {len(orphaned)} orphaned backup records:")
-                for backup in orphaned:
-                    print(f"    - {backup['service_name']}: {backup['filename']}")
-
-                    backup_file = os.path.join(BACKUP_DIR, backup['filename'])
-                    if os.path.exists(backup_file):
-                        try:
-                            os.remove(backup_file)
-                            print(f"      {C_GREEN}✓ Deleted file{C_RESET}")
-                        except Exception as e:
-                            print(f"      {C_YELLOW}⚠ Could not delete file: {e}{C_RESET}")
-
-                    db.query("DELETE FROM backups WHERE id=?", (backup['id'],))
-                    deleted_count += 1
-
-                print_status(f"Deleted {len(orphaned)} orphaned backup records", "success")
+                SELECT COUNT(*) as count FROM backups
+                WHERE service_name NOT IN (SELECT name FROM services)
+            """, fetch_one=True)
+            orphaned_count = orphaned['count'] if orphaned else 0
+            if orphaned_count > 0:
+                print(f"  {C_YELLOW}⚠ {orphaned_count} orphaned backup records found{C_RESET}")
             else:
-                print_status("No orphaned backups found", "info")
+                print(f"  {C_GREEN}✓ No orphaned backup records{C_RESET}")
 
-        if choice == "4":
-            service_name = input(f"\n{C_BOLD}Service name to delete from database:{C_RESET} ").strip()
-
-            svc = db.query("SELECT * FROM services WHERE name=?", (service_name,), fetch_one=True)
-
-            if not svc:
-                print_status(f"Service '{service_name}' not found in database", "error")
+            # Old deployments
+            old_deploys = db.query(
+                "SELECT COUNT(*) as count FROM deployments",
+                fetch_one=True
+            )
+            old_count = old_deploys['count'] if old_deploys else 0
+            if old_count > 100:
+                print(f"  {C_YELLOW}⚠ {old_count} deployment records — recommend keeping last 100{C_RESET}")
             else:
-                print(f"\n{C_YELLOW}This will delete ALL database records for '{service_name}':{C_RESET}")
-                print("  - Service record")
-                print("  - Backup records")
-                print("  - Deployment history")
-                print("  - Metrics history")
+                print(f"  {C_GREEN}✓ Deployment history is clean ({old_count} records){C_RESET}")
 
-                confirm2 = input(f"\n{C_RED}Type service name to confirm:{C_RESET} ").strip()
-
-                if confirm2 == service_name:
-                    db.query("DELETE FROM metrics_history WHERE service_name=?", (service_name,))
-                    db.query("DELETE FROM deployments WHERE service_name=?", (service_name,))
-                    db.query("DELETE FROM backups WHERE service_name=?", (service_name,))
-                    db.query("DELETE FROM services WHERE name=?", (service_name,))
-
-                    print_status(f"Service '{service_name}' deleted from database", "success")
-                    deleted_count += 1
+            # WAL file check
+            wal_file = DB_FILE + "-wal"
+            if os.path.exists(wal_file):
+                wal_size = os.path.getsize(wal_file) / 1024
+                if wal_size > 1024:
+                    print(f"  {C_YELLOW}⚠ WAL file is {wal_size:.1f} KB — run vacuum to merge{C_RESET}")
                 else:
-                    print_status("Service name didn't match - cancelled", "warning")
+                    print(f"  {C_GREEN}✓ WAL file size normal ({wal_size:.1f} KB){C_RESET}")
 
-        if choice == "5" or choice == "6":
-            print_status("Optimizing database...", "info")
+            print(f"\n  {C_CYAN}{'─' * 52}{C_RESET}")
+            input(f"  {C_CYAN}Press Enter to continue...{C_RESET}")
+            continue
 
-            size_before = os.path.getsize(DB_FILE) / 1024
+        # ── Confirmation for destructive actions ───────────────────────────────
+        os.system('clear')
+        print_header()
+        print(f"{C_RED}{C_BOLD}═══ CONFIRM CLEANUP ═══{C_RESET}\n")
+        print(f"  {C_YELLOW}This action cannot be undone.{C_RESET}\n")
+        confirm = input(f"  Type {C_BOLD}CLEANUP{C_RESET} to confirm: ").strip()
 
-            conn = sqlite3.connect(DB_FILE)
-            conn.execute("VACUUM")
-            conn.close()
+        if confirm != "CLEANUP":
+            print_status("Cleanup cancelled.", "warning")
+            time.sleep(1)
+            continue
 
-            size_after = os.path.getsize(DB_FILE) / 1024
-            saved = size_before - size_after
+        os.system('clear')
+        print_header()
+        print(f"{C_RED}{C_BOLD}═══ RUNNING CLEANUP ═══{C_RESET}\n")
 
-            print_status(f"Database optimized (saved {saved:.2f} KB)", "success")
+        deleted_count = 0
 
-        audit_log("DATABASE_CLEANUP", "ATS", {
-            "action": choice,
-            "records_deleted": deleted_count
-        })
+        try:
+            # ── Option 1: Old deployments ──────────────────────────────────────
+            if choice in ("1", "6"):
+                print_status("Cleaning old deployment history...", "info")
+                db.query("""
+                    DELETE FROM deployments
+                    WHERE id NOT IN (
+                        SELECT id FROM deployments
+                        ORDER BY timestamp DESC
+                        LIMIT 100
+                    )
+                """)
+                result = db.query("SELECT COUNT(*) as count FROM deployments", fetch_one=True)
+                print_status(f"Deployments kept: {result['count'] if result else 0}", "success")
 
-        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
-        print(f"{C_GREEN}{C_BOLD}✓ CLEANUP COMPLETED{C_RESET}")
-        print(f"{C_GREEN}Total records affected: {deleted_count}{C_RESET}")
-        print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
+            # ── Option 2: Old metrics ──────────────────────────────────────────
+            if choice in ("2", "6"):
+                print_status("Cleaning old metrics history...", "info")
+                db.query("""
+                    DELETE FROM metrics_history
+                    WHERE id NOT IN (
+                        SELECT id FROM metrics_history
+                        ORDER BY timestamp DESC
+                        LIMIT 1000
+                    )
+                """)
+                result = db.query("SELECT COUNT(*) as count FROM metrics_history", fetch_one=True)
+                print_status(f"Metrics kept: {result['count'] if result else 0}", "success")
 
-    except Exception as e:
-        logger.error(f"Database cleanup error: {e}")
-        print_status(f"Cleanup failed: {e}", "error")
+            # ── Option 3: Orphaned backups ─────────────────────────────────────
+            if choice in ("3", "6"):
+                print_status("Checking for orphaned backup records...", "info")
+                orphaned = db.query("""
+                    SELECT b.id, b.service_name, b.filename
+                    FROM backups b
+                    WHERE b.service_name NOT IN (SELECT name FROM services)
+                """, fetch_all=True)
 
-    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+                if not orphaned:
+                    print_status("No orphaned backups found.", "info")
+                else:
+                    print(f"\n  {C_YELLOW}Found {len(orphaned)} orphaned record(s):{C_RESET}")
+                    for backup in orphaned:
+                        svc_name = backup['service_name'] or "unknown"
+                        fname    = backup['filename']     or "unknown"
+                        print(f"  {C_CYAN}│{C_RESET}  {svc_name}  →  {fname}")
+                        if backup['filename']:
+                            backup_file = os.path.join(BACKUP_DIR, backup['filename'])
+                            if os.path.exists(backup_file):
+                                try:
+                                    os.remove(backup_file)
+                                    print(f"  {C_CYAN}│{C_RESET}  {C_GREEN}✓ File deleted{C_RESET}")
+                                except Exception as fe:
+                                    print(f"  {C_CYAN}│{C_RESET}  {C_YELLOW}⚠ Could not delete file: {fe}{C_RESET}")
+                        db.query("DELETE FROM backups WHERE id=?", (backup['id'],))
+                        deleted_count += 1
+                    print_status(f"Removed {len(orphaned)} orphaned record(s).", "success")
+
+            # ── Option 4: Delete specific service ─────────────────────────────
+            if choice == "4":
+                print()
+                services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
+                if not services:
+                    print_status("No services in database.", "warning")
+                    time.sleep(1)
+                    continue
+
+                print(f"  {C_CYAN}Available services:{C_RESET}")
+                for s in services:
+                    print(f"  {C_CYAN}│{C_RESET}  {s['name']}")
+                print()
+
+                service_name = input(f"  {C_BOLD}Service name to delete:{C_RESET} ").strip()
+                if not service_name:
+                    print_status("No name entered. Cancelled.", "warning")
+                    time.sleep(1)
+                    continue
+
+                svc = db.query("SELECT * FROM services WHERE name=?", (service_name,), fetch_one=True)
+                if not svc:
+                    print_status(f"'{service_name}' not found.", "error")
+                else:
+                    print(f"\n  {C_YELLOW}Deleting ALL records for {C_BOLD}'{service_name}'{C_RESET}{C_YELLOW}:{C_RESET}")
+                    print(f"  {C_CYAN}│{C_RESET}  Service record")
+                    print(f"  {C_CYAN}│{C_RESET}  Backup records")
+                    print(f"  {C_CYAN}│{C_RESET}  Deployment history")
+                    print(f"  {C_CYAN}│{C_RESET}  Metrics history")
+                    print()
+                    confirm2 = input(f"  Type {C_BOLD}'{service_name}'{C_RESET} to confirm: ").strip()
+                    if confirm2 == service_name:
+                        db.query("DELETE FROM metrics_history WHERE service_name=?", (service_name,))
+                        db.query("DELETE FROM deployments    WHERE service_name=?", (service_name,))
+                        db.query("DELETE FROM backups        WHERE service_name=?", (service_name,))
+                        db.query("DELETE FROM services       WHERE name=?",         (service_name,))
+                        deleted_count += 1
+                        print_status(f"'{service_name}' fully removed.", "success")
+                    else:
+                        print_status("Name didn't match. Cancelled.", "warning")
+
+            # ── Option 5: Vacuum ───────────────────────────────────────────────
+            if choice in ("5", "6"):
+                print_status("Optimizing database file...", "info")
+                size_before = os.path.getsize(DB_FILE) / 1024 if os.path.exists(DB_FILE) else 0
+                try:
+                    conn = sqlite3.connect(DB_FILE)
+                    conn.execute("VACUUM")
+                    conn.close()
+                    size_after = os.path.getsize(DB_FILE) / 1024 if os.path.exists(DB_FILE) else 0
+                    saved      = max(0.0, size_before - size_after)
+                    print_status(
+                        f"Optimized  {size_before:.1f} KB → {size_after:.1f} KB  "
+                        f"(saved {saved:.1f} KB)", "success"
+                    )
+                except Exception as ve:
+                    print_status(f"Vacuum failed: {ve}", "error")
+
+            # ── Option 7: Delete failed deployments only ───────────────────────
+            if choice == "7":
+                print_status("Removing failed deployment records...", "info")
+                before = db.query("SELECT COUNT(*) as count FROM deployments WHERE status != 'success'", fetch_one=True)
+                db.query("DELETE FROM deployments WHERE status != 'success'")
+                after  = db.query("SELECT COUNT(*) as count FROM deployments", fetch_one=True)
+                removed = before['count'] if before else 0
+                deleted_count += removed
+                print_status(f"Removed {removed} failed record(s). {after['count'] if after else 0} successful kept.", "success")
+
+            # ── Option 8: Reset metrics for one service ────────────────────────
+            if choice == "8":
+                print()
+                services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
+                if not services:
+                    print_status("No services in database.", "warning")
+                    time.sleep(1)
+                    continue
+
+                print(f"  {C_CYAN}Available services:{C_RESET}")
+                for s in services:
+                    count = db.query(
+                        "SELECT COUNT(*) as count FROM metrics_history WHERE service_name=?",
+                        (s['name'],), fetch_one=True
+                    )
+                    print(f"  {C_CYAN}│{C_RESET}  {s['name']:<25} {count['count'] if count else 0} records")
+                print()
+
+                service_name = input(f"  {C_BOLD}Service name to clear metrics:{C_RESET} ").strip()
+                if not service_name:
+                    print_status("No name entered. Cancelled.", "warning")
+                    time.sleep(1)
+                    continue
+
+                result = db.query(
+                    "SELECT COUNT(*) as count FROM metrics_history WHERE service_name=?",
+                    (service_name,), fetch_one=True
+                )
+                count = result['count'] if result else 0
+                if count == 0:
+                    print_status(f"No metrics found for '{service_name}'.", "warning")
+                else:
+                    db.query("DELETE FROM metrics_history WHERE service_name=?", (service_name,))
+                    deleted_count += count
+                    print_status(f"Cleared {count} metrics records for '{service_name}'.", "success")
+
+            # ── Option 9: Delete backups older than N days ─────────────────────
+            if choice == "9":
+                print()
+                days_str = input(f"  {C_BOLD}Delete backups older than how many days?{C_RESET} ").strip()
+                if not days_str.isdigit() or int(days_str) < 1:
+                    print_status("Invalid number. Enter a positive integer.", "warning")
+                    time.sleep(1)
+                    continue
+
+                days = int(days_str)
+                old_backups = db.query(f"""
+                    SELECT id, service_name, filename, timestamp
+                    FROM backups
+                    WHERE timestamp < datetime('now', '-{days} days')
+                    ORDER BY timestamp ASC
+                """, fetch_all=True)
+
+                if not old_backups:
+                    print_status(f"No backups older than {days} days found.", "info")
+                else:
+                    print(f"\n  {C_YELLOW}Found {len(old_backups)} backup(s) older than {days} days:{C_RESET}")
+                    for b in old_backups:
+                        ts       = b['timestamp'][:19] if b['timestamp'] else "Unknown"
+                        svc_name = b['service_name'] or "unknown"
+                        fname    = b['filename']     or "unknown"
+                        print(f"  {C_CYAN}│{C_RESET}  {svc_name:<20} {fname:<35} {ts}")
+
+                        if b['filename']:
+                            backup_file = os.path.join(BACKUP_DIR, b['filename'])
+                            if os.path.exists(backup_file):
+                                try:
+                                    os.remove(backup_file)
+                                    print(f"  {C_CYAN}│{C_RESET}  {C_GREEN}✓ File deleted{C_RESET}")
+                                except Exception as fe:
+                                    print(f"  {C_CYAN}│{C_RESET}  {C_YELLOW}⚠ {fe}{C_RESET}")
+
+                        db.query("DELETE FROM backups WHERE id=?", (b['id'],))
+                        deleted_count += 1
+
+                    print_status(f"Removed {len(old_backups)} old backup(s).", "success")
+
+            # ── Audit + done ───────────────────────────────────────────────────
+            audit_log("DATABASE_CLEANUP", "ATS", {
+                "action": choice,
+                "records_deleted": deleted_count
+            })
+
+            print(f"\n  {C_CYAN}{'─' * 55}{C_RESET}")
+            print(f"  {C_GREEN}{C_BOLD}✓ Cleanup completed{C_RESET}")
+            print(f"  {C_GREEN}Records affected: {deleted_count}{C_RESET}")
+            print(f"  {C_CYAN}{'─' * 55}{C_RESET}")
+
+        except Exception as e:
+            logger.error(f"Database cleanup error: {e}")
+            print_status(f"Cleanup failed: {e}", "error")
+
+        input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}")
 
 # ==============================================================================
 #   TELEMETRY
