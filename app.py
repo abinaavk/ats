@@ -2559,7 +2559,6 @@ async def get_telemetry_async() -> Tuple[float, str, str, int]:
 # ==============================================================================
 
 def mainmenu():
-    """Main interactive menu - COMPLETE WITH ALL FEATURES"""
     while True:
         try:
             print_header()
@@ -2567,45 +2566,64 @@ def mainmenu():
             cpu, ram, disk, svccount = asyncio.run(get_telemetry_async())
 
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
-            print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}System{C_RESET}: CPU {cpu:.1f}% | RAM {ram} | Disk {disk} | Services {svccount} {C_CYAN}│{C_RESET}")
+            print(f"{C_CYAN}│{C_RESET} {C_BOLD}System{C_RESET}: CPU {cpu:.1f}% | RAM {ram} | Disk {disk} | Services {svccount} {C_CYAN}│{C_RESET}")
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
 
             services = db.query("SELECT * FROM services ORDER BY name", fetch_all=True)
 
-            print(f"{C_BOLD}{'NAME':<15} {'PORT':<8} {'STATUS':<12} {'DOMAIN'}{C_RESET}")
-            print(f"{C_CYAN}{'─' * 70}{C_RESET}")
-
             if services:
                 health_results = asyncio.run(parallel_health_checks(services))
-                for svc in services:
+
+                # Table Header
+                print(f"{C_CYAN}│{C_RESET} {C_BOLD}{'S.No.':<4} {'NAME':<40} {'PORT':<7} {'STATUS':<12} {'DOMAIN':<40} {'LOCATION'}{C_RESET}")
+                print(f"{C_CYAN}│{C_RESET} {'─' * 4} {'─' * 40} {'─' * 7} {'─' * 12} {'─' * 40} {'─' * 20}")
+
+                for idx, svc in enumerate(services, start=1):
                     is_healthy = health_results.get(svc['name'], False)
-                    if is_healthy:
-                        status_str = f"{C_GREEN}● ONLINE{C_RESET}"
-                    else:
-                        status_str = f"{C_RED}● OFFLINE{C_RESET}"
-                    print(f"{svc['name']:<15} {svc['port']:<8} {status_str:<20} {svc['domain']}")
+                    status_str = f"{C_GREEN}● ONLINE{C_RESET}" if is_healthy else f"{C_RED}● OFFLINE{C_RESET}"
+
+                    # Truncate long values smartly
+                    name = svc['name'][:28] + ".." if len(svc['name']) > 28 else svc['name']
+                    domain = svc['domain'][:38] + ".." if len(svc['domain']) > 38 else svc['domain']
+
+                    # Build location from storage_path + /api/ + name
+                    full_loc = os.path.join(svc['storage_path'], "api", svc['name'])
+                    location = full_loc[:18] + ".." if len(full_loc) > 18 else full_loc
+
+                    print(f"{C_CYAN}│{C_RESET} "
+                          f"{C_BOLD}{idx:<4}{C_RESET}"
+                          f"{name:<30} "
+                          f"{svc['port']:<7} "
+                          f"{status_str:<21} "
+                          f"{domain:<40} "
+                          f"{C_CYAN}{location}{C_RESET}")
+
             else:
-                print(f"{C_YELLOW}No services deployed{C_RESET}")
+                print(f"{C_CYAN}│{C_RESET}  {C_YELLOW}No services deployed yet — use Option 1 to get started{C_RESET}")
 
-            print(f"{C_CYAN}{'─' * 70}{C_RESET}")
+            print(f"{C_CYAN}{'─' * 120}{C_RESET}")
 
-            print(f"\n{C_CYAN}═══ DEPLOYMENT MANAGEMENT ═══{C_RESET}")
+            # ════ MENU ════
+            print(f"\n{C_CYAN}╔{'═' * 55}╦{'═' * 55}╗{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}1{C_RESET}  Deploy Service        {C_CYAN}│{C_RESET}  {C_BOLD}5{C_RESET}  Service Operations")
+                f"{C_CYAN}║{C_RESET}  {C_BOLD}{'DEPLOYMENT & SERVICES':<53}{C_CYAN}║{C_RESET}  {C_BOLD}{'SYSTEM & DATABASE':<53}{C_CYAN}║{C_RESET}")
+            print(f"{C_CYAN}╠{'═' * 55}╬{'═' * 55}╣{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}2{C_RESET}  List Services         {C_CYAN}│{C_RESET}  {C_BOLD}6{C_RESET}  Backup Service")
+                f"{C_CYAN}║{C_RESET}  {C_BOLD}1{C_RESET}  Deploy Service{' ' * 38}{C_CYAN}║{C_RESET}  {C_BOLD}5{C_RESET}  Service Operations{' ' * 34}{C_CYAN}║{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}3{C_RESET}  Destroy Service       {C_CYAN}│{C_RESET}  {C_BOLD}7{C_RESET}  List Backups")
+                f"{C_CYAN}║{C_RESET}  {C_BOLD}2{C_RESET}  List Services{' ' * 39}{C_CYAN}║{C_RESET}  {C_BOLD}6{C_RESET}  Backup Service{' ' * 38}{C_CYAN}║{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}4{C_RESET}  View Logs             {C_CYAN}│{C_RESET}  {C_BOLD}8{C_RESET}  Export Metrics")
-            print(f"{C_CYAN}│{C_RESET}")
+                f"{C_CYAN}║{C_RESET}  {C_BOLD}3{C_RESET}  Destroy Service{' ' * 37}{C_CYAN}║{C_RESET}  {C_BOLD}7{C_RESET}  List Backups{' ' * 40}{C_CYAN}║{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}9{C_RESET}  Deployment History    {C_CYAN}│{C_RESET}  {C_BOLD}D{C_RESET}  System Diagnostics")
+                f"{C_CYAN}║{C_RESET}  {C_BOLD}4{C_RESET}  View Logs{' ' * 43}{C_CYAN}║{C_RESET}  {C_BOLD}8{C_RESET}  Export Metrics{' ' * 38}{C_CYAN}║{C_RESET}")
+            print(f"{C_CYAN}╠{'═' * 55}╬{'═' * 55}╣{C_RESET}")
             print(
-                f"{C_CYAN}│{C_RESET} {C_BOLD}10{C_RESET} View Database         {C_CYAN}│{C_RESET}  {C_BOLD}11{C_RESET} Database Cleanup")
-            print(f"{C_CYAN}{'═' * 70}{C_RESET}")
-            print(f"\n{C_RED}{C_BOLD}0{C_RESET}  Exit")
+                f"{C_CYAN}║{C_RESET}  {C_BOLD}9{C_RESET}  Deployment History{' ' * 34}{C_CYAN}║{C_RESET}  {C_BOLD}D{C_RESET}  System Diagnostics{' ' * 34}{C_CYAN}║{C_RESET}")
+            print(
+                f"{C_CYAN}║{C_RESET}  {C_BOLD}10{C_RESET} View Database{' ' * 39}{C_CYAN}║{C_RESET}  {C_BOLD}11{C_RESET} Database Cleanup{' ' * 36}{C_CYAN}║{C_RESET}")
+            print(f"{C_CYAN}╠{'═' * 55}╩{'═' * 55}╣{C_RESET}")
+            print(f"{C_CYAN}║{C_RESET}  {C_RED}{C_BOLD}0{C_RESET}  Exit ATS{' ' * 100}{C_CYAN}║{C_RESET}")
+            print(f"{C_CYAN}╚{'═' * 113}╝{C_RESET}")
 
             choice = input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} ").strip().lower()
 
