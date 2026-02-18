@@ -1276,7 +1276,7 @@ def list_services_detailed():
     RESERVED    = 23 # exactly counted above
 
     usable      = terminal_rows - RESERVED
-    per_page    = max(1, usable // CARD_HEIGHT)
+    per_page = max(1, min(3, usable // CARD_HEIGHT))
     total       = len(services)
     total_pages = max(1, (total + per_page - 1) // per_page)
     current     = 1
