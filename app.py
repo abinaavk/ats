@@ -2139,20 +2139,20 @@ def auto_health_recovery():
     """
     from datetime import datetime
 
-    FAIL_THRESHOLD   = 3    # restarts after this many consecutive fails
-    CHECK_INTERVAL   = 60   # seconds between full sweeps
-    RESTART_WAIT     = 10   # seconds to wait after restart before re-checking
+    FAIL_THRESHOLD = 3
+    CHECK_INTERVAL = 60
+    RESTART_WAIT   = 10
 
-    log_path = os.path.join(ATS_DIR, "logs", "health_recovery.log")
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    # ── Use correct constant + auto-create logs folder ─────────────────────────
+    log_dir  = os.path.join(ATS_HOME, "logs")
+    log_path = os.path.join(log_dir, "health_recovery.log")
+    os.makedirs(log_dir, exist_ok=True)   # creates /home/gaia/ats/logs/ if missing
 
     def log(msg, level="INFO"):
-        """Write to both file and console"""
         timestamp = datetime.now().strftime("%d %b %Y %H:%M:%S")
         line      = f"[{timestamp}] [{level}] {msg}"
         with open(log_path, "a") as f:
             f.write(line + "\n")
-        # Also print to console if running in foreground
         if level == "CRITICAL":
             print(f"{C_RED}{line}{C_RESET}")
         elif level == "WARNING":
@@ -2174,12 +2174,12 @@ def auto_health_recovery():
         )
         now = datetime.now().isoformat()
         if existing:
-            db.execute(
+            db.query(
                 "UPDATE health_fail_counters SET fail_count=?, last_checked=? WHERE service_name=?",
                 (count, now, service_name)
             )
         else:
-            db.execute(
+            db.query(
                 "INSERT INTO health_fail_counters (service_name, fail_count, last_checked) VALUES (?,?,?)",
                 (service_name, count, now)
             )
@@ -2189,7 +2189,7 @@ def auto_health_recovery():
 
     def log_recovery_event(service_name, fail_count, restarted, recovered, note):
         now = datetime.now().isoformat()
-        db.execute(
+        db.query(
             """INSERT INTO health_recovery_log
                (service_name, fail_count, last_fail, restarted_at, recovered, note)
                VALUES (?,?,?,?,?,?)""",
@@ -2200,7 +2200,6 @@ def auto_health_recovery():
         )
 
     def restart_service(service_name):
-        """Restart via systemd and return True if successful"""
         result = subprocess.run(
             ["sudo", "systemctl", "restart", service_name],
             capture_output=True, text=True
@@ -2208,7 +2207,6 @@ def auto_health_recovery():
         return result.returncode == 0
 
     def is_service_healthy(svc):
-        """Single health check — returns True/False"""
         try:
             import urllib.request
             url      = f"http://localhost:{svc['port']}/health"
@@ -2220,55 +2218,48 @@ def auto_health_recovery():
 
     log("Auto Health Recovery daemon started.", "INFO")
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
     while True:
         try:
             services = db.query("SELECT * FROM services", fetch_all=True)
 
-            for svc in services:
-                name    = svc['name']
-                healthy = is_service_healthy(svc)
+            if services:
+                for svc in services:
+                    name    = svc['name']
+                    healthy = is_service_healthy(svc)
 
-                if healthy:
-                    # ── Healthy → reset counter ────────────────────────────────
-                    prev_count = get_fail_count(name)
-                    if prev_count > 0:
-                        log(f"{name} → recovered (was at {prev_count} fails). Counter reset.", "RECOVERY")
-                        log_recovery_event(name, prev_count, False, True, "Self-recovered")
-                    reset_fail_count(name)
+                    if healthy:
+                        prev_count = get_fail_count(name)
+                        if prev_count > 0:
+                            log(f"{name} → recovered (was at {prev_count} fails). Counter reset.", "RECOVERY")
+                            log_recovery_event(name, prev_count, False, True, "Self-recovered")
+                        reset_fail_count(name)
 
-                else:
-                    # ── Unhealthy → increment counter ──────────────────────────
-                    fail_count = get_fail_count(name) + 1
-                    set_fail_count(name, fail_count)
-                    log(f"{name} → health check FAILED ({fail_count}/{FAIL_THRESHOLD})", "WARNING")
+                    else:
+                        fail_count = get_fail_count(name) + 1
+                        set_fail_count(name, fail_count)
+                        log(f"{name} → health check FAILED ({fail_count}/{FAIL_THRESHOLD})", "WARNING")
 
-                    if fail_count >= FAIL_THRESHOLD:
-                        # ── Threshold hit → RESTART ────────────────────────────
-                        log(f"{name} → {FAIL_THRESHOLD} consecutive failures. AUTO RESTARTING...", "WARNING")
-                        restarted = restart_service(name)
+                        if fail_count >= FAIL_THRESHOLD:
+                            log(f"{name} → {FAIL_THRESHOLD} consecutive failures. AUTO RESTARTING...", "WARNING")
+                            restarted = restart_service(name)
 
-                        if restarted:
-                            log(f"{name} → restart command sent. Waiting {RESTART_WAIT}s...", "INFO")
-                            time.sleep(RESTART_WAIT)
+                            if restarted:
+                                log(f"{name} → restart command sent. Waiting {RESTART_WAIT}s...", "INFO")
+                                time.sleep(RESTART_WAIT)
+                                recovered = is_service_healthy(svc)
 
-                            # ── Post-restart health check ──────────────────────
-                            recovered = is_service_healthy(svc)
-
-                            if recovered:
-                                log(f"{name} → RECOVERED after restart ✓", "RECOVERY")
-                                log_recovery_event(name, fail_count, True, True, "Auto-restarted and recovered")
-                                reset_fail_count(name)
+                                if recovered:
+                                    log(f"{name} → RECOVERED after restart ✓", "RECOVERY")
+                                    log_recovery_event(name, fail_count, True, True, "Auto-restarted and recovered")
+                                    reset_fail_count(name)
+                                else:
+                                    log(f"{name} → STILL FAILING after restart. Manual intervention needed!", "CRITICAL")
+                                    log_recovery_event(name, fail_count, True, False, "Auto-restarted but still failing")
+                                    reset_fail_count(name)
                             else:
-                                log(f"{name} → STILL FAILING after restart. Manual intervention needed!", "CRITICAL")
-                                log_recovery_event(name, fail_count, True, False, "Auto-restarted but still failing")
-                                # Reset counter so it doesn't spam restarts every 60s
-                                # Will try again after FAIL_THRESHOLD more failures
+                                log(f"{name} → restart FAILED (systemd error). Check sudo permissions.", "CRITICAL")
+                                log_recovery_event(name, fail_count, False, False, "Restart command failed")
                                 reset_fail_count(name)
-                        else:
-                            log(f"{name} → restart FAILED (systemd error). Check sudo permissions.", "CRITICAL")
-                            log_recovery_event(name, fail_count, False, False, "Restart command failed")
-                            reset_fail_count(name)
 
         except Exception as e:
             log(f"Recovery daemon error: {e}", "CRITICAL")
