@@ -2710,9 +2710,6 @@ def mainmenu():
         try:
             print_header()
 
-            recovery_thread = threading.Thread(target=auto_health_recovery, daemon=True, name="HealthRecovery")
-            recovery_thread.start()
-
             cpu, ram, disk, svccount = asyncio.run(get_telemetry_async())
 
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
