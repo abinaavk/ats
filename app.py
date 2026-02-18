@@ -2576,8 +2576,8 @@ def mainmenu():
                 health_results = asyncio.run(parallel_health_checks(services))
 
                 # Table Header
-                header = f"  {'S.No.':<6} {'NAME':<40} {'PORT':<7} {'STATUS':<12} {'DOMAIN':<42} {'LOCATION':<25}"
-                separator = f"  {C_CYAN}{'─' * 6} {'─' * 40} {'─' * 7} {'─' * 12} {'─' * 42} {'─' * 25}{C_RESET}"
+                header = f"  {'S.No.':<6} {'NAME':<40} {'PORT':<7} {'STATUS':<12} {'DOMAIN':<42} {'LOCATION':<60}"
+                separator = f"  {C_CYAN}{'─' * 6} {'─' * 40} {'─' * 7} {'─' * 12} {'─' * 42} {'─' * 60}{C_RESET}"
 
                 print(f"{C_CYAN}│{C_RESET}{C_BOLD}{header}{C_RESET}")
                 print(f"{C_CYAN}│{C_RESET}{C_CYAN}{separator}{C_RESET}")
@@ -2589,7 +2589,7 @@ def mainmenu():
                     name = svc['name'][:38] + ".." if len(svc['name']) > 38 else svc['name']
                     domain = svc['domain'][:40] + ".." if len(svc['domain']) > 40 else svc['domain']
                     full_loc = os.path.join(svc['storage_path'], "api", svc['name'])
-                    location = full_loc[:23] + ".." if len(full_loc) > 23 else full_loc
+                    location = full_loc[:60] + ".." if len(full_loc) > 60 else full_loc
 
                     row = (
                         f"  {C_BOLD}{idx:<6}{C_RESET}"
@@ -2603,7 +2603,7 @@ def mainmenu():
             else:
                 print(f"{C_CYAN}│{C_RESET}  {C_YELLOW}No services deployed yet — use Option 1 to get started{C_RESET}")
 
-            print(f"{C_CYAN}{'─' * 120}{C_RESET}")
+            print(f"{C_CYAN}{'─' * 167}{C_RESET}")
 
             # ════ MENU ════
             def menu_row(left_num, left_text, right_num, right_text, col_width=53):
@@ -2645,7 +2645,7 @@ def mainmenu():
             print(menu_row("10", "View Database", "11", "Database Cleanup"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
             print(menu_single_row("0", "Exit ATS"))
-            print(f"{C_CYAN}╚{'═' * T}╝{C_RESET}")
+            print(f"{C_CYAN}╚{'═' * (T-3)}╝{C_RESET}")
 
             choice = input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} ").strip().lower()
 
