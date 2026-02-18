@@ -2265,44 +2265,6 @@ def export_metrics():
 
     input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}")
 
-def view_deployment_history():
-    """View deployment history"""
-    print_header()
-    print(f"{C_CYAN}{C_BOLD}═══ DEPLOYMENT HISTORY ═══{C_RESET}\n")
-
-    deployments = db.query(
-        "SELECT * FROM deployments ORDER BY timestamp DESC LIMIT 50",
-        fetch_all=True
-    )
-
-    if not deployments:
-        print_status("No deployment history", "warning")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-        return
-
-    print(f"{C_CYAN}Total Deployments: {C_BOLD}{len(deployments)}{C_RESET}\n")
-
-    success_count = sum(1 for d in deployments if d['status'] == 'success')
-    failed_count = len(deployments) - success_count
-
-    print(f"{C_GREEN}✓ Successful: {success_count}{C_RESET}  |  {C_RED}✗ Failed: {failed_count}{C_RESET}\n")
-
-    print(f"{C_BOLD}{'ID':<4} {'SERVICE':<15} {'STATUS':<18} {'DURATION':<12} {'TIMESTAMP':<20}{C_RESET}")
-    print(f"{C_CYAN}{'─' * 100}{C_RESET}")
-
-    for deploy in deployments:
-        status_icon = f"{C_GREEN}SUCCESS{C_RESET}" if deploy['status'] == 'success' else f"{C_RED}FAILED{C_RESET}"
-        duration = f"{deploy['duration_seconds']:.1f}s" if deploy['duration_seconds'] else "N/A"
-        timestamp = deploy['timestamp'][:19] if deploy['timestamp'] else "Unknown"
-
-        print(f"{deploy['id']:<4} {deploy['service_name']:<15} {status_icon:<26} {duration:<12} {timestamp:<20}")
-
-        if deploy['error_message']:
-            print(f"     {C_YELLOW}Error: {deploy['error_message'][:60]}{C_RESET}")
-
-    print(f"{C_CYAN}{'─' * 100}{C_RESET}\n")
-    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
-
 # ==============================================================================
 #   SYSTEM DIAGNOSTICS
 # ==============================================================================
@@ -3266,8 +3228,8 @@ def mainmenu():
             print(menu_row("3", "Destroy Service", "7", "List Backups"))
             print(menu_row("4", "View Logs", "8", "Export Metrics"))
             print(f"{C_CYAN}╠{'═' * W}╬{'═' * W}╣{C_RESET}")
-            print(menu_row("9", "Deployment History", "D", "System Diagnostics"))
-            print(menu_row("10", "View Database", "11", "Database Cleanup"))
+            print(menu_row("9", "View Database", "10", "Database Cleanup"))
+            print(menu_row("11", "Future", "D", "System Diagnostics"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
             print(menu_single_row("[ 0 ]", "Exit ATS"))
             print(f"{C_CYAN}╚{'═' * (T-2)}╝{C_RESET}")
@@ -3291,10 +3253,8 @@ def mainmenu():
             elif choice == "8":
                 export_metrics()
             elif choice == "9":
-                view_deployment_history()
-            elif choice == "10":
                 view_database()
-            elif choice == "11":
+            elif choice == "10":
                 database_cleanup()
             elif choice == "d":
                 ats_doctor()
