@@ -2603,11 +2603,11 @@ def mainmenu():
             else:
                 print(f"{C_CYAN}│{C_RESET}  {C_YELLOW}No services deployed yet — use Option 1 to get started{C_RESET}")
 
-            print(f"{C_CYAN}{'─' * 167}{C_RESET}")
+            print(f"{C_CYAN}{'─' * 180}{C_RESET}")
 
             # ════ MENU ════
-            W = 50
-            T = 100
+            W = 55
+            T = 113
             
             def menu_row(left_num, left_text, right_num, right_text, col_width=W):
                 left = f"{C_BOLD}{left_num}{C_RESET}  {left_text}"
@@ -2629,7 +2629,7 @@ def mainmenu():
             def menu_single_row(num, text, total_width=T):
                 content = f"{C_RED}{C_BOLD}{num}{C_RESET}  {text}"
                 visible = len(num) + 2 + len(text)
-                pad = total_width - visible - 3
+                pad = total_width - visible - 2
                 return f"{C_CYAN}║{C_RESET}  {content}{' ' * pad}{C_CYAN}║{C_RESET}"
 
             print(f"\n{C_CYAN}╔{'═' * W}╦{'═' * W}╗{C_RESET}")
@@ -2644,7 +2644,7 @@ def mainmenu():
             print(menu_row("9", "Deployment History", "D", "System Diagnostics"))
             print(menu_row("10", "View Database", "11", "Database Cleanup"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
-            print(menu_single_row("0", "Exit ATS"))
+            print(menu_single_row("[0]", "Exit ATS"))
             print(f"{C_CYAN}╚{'═' * (T-1)}╝{C_RESET}")
 
             choice = input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} ").strip().lower()
