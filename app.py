@@ -2606,7 +2606,10 @@ def mainmenu():
             print(f"{C_CYAN}{'─' * 167}{C_RESET}")
 
             # ════ MENU ════
-            def menu_row(left_num, left_text, right_num, right_text, col_width=53):
+            W = 50
+            T = 100
+            
+            def menu_row(left_num, left_text, right_num, right_text, col_width=W):
                 left = f"{C_BOLD}{left_num}{C_RESET}  {left_text}"
                 right = f"{C_BOLD}{right_num}{C_RESET}  {right_text}"
 
@@ -2623,14 +2626,11 @@ def mainmenu():
                     f"{C_CYAN}║{C_RESET}"
                 )
 
-            def menu_single_row(num, text, total_width=113):
+            def menu_single_row(num, text, total_width=T):
                 content = f"{C_RED}{C_BOLD}{num}{C_RESET}  {text}"
                 visible = len(num) + 2 + len(text)
-                pad = total_width - visible - 2
+                pad = total_width - visible - 3
                 return f"{C_CYAN}║{C_RESET}  {content}{' ' * pad}{C_CYAN}║{C_RESET}"
-
-            W = 55
-            T = 113
 
             print(f"\n{C_CYAN}╔{'═' * W}╦{'═' * W}╗{C_RESET}")
             print(
@@ -2645,7 +2645,7 @@ def mainmenu():
             print(menu_row("10", "View Database", "11", "Database Cleanup"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
             print(menu_single_row("0", "Exit ATS"))
-            print(f"{C_CYAN}╚{'═' * (T-3)}╝{C_RESET}")
+            print(f"{C_CYAN}╚{'═' * (T-1)}╝{C_RESET}")
 
             choice = input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} ").strip().lower()
 
