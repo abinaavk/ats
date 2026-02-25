@@ -1089,18 +1089,18 @@ async def deploy_service_async():
         except Exception as e:
             raise RuntimeError(f"Failed to configure Cloudflare: {e}")
 
-            # ========== DATABASE RECORD ==========
-            print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
-            print_status("REGISTERING SERVICE IN DATABASE", "info")
+        # ========== DATABASE RECORD ==========
+        print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
+        print_status("REGISTERING SERVICE IN DATABASE", "info")
 
-            try:
+        try:
                 # --- FIX: SMART DEPENDENCY HASHING ---
-                if runtime == "node":
-                    target_file = os.path.join(api_dir, "package.json")
-                else:
-                    target_file = os.path.join(api_dir, "requirements.txt")
-            except:
-                pass
+            if runtime == "node":
+                target_file = os.path.join(api_dir, "package.json")
+            else:
+                target_file = os.path.join(api_dir, "requirements.txt")
+
+            deployment_hash = calculate_file_hash(target_file) if os.path.exists(target_file) else "none"
 
             print_status("Inserting service record...", "info")
             db.query(
