@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-ATS | AUTOMATED TECH STACK | v7.0
-Architect: Abinaav K
-Status: PRODUCTION - ALL FEATURES COMPLETE
-"""
-
 import os
 import sys
 import subprocess
@@ -26,7 +18,6 @@ from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 import threading
-
 
 # --- DEPENDENCY SAFEGUARD ---
 try:
@@ -78,7 +69,6 @@ if PROMETHEUS_AVAILABLE:
     BACKUP_COUNTER = Counter('ats_backups_total', 'Total backups created')
     HEALTH_CHECK_DURATION = Histogram('ats_health_check_seconds', 'Health check duration', ['service'])
 
-
 # ==============================================================================
 #   DATA MODELS
 # ==============================================================================
@@ -101,7 +91,6 @@ class ServiceConfig:
             import multiprocessing
             self.workers = min(multiprocessing.cpu_count() * 2 + 1, 8)
 
-
 # ==============================================================================
 #   VISUAL STYLING
 # ==============================================================================
@@ -114,7 +103,6 @@ C_YELLOW = "\033[93m"
 C_CYAN = "\033[96m"
 C_BLUE = "\033[94m"
 C_MAGENTA = "\033[95m"
-
 
 def print_header():
     os.system('clear')
@@ -134,14 +122,12 @@ def print_header():
     """ + f"{C_RESET}")
     print(f"{C_CYAN}{'=' * 70}{C_RESET}")
 
-
 def print_status(msg: str, status: str = "info"):
     colors = {"info": C_CYAN, "success": C_GREEN, "error": C_RED, "warning": C_YELLOW}
     symbols = {"info": "▶", "success": "✓", "error": "✗", "warning": "⚠"}
     color = colors.get(status, C_CYAN)
     symbol = symbols.get(status, "▶")
     print(f"{color}{symbol} {msg}{C_RESET}")
-
 
 # ==============================================================================
 #   LOGGING & AUDITING
@@ -159,18 +145,9 @@ class SecurityLogger(logging.Handler):
             except:
                 pass
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-8s | %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s', handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger()
 logger.addHandler(SecurityLogger())
-
 
 def audit_log(action: str, target: str, metadata: Optional[Dict] = None):
     """Enhanced audit logging with structured data"""
@@ -186,7 +163,6 @@ def audit_log(action: str, target: str, metadata: Optional[Dict] = None):
             f.write(json.dumps(entry) + "\n")
     except Exception as e:
         logger.error(f"Audit log failed: {e}")
-
 
 # ==============================================================================
 #   DATABASE ENGINE
@@ -326,7 +302,6 @@ def check_port_listening(port: int, timeout: float = 1.0) -> bool:
         except:
             pass
 
-
 def check_systemd_active(service_name: str) -> bool:
     """Check if systemd service is active"""
     try:
@@ -340,7 +315,6 @@ def check_systemd_active(service_name: str) -> bool:
     except Exception as e:
         logger.debug(f"Systemd check failed for {service_name}: {e}")
         return False
-
 
 def get_service_pid(service_name: str) -> Optional[int]:
     """Get service PID using systemctl"""
@@ -358,13 +332,11 @@ def get_service_pid(service_name: str) -> Optional[int]:
         logger.debug(f"Failed to get PID for {service_name}: {e}")
         return None
 
-
 def check_service_health(service_name: str, port: int) -> bool:
     """Check service health - both systemd status and port listening"""
     if not check_systemd_active(service_name):
         return False
     return check_port_listening(port, timeout=2.0)
-
 
 # ==============================================================================
 #   ASYNC UTILITIES
@@ -395,7 +367,6 @@ async def run_async_command(cmd: List[str], cwd: Optional[str] = None, timeout: 
         logger.error(f"Async command failed: {e}")
         raise
 
-
 async def check_single_service_health_async(svc: Dict) -> Tuple[str, bool]:
     """Async wrapper for health check"""
     try:
@@ -410,7 +381,6 @@ async def check_single_service_health_async(svc: Dict) -> Tuple[str, bool]:
     except Exception as e:
         logger.debug(f"Health check error for {svc['name']}: {e}")
         return svc['name'], False
-
 
 async def parallel_health_checks(services: List[Dict]) -> Dict[str, bool]:
     """Run health checks in parallel for all services"""
@@ -431,7 +401,6 @@ async def parallel_health_checks(services: List[Dict]) -> Dict[str, bool]:
             logger.debug(f"Health check exception: {result}")
 
     return health_dict
-
 
 # ==============================================================================
 #   CORE UTILITIES
@@ -460,7 +429,6 @@ def acquire_lock():
         print(f"{C_RED}CRITICAL: ATS is locked (Another instance running).{C_RESET}")
         sys.exit(1)
 
-
 def run_as_gaia(cmd: List[str], cwd: Optional[str] = None, timeout: int = 300, capture: bool = False):
     """Execute command as gaia user"""
     env = os.environ.copy()
@@ -486,12 +454,10 @@ def run_as_gaia(cmd: List[str], cwd: Optional[str] = None, timeout: int = 300, c
     except subprocess.TimeoutExpired:
         raise TimeoutError(f"Command timeout: {' '.join(cmd)}")
 
-
 def run_root(cmd: List[str], timeout: int = 60):
     """Execute command as root"""
     logger.info(f"EXEC(ROOT): {' '.join(cmd)}")
     subprocess.check_call(cmd, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
 
 def get_service_path(storage: str, name: str) -> str:
     """
@@ -509,7 +475,6 @@ def get_service_path(storage: str, name: str) -> str:
 
     return os.path.join(base, "api", name)
 
-
 def calculate_file_hash(filepath: str) -> str:
     """Calculate SHA256 hash of file"""
     sha256 = hashlib.sha256()
@@ -521,7 +486,6 @@ def calculate_file_hash(filepath: str) -> str:
     except Exception as e:
         logger.error(f"Failed to calculate hash: {e}")
         return "error"
-
 
 # ==============================================================================
 #   VALIDATION
@@ -540,7 +504,6 @@ def validate_storage(path: str) -> str:
         raise ValueError(f"Path not writable: {clean}")
     return clean
 
-
 def validate_domain(domain: str) -> str:
     """Validate domain format and availability"""
     if not domain:
@@ -550,7 +513,6 @@ def validate_domain(domain: str) -> str:
     if db.query("SELECT 1 FROM services WHERE domain=?", (domain,), fetch_one=True):
         raise ValueError(f"Domain {domain} already exists.")
     return domain.lower()
-
 
 def validate_port(port: str) -> int:
     """Validate port is numeric, in range, and available"""
@@ -570,7 +532,6 @@ def validate_port(port: str) -> int:
 
     return p
 
-
 def validate_git_url(url: str) -> str:
     """Validate git repository URL"""
     if not url:
@@ -578,7 +539,6 @@ def validate_git_url(url: str) -> str:
     if not (url.startswith("http://") or url.startswith("https://") or url.startswith("git@")):
         raise ValueError("Invalid Git URL format.")
     return url
-
 
 # ==============================================================================
 #   CLOUDFLARE MANAGEMENT
@@ -670,9 +630,7 @@ class CloudflareManager:
             self._restore_config()
             raise
 
-
 cloudflare = CloudflareManager(CLOUDFLARE_CONFIG)
-
 
 # ==============================================================================
 #   SYSTEMD SERVICE GENERATION
@@ -1542,7 +1500,6 @@ def destroy_service():
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
-
 def view_service_logs():
     """View service logs with options"""
     print_header()
@@ -1625,7 +1582,6 @@ def view_service_logs():
         print(f"{C_CYAN}{'=' * 70}{C_RESET}")
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
-
 
 def service_operations():
     """Service management operations menu - COMPLETE WITH VENV REBUILD"""
@@ -2058,7 +2014,6 @@ def service_operations():
     else:
         print_status("Invalid choice", "warning")
         time.sleep(1)
-
 
 # ==============================================================================
 #   BACKUP MANAGEMENT
