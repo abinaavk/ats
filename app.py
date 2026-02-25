@@ -181,7 +181,7 @@ class DatabaseManager:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         cursor = conn.cursor()
-        
+
         # delete after this
         try:
             conn.execute("ALTER TABLE services ADD COLUMN runtime TEXT DEFAULT 'python'")
@@ -189,7 +189,7 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass  # Column already exists
         # to this
-        
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1089,12 +1089,18 @@ async def deploy_service_async():
         except Exception as e:
             raise RuntimeError(f"Failed to configure Cloudflare: {e}")
 
-        # ========== DATABASE RECORD ==========
-        print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
-        print_status("REGISTERING SERVICE IN DATABASE", "info")
+            # ========== DATABASE RECORD ==========
+            print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
+            print_status("REGISTERING SERVICE IN DATABASE", "info")
 
-        try:
-            deployment_hash = calculate_file_hash(requirements_file) if os.path.exists(requirements_file) else "none"
+            try:
+                # --- FIX: SMART DEPENDENCY HASHING ---
+                if runtime == "node":
+                    target_file = os.path.join(api_dir, "package.json")
+                else:
+                    target_file = os.path.join(api_dir, "requirements.txt")
+            except:
+                pass
 
             print_status("Inserting service record...", "info")
             db.query(
