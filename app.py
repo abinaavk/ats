@@ -181,7 +181,15 @@ class DatabaseManager:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         cursor = conn.cursor()
-
+        
+        # delete after this
+        try:
+            conn.execute("ALTER TABLE services ADD COLUMN runtime TEXT DEFAULT 'python'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # to this
+        
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,15 +248,6 @@ class DatabaseManager:
 
         conn.commit()
         conn.close()
-
-        # delete after this
-        try:
-            conn.execute("ALTER TABLE services ADD COLUMN runtime TEXT DEFAULT 'python'")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
-        # to this
-
 
         try:
             os.chmod(self.db_path, 0o600)
