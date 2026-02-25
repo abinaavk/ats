@@ -93,6 +93,8 @@ class ServiceConfig:
     workers: int = 0
     max_memory_mb: int = 512
     cpu_quota: int = 50
+    runtime: str = "python"   # ✅ "python" or "node"
+
 
     def __post_init__(self):
         if self.workers == 0:
@@ -220,6 +222,7 @@ class DatabaseManager:
                 last_health_check TIMESTAMP,
                 deployment_hash TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -261,6 +264,16 @@ class DatabaseManager:
 
         conn.commit()
         conn.close()
+
+        # delete after this
+        try:
+            conn.execute("ALTER TABLE services ADD COLUMN runtime TEXT DEFAULT 'python'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        # to this
+
+
         try:
             os.chmod(self.db_path, 0o600)
         except:
@@ -666,7 +679,34 @@ cloudflare = CloudflareManager(CLOUDFLARE_CONFIG)
 # ==============================================================================
 
 def generate_systemd_service(config: ServiceConfig, api_dir: str, log_dir: str, db_dir: str) -> str:
-    """Generate enhanced systemd service file"""
+    """Generate systemd service file — supports Python (gunicorn) and Node.js (npm start)"""
+
+    if config.runtime == "node":
+        exec_start = f"/usr/bin/npm start"
+        env_block  = (
+            f'Environment="PATH=/usr/local/bin:/usr/bin:/bin"\n'
+            f'Environment="NODE_ENV=production"\n'
+            f'Environment="PORT={config.port}"'
+        )
+    else:
+        exec_start = (
+            f"{api_dir}/venv/bin/gunicorn \\\n"
+            f"    --bind 127.0.0.1:{config.port} \\\n"
+            f"    --workers {config.workers} \\\n"
+            f"    --worker-class sync \\\n"
+            f"    --timeout 120 \\\n"
+            f"    --max-requests 1000 \\\n"
+            f"    --max-requests-jitter 100 \\\n"
+            f"    --worker-connections 1000 \\\n"
+            f"    --access-logfile {log_dir}/access.log \\\n"
+            f"    --error-logfile {log_dir}/error.log \\\n"
+            f"    --log-level info \\\n"
+            f"    app:app"
+        )
+        env_block = (
+            f'Environment="PATH={api_dir}/venv/bin:/usr/local/bin:/usr/bin"\n'
+            f'Environment="PYTHONUNBUFFERED=1"'
+        )
 
     content = f"""[Unit]
 Description={config.name} API [ATS v7.0 MANAGED]
@@ -681,22 +721,10 @@ Group={SERVICE_GROUP}
 WorkingDirectory={api_dir}
 
 # Environment
-Environment="PATH={api_dir}/venv/bin:/usr/local/bin:/usr/bin"
-Environment="PYTHONUNBUFFERED=1"
+{env_block}
 
 # Execution
-ExecStart={api_dir}/venv/bin/gunicorn \\
-    --bind 127.0.0.1:{config.port} \\
-    --workers {config.workers} \\
-    --worker-class sync \\
-    --timeout 120 \\
-    --max-requests 1000 \\
-    --max-requests-jitter 100 \\
-    --worker-connections 1000 \\
-    --access-logfile {log_dir}/access.log \\
-    --error-logfile {log_dir}/error.log \\
-    --log-level info \\
-    app:app
+ExecStart={exec_start}
 
 # Logging
 StandardOutput=append:{log_dir}/stdout.log
@@ -748,7 +776,6 @@ UMask=0027
 WantedBy=multi-user.target
 """
     return content
-
 
 # ==============================================================================
 #   HEALTH CHECKING
@@ -830,7 +857,15 @@ async def deploy_service_async():
         port = validate_port(input(f"{C_BOLD}Port (1024-65535):{C_RESET} ").strip())
         repo_url = validate_git_url(input(f"{C_BOLD}Git Repository URL:{C_RESET} ").strip())
 
+        print(f"\n{C_CYAN}Runtime:{C_RESET}")
+        print(f"  1. Python (Flask/Gunicorn) [default]")
+        print(f"  2. Node.js (npm start)")
+        runtime_choice = input(f"{C_BOLD}Choice (1/2):{C_RESET} ").strip()
+        runtime = "node" if runtime_choice == "2" else "python"
+        print(f"  {C_CYAN}→ Runtime: {runtime}{C_RESET}")
+
         print(f"\n{C_YELLOW}Advanced Settings (press Enter for defaults):{C_RESET}")
+
         workers_input = input(f"  Workers [auto]: ").strip()
         workers = int(workers_input) if workers_input else 0
 
@@ -848,7 +883,8 @@ async def deploy_service_async():
             repo_url=repo_url,
             workers=workers,
             max_memory_mb=max_memory,
-            cpu_quota=cpu_quota
+            cpu_quota=cpu_quota,
+            runtime=runtime
         )
 
         # ========== INFRASTRUCTURE PROVISIONING ==========
@@ -941,88 +977,103 @@ async def deploy_service_async():
         except Exception as e:
             raise RuntimeError(f"Failed to create logs directory: {e}")
 
-        # ========== PYTHON ENVIRONMENT ==========
+        # ========== ENVIRONMENT SETUP ==========
         print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
-        print_status("CREATING PYTHON VIRTUAL ENVIRONMENT", "info")
 
-        try:
-            if not os.path.exists(api_dir):
-                raise RuntimeError(f"API directory missing before venv creation: {api_dir}")
+        if runtime == "node":
+            print_status("SETTING UP NODE.JS ENVIRONMENT", "info")
 
-            run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=api_dir, timeout=120)
-            print_status("Virtual environment created", "success")
+            # Check node/npm installed
+            try:
+                returncode, stdout, _ = await run_async_command(["node", "--version"])
+                if returncode != 0:
+                    raise RuntimeError("Node.js not found. Install with: sudo apt install nodejs npm")
+                print_status(f"Node.js detected: {stdout.strip()}", "success")
+            except FileNotFoundError:
+                raise RuntimeError("Node.js not found. Install with: sudo apt install nodejs npm")
 
-        except Exception as e:
-            raise RuntimeError(f"Failed to create virtual environment: {e}")
+            # Check for package.json
+            pkg_json = os.path.join(api_dir, "package.json")
+            if not os.path.exists(pkg_json):
+                print_status("Warning: package.json not found in repository root", "warning")
+            else:
+                print_status("Running npm install...", "info")
+                try:
+                    run_as_gaia(["npm", "install", "--production"], cwd=api_dir, timeout=300)
+                    print_status("npm packages installed", "success")
+                except Exception as e:
+                    raise RuntimeError(f"npm install failed: {e}")
 
-        # Find pip executable
-        pip3_path = os.path.join(api_dir, "venv", "bin", "pip3")
-        pip_path = os.path.join(api_dir, "venv", "bin", "pip")
+            print_status("Node.js environment ready", "success")
 
-        if os.path.exists(pip3_path):
-            pip_executable = pip3_path
-        elif os.path.exists(pip_path):
-            pip_executable = pip_path
         else:
-            raise RuntimeError(f"Failed to create virtual environment - no pip found in {api_dir}/venv/bin/")
-
-        print(f"  Using: {os.path.basename(pip_executable)}\n")
-
-        # Upgrade pip
-        print_status("Upgrading pip...", "info")
-        try:
-            run_as_gaia(
-                [pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"],
-                cwd=api_dir,
-                timeout=120
-            )
-            print_status("Pip upgraded", "success")
-        except Exception as e:
-            print_status(f"Pip upgrade warning: {e}", "warning")
-
-        # Install requirements
-        requirements_file = os.path.join(api_dir, "requirements.txt")
-
-        if os.path.exists(requirements_file):
-            print_status("Installing requirements.txt...", "info")
-            print(f"  This may take several minutes\n")
+            print_status("CREATING PYTHON VIRTUAL ENVIRONMENT", "info")
 
             try:
-                run_as_gaia(
-                    [pip_executable, "install", "-r", "requirements.txt"],
-                    cwd=api_dir,
-                    timeout=600
-                )
-                print_status("Dependencies installed", "success")
-            except Exception as pip_error:
-                raise RuntimeError(f"Failed to install requirements: {pip_error}")
-        else:
-            print_status("No requirements.txt found, installing Flask defaults", "warning")
-            try:
-                run_as_gaia(
-                    [pip_executable, "install", "flask", "flask-cors"],
-                    cwd=api_dir,
-                    timeout=120
-                )
+                if not os.path.exists(api_dir):
+                    raise RuntimeError(f"API directory missing before venv creation: {api_dir}")
+                run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=api_dir, timeout=120)
+                print_status("Virtual environment created", "success")
             except Exception as e:
-                raise RuntimeError(f"Failed to install Flask: {e}")
+                raise RuntimeError(f"Failed to create virtual environment: {e}")
 
-        # Install gunicorn
-        print_status("Installing Gunicorn...", "info")
-        try:
-            run_as_gaia([pip_executable, "install", "gunicorn"], cwd=api_dir, timeout=60)
-            print_status("Gunicorn installed", "success")
-        except Exception as e:
-            raise RuntimeError(f"Failed to install Gunicorn: {e}")
+            pip3_path = os.path.join(api_dir, "venv", "bin", "pip3")
+            pip_path  = os.path.join(api_dir, "venv", "bin", "pip")
+            if os.path.exists(pip3_path):
+                pip_executable = pip3_path
+            elif os.path.exists(pip_path):
+                pip_executable = pip_path
+            else:
+                raise RuntimeError(f"Failed to create virtual environment - no pip found in {api_dir}/venv/bin/")
 
-        # Optional: Prometheus exporter
-        if PROMETHEUS_AVAILABLE:
+            print(f"  Using: {os.path.basename(pip_executable)}\n")
+
+            print_status("Upgrading pip...", "info")
             try:
-                run_as_gaia([pip_executable, "install", "prometheus-flask-exporter"], cwd=api_dir, timeout=60)
-            except:
-                pass
+                run_as_gaia(
+                    [pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"],
+                    cwd=api_dir, timeout=120
+                )
+                print_status("Pip upgraded", "success")
+            except Exception as e:
+                print_status(f"Pip upgrade warning: {e}", "warning")
 
-        print_status("Python environment ready", "success")
+            requirements_file = os.path.join(api_dir, "requirements.txt")
+            if os.path.exists(requirements_file):
+                print_status("Installing requirements.txt...", "info")
+                print(f"  This may take several minutes\n")
+                try:
+                    run_as_gaia(
+                        [pip_executable, "install", "-r", "requirements.txt"],
+                        cwd=api_dir, timeout=600
+                    )
+                    print_status("Dependencies installed", "success")
+                except Exception as pip_error:
+                    raise RuntimeError(f"Failed to install requirements: {pip_error}")
+            else:
+                print_status("No requirements.txt found, installing Flask defaults", "warning")
+                try:
+                    run_as_gaia(
+                        [pip_executable, "install", "flask", "flask-cors"],
+                        cwd=api_dir, timeout=120
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"Failed to install Flask: {e}")
+
+            print_status("Installing Gunicorn...", "info")
+            try:
+                run_as_gaia([pip_executable, "install", "gunicorn"], cwd=api_dir, timeout=60)
+                print_status("Gunicorn installed", "success")
+            except Exception as e:
+                raise RuntimeError(f"Failed to install Gunicorn: {e}")
+
+            if PROMETHEUS_AVAILABLE:
+                try:
+                    run_as_gaia([pip_executable, "install", "prometheus-flask-exporter"], cwd=api_dir, timeout=60)
+                except:
+                    pass
+
+            print_status("Python environment ready", "success")
 
         # ========== SYSTEMD SERVICE ==========
         print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
@@ -1090,9 +1141,9 @@ async def deploy_service_async():
 
             print_status("Inserting service record...", "info")
             db.query(
-                """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
+                """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash, runtime) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash, runtime)
             )
 
             # Verify insertion
@@ -1106,9 +1157,10 @@ async def deploy_service_async():
                 conn = sqlite3.connect(DB_FILE)
                 cursor = conn.cursor()
                 cursor.execute(
-                    """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash)
+                    """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash, runtime) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash,
+                     runtime)
                 )
                 conn.commit()
                 conn.close()
@@ -1735,11 +1787,41 @@ def service_operations():
 
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
+
     elif choice == "5":
-        # REINSTALL DEPENDENCIES WITH AUTO-REBUILD
+
         print(f"\n{C_YELLOW}Reinstalling dependencies...{C_RESET}")
+
         try:
             service_path = get_service_path(svc['storage_path'], name)
+            svc_runtime = svc['runtime'] if 'runtime' in svc.keys() else 'python'
+
+            # ── Node.js branch ────────────────────────────────────────────────
+            if svc_runtime == "node":
+                pkg_json = os.path.join(service_path, "package.json")
+
+                if not os.path.exists(pkg_json):
+                    print(f"{C_RED}✗ package.json not found at {service_path}{C_RESET}")
+                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    return
+
+                print(f"{C_CYAN}Running npm install...{C_RESET}")
+
+                try:
+                    run_as_gaia(["npm", "install", "--production"], cwd=service_path, timeout=300)
+                    print(f"{C_GREEN}✓ npm packages reinstalled{C_RESET}")
+                    print(f"\n{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
+                    if input().strip().lower() == "yes":
+                        subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+                        print(f"{C_GREEN}✓ Service restarted{C_RESET}")
+                except Exception as e:
+                    print(f"{C_RED}✗ npm install failed: {e}{C_RESET}")
+
+                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                return
+
+            # ── Python branch (original logic) ────────────────────────────────
+
             requirements_file = os.path.join(service_path, "requirements.txt")
             venv_path = os.path.join(service_path, "venv")
 
