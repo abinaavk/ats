@@ -198,7 +198,6 @@ class DatabaseManager:
                 last_health_check TIMESTAMP,
                 deployment_hash TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
