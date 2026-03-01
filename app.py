@@ -83,7 +83,8 @@ class ServiceConfig:
     workers: int = 0
     max_memory_mb: int = 512
     cpu_quota: int = 50
-    runtime: str = "python"   # ✅ "python" or "node"
+    runtime: str = "python"
+    entry_point: str = "app:app"# ✅ "python" or "node"
 
 
     def __post_init__(self):
@@ -649,7 +650,7 @@ def generate_systemd_service(config: ServiceConfig, api_dir: str, log_dir: str, 
             f"    --access-logfile {log_dir}/access.log \\\n"
             f"    --error-logfile {log_dir}/error.log \\\n"
             f"    --log-level info \\\n"
-            f"    app:app"
+            f"    {config.entry_point}"
         )
         env_block = (
             f'Environment="PATH={api_dir}/venv/bin:/usr/local/bin:/usr/bin"\n'
@@ -811,6 +812,12 @@ async def deploy_service_async():
         runtime_choice = input(f"{C_BOLD}Choice (1/2):{C_RESET} ").strip()
         runtime = "node" if runtime_choice == "2" else "python"
         print(f"  {C_CYAN}→ Runtime: {runtime}{C_RESET}")
+
+        entry_point = "app:app"
+        if runtime == "python":
+            ep_input = input(f"  Python Entry Point [app:app]: ").strip()
+        if ep_input:
+            entry_point = ep_input
 
         print(f"\n{C_YELLOW}Advanced Settings (press Enter for defaults):{C_RESET}")
 
