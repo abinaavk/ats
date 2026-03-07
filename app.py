@@ -239,7 +239,26 @@ class DatabaseManager:
             )
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS remote_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_name TEXT UNIQUE,
+                type TEXT,
+                target TEXT,
+                auto_offload INTEGER DEFAULT 0,
+                FOREIGN KEY(service_name) REFERENCES services(name) ON DELETE CASCADE
+            )
+        ''')
+
         conn.commit()
+        
+        # --- MIGRATIONS FOR EXISTING DATABASES ---
+        try:
+            cursor.execute("ALTER TABLE services ADD COLUMN branch TEXT DEFAULT 'main'")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass # Column already exists
+            
         conn.close()
 
         try:
