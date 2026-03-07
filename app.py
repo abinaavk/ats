@@ -52,6 +52,7 @@ METRICS_FILE = os.path.join(ATS_HOME, "metrics.prom")
 IS_DAEMON = "--daemon" in sys.argv
 LOCK_FILE = f"/tmp/ats_{'daemon' if IS_DAEMON else 'cli'}.lock"
 
+
 SERVICE_USER = "gaia"
 SERVICE_GROUP = "gaia"
 MAIN_DOMAIN = "gaiasentinel.online"
@@ -2144,28 +2145,48 @@ async def zero_downtime_update(name: str):
 # ==============================================================================
 
 async def handle_webhook(reader, writer):
-    """Robust GitHub/GitLab webhook handler"""
+    """Robust GitHub/GitLab webhook handler with full body reading"""
     try:
-        # Read headers first
-        data = await reader.read(16384) # Increased buffer
+        # 1. Read the initial chunk (Headers + potentially start of Body)
+        data = await reader.read(16384)
+        if not data:
+            writer.close()
+            return
+            
         request_text = data.decode('utf-8', errors='ignore')
         
         if "POST" not in request_text:
             writer.close()
             return
 
-        # Find the start of the JSON body (supports \r\n\r\n and \n\n)
-        body = ""
-        if "\r\n\r\n" in request_text:
-            body = request_text.split("\r\n\r\n", 1)[1]
-        elif "\n\n" in request_text:
-            body = request_text.split("\n\n", 1)[1]
+        # 2. Extract Headers and initial Body
+        headers_part, _, body_start = request_text.partition("\r\n\r\n")
+        if not body_start and "\n\n" in request_text: # Fallback for some clients
+            headers_part, _, body_start = request_text.partition("\n\n")
 
-        if not body:
+        # 3. Determine remaining content to read
+        content_length = 0
+        for line in headers_part.splitlines():
+            if line.lower().startswith("content-length:"):
+                try:
+                    content_length = int(line.split(":", 1)[1].strip())
+                except: pass
+                break
+
+        # 4. Read the rest of the body if needed
+        body_bytes = body_start.encode('utf-8')
+        while len(body_bytes) < content_length:
+            chunk = await reader.read(min(16384, content_length - len(body_bytes)))
+            if not chunk: break
+            body_bytes += chunk
+
+        full_body = body_bytes.decode('utf-8', errors='ignore')
+        if not full_body:
             writer.close()
             return
 
-        js = json.loads(body)
+        # 5. Process JSON
+        js = json.loads(full_body)
         repo_name = js.get("repository", {}).get("name")
         
         if repo_name:
