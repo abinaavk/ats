@@ -2139,69 +2139,63 @@ async def zero_downtime_update(name: str):
 # ==============================================================================
 
 async def handle_webhook(reader, writer):
-    """Handle incoming git push webhooks with basic HTTP parsing"""
+    """Robust GitHub/GitLab webhook handler"""
     try:
-        data = await reader.read(8192)
-        request = data.decode('utf-8', errors='ignore')
+        # Read headers first
+        data = await reader.read(16384) # Increased buffer
+        request_text = data.decode('utf-8', errors='ignore')
         
-        if not request.startswith("POST"):
+        if "POST" not in request_text:
             writer.close()
             return
 
-        # Extract Body (after \r\n\r\n)
-        parts = request.split("\r\n\r\n")
-        if len(parts) < 2:
-            writer.close()
-            return
-            
-        payload_str = parts[1]
-        if not payload_str:
+        # Find the start of the JSON body (supports \r\n\r\n and \n\n)
+        body = ""
+        if "\r\n\r\n" in request_text:
+            body = request_text.split("\r\n\r\n", 1)[1]
+        elif "\n\n" in request_text:
+            body = request_text.split("\n\n", 1)[1]
+
+        if not body:
             writer.close()
             return
 
-        js = json.loads(payload_str)
+        js = json.loads(body)
         repo_name = js.get("repository", {}).get("name")
         
         if repo_name:
             print(f"\n{C_MAGENTA}{C_BOLD}[ WEBHOOK RECEIVED ]{C_RESET} Repository: {repo_name}")
             audit_log("WEBHOOK_RECEIVED", repo_name)
             
-            # Find matching service
             services = db.query("SELECT name, repo_url FROM services", fetch_all=True)
             match_found = False
             for s in services:
-                # 1. Match by Service Name (Fallback)
                 name_match = s['name'].lower() == repo_name.lower()
-                
-                # 2. Match by Repository Name in URL (Primary)
-                # Extracts 'cool-app' from 'https://github.com/user/cool-app.git'
                 url_repo = ""
                 if s['repo_url']:
                     url_parts = s['repo_url'].strip().rstrip('/').split('/')
-                    if url_parts:
-                        url_repo = url_parts[-1].replace('.git', '')
+                    if url_parts: url_repo = url_parts[-1].replace('.git', '')
                 
-                url_match = url_repo.lower() == repo_name.lower()
-
-                if name_match or url_match:
-                    print_status(f"Auto-deploying matching service: {s['name']}", "info")
+                if name_match or (url_repo.lower() == repo_name.lower()):
+                    print_status(f"Auto-deploying: {s['name']}", "info")
                     asyncio.create_task(zero_downtime_update(s['name']))
                     match_found = True
                     break
             
             if not match_found:
-                print_status(f"No matching service found for repository '{repo_name}'", "warning")
+                print_status(f"No match for '{repo_name}'", "warning")
         
-        # Send simple HTTP 200 OK response
-        response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
+        response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
         writer.write(response.encode())
         await writer.drain()
 
     except Exception as e:
         logger.error(f"Webhook error: {e}")
     finally:
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except: pass
 
 async def start_webhook_server():
     """Start background webhook listener on port 9999"""
@@ -4559,6 +4553,9 @@ async def mainmenu():
                 print_status("Invalid choice", "warning")
                 await asyncio.sleep(1)
 
+        except EOFError:
+            logger.error("Terminal disconnected or running as service without --daemon. Exiting menu.")
+            return
         except KeyboardInterrupt:
             print(f"\n{C_YELLOW}Use option [0] to exit properly.{C_RESET}")
             await asyncio.sleep(1)
