@@ -1446,18 +1446,34 @@ async def list_services_detailed():
 # ==============================================================================
 
 async def destroy_service():
-    """Enhanced service destruction with confirmation"""
+    """Enhanced service destruction with ID selection"""
     print_header()
     print(f"{C_RED}{C_BOLD}═══ DESTROY SERVICE ═══{C_RESET}\n")
     print(f"{C_YELLOW}WARNING: This will permanently delete the service and all its data.{C_RESET}\n")
 
-    name = input("Service Name: ").strip()
-    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
-
-    if not svc:
-        print_status("Service not found", "error")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+    services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
+    if not services:
+        print_status("No services deployed.", "warning")
+        await asyncio.sleep(1)
         return
+
+    print(f"  {C_BOLD}{'ID':<6} {'SERVICE NAME'}{C_RESET}")
+    print(f"  {C_CYAN}{'─' * 30}{C_RESET}")
+    for s in services:
+        print(f"  {s['id']:<6} {s['name']}")
+
+    loop = asyncio.get_event_loop()
+    svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID to Destroy (0 to cancel):{C_RESET} "))).strip()
+    
+    if svc_id == "0" or not svc_id: return
+
+    svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
+    if not svc:
+        print_status("Invalid Service ID.", "error")
+        await asyncio.sleep(1)
+        return
+
+    name = svc['name']
 
     print(f"\n{C_CYAN}Service Information:{C_RESET}")
     print(f"  Name:    {svc['name']}")
@@ -1466,11 +1482,11 @@ async def destroy_service():
     print(f"  Created: {svc['created_at']}")
 
     print(f"\n{C_RED}Type 'DELETE {name}' to confirm:{C_RESET} ", end='')
-    confirmation = input()
+    confirmation = (await loop.run_in_executor(None, lambda: input())).strip()
 
     if confirmation != f"DELETE {name}":
         print_status("Destruction cancelled", "warning")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
         return
 
     try:
@@ -2145,10 +2161,23 @@ async def handle_webhook(reader, writer):
             print(f"\n{C_MAGENTA}{C_BOLD}[ WEBHOOK RECEIVED ]{C_RESET} Repository: {repo_name}")
             
             # Find matching service
-            services = db.query("SELECT name FROM services", fetch_all=True)
+            services = db.query("SELECT name, repo_url FROM services", fetch_all=True)
             match_found = False
             for s in services:
-                if s['name'].lower() == repo_name.lower():
+                # 1. Match by Service Name (Fallback)
+                name_match = s['name'].lower() == repo_name.lower()
+                
+                # 2. Match by Repository Name in URL (Primary)
+                # Extracts 'cool-app' from 'https://github.com/user/cool-app.git'
+                url_repo = ""
+                if s['repo_url']:
+                    url_parts = s['repo_url'].strip().rstrip('/').split('/')
+                    if url_parts:
+                        url_repo = url_parts[-1].replace('.git', '')
+                
+                url_match = url_repo.lower() == repo_name.lower()
+
+                if name_match or url_match:
                     print_status(f"Auto-deploying matching service: {s['name']}", "info")
                     asyncio.create_task(zero_downtime_update(s['name']))
                     match_found = True
@@ -2193,28 +2222,9 @@ async def run_webhook_listener():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}"))
 
-def service_operations():
-    """Service management operations menu - COMPLETE WITH VENV REBUILD"""
-    print_header()
-    print(f"{C_CYAN}{C_BOLD}═══ SERVICE OPERATIONS ═══{C_RESET}\n")
-
-    name = input("Service Name: ").strip()
-    if not name:
-        print_status("Service name cannot be empty", "error")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-        return
-
-    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
-
-    if not svc:
-        print_status("Service not found", "error")
-        all_services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
-        if all_services:
-            print(f"\n{C_CYAN}Available services:{C_RESET}")
-            for s in all_services:
-                print(f"  - {s['name']}")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-        return
+# ==============================================================================
+#   SERVICE LISTING
+# ==============================================================================
 
     print(f"\n{C_CYAN}Service: {C_BOLD}{name}{C_RESET}")
     print(f"Domain:  https://{svc['domain']}")
@@ -2766,18 +2776,31 @@ async def backup_service():
             break
 
         if choice == "1":
-            name = (await loop.run_in_executor(None, lambda: input("\n  Service Name: "))).strip()
-            svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+            services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
+            if not services:
+                print_status("No services deployed.", "warning")
+                await asyncio.sleep(1)
+                continue
 
+            print(f"  {C_BOLD}{'ID':<6} {'SERVICE NAME'}{C_RESET}")
+            print(f"  {C_CYAN}{'─' * 30}{C_RESET}")
+            for s in services:
+                print(f"  {s['id']:<6} {s['name']}")
+
+            svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID to Backup (0 to cancel):{C_RESET} "))).strip()
+            
+            if svc_id == "0" or not svc_id: continue
+
+            svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
             if not svc:
-                print_status("Service not found", "error")
+                print_status("Invalid Service ID.", "error")
                 await asyncio.sleep(1)
                 continue
 
             backup_file = create_local_backup(svc)
             if backup_file:
                 # Check if auto-offload is enabled for this service
-                config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (name,), fetch_one=True)
+                config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],), fetch_one=True)
                 if config and config['auto_offload']:
                     await offload_backup(backup_file, config)
 
