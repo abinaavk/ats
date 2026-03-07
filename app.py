@@ -1516,17 +1516,33 @@ async def destroy_service():
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
 async def view_service_logs():
-    """View service logs with options"""
+    """View service logs with ID selection"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ SERVICE LOGS ═══{C_RESET}\n")
 
-    name = input("Service Name: ").strip()
-    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
-
-    if not svc:
-        print_status("Service not found", "error")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+    services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
+    if not services:
+        print_status("No services deployed.", "warning")
+        await asyncio.sleep(1)
         return
+
+    print(f"  {C_BOLD}{'ID':<6} {'SERVICE NAME'}{C_RESET}")
+    print(f"  {C_CYAN}{'─' * 30}{C_RESET}")
+    for s in services:
+        print(f"  {s['id']:<6} {s['name']}")
+
+    loop = asyncio.get_event_loop()
+    svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID (0 to cancel):{C_RESET} "))).strip()
+    
+    if svc_id == "0" or not svc_id: return
+
+    svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
+    if not svc:
+        print_status("Invalid Service ID.", "error")
+        await asyncio.sleep(1)
+        return
+
+    name = svc['name']
 
     service_path = get_service_path(svc['storage_path'], name)
     log_dir = os.path.join(service_path, "logs")
@@ -1640,27 +1656,33 @@ async def analyze_service_logs(name: str, log_dir: str):
     input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
 async def service_operations():
-    """Service management operations menu - COMPLETE WITH VENV REBUILD"""
+    """Service management operations menu - ID selection"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ SERVICE OPERATIONS ═══{C_RESET}\n")
 
-    name = input("Service Name: ").strip()
-    if not name:
-        print_status("Service name cannot be empty", "error")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+    services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
+    if not services:
+        print_status("No services deployed.", "warning")
+        await asyncio.sleep(1)
         return
 
-    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    print(f"  {C_BOLD}{'ID':<6} {'SERVICE NAME'}{C_RESET}")
+    print(f"  {C_CYAN}{'─' * 30}{C_RESET}")
+    for s in services:
+        print(f"  {s['id']:<6} {s['name']}")
 
+    loop = asyncio.get_event_loop()
+    svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID (0 to cancel):{C_RESET} "))).strip()
+    
+    if svc_id == "0" or not svc_id: return
+
+    svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
     if not svc:
-        print_status("Service not found", "error")
-        all_services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
-        if all_services:
-            print(f"\n{C_CYAN}Available services:{C_RESET}")
-            for s in all_services:
-                print(f"  - {s['name']}")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        print_status("Invalid Service ID.", "error")
+        await asyncio.sleep(1)
         return
+
+    name = svc['name']
 
     print(f"\n{C_CYAN}Service: {C_BOLD}{name}{C_RESET}")
     print(f"Domain:  https://{svc['domain']}")
