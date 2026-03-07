@@ -2196,20 +2196,26 @@ async def handle_webhook(reader, writer):
             services = db.query("SELECT name, repo_url FROM services", fetch_all=True)
             match_found = False
             for s in services:
-                name_match = s['name'].lower() == repo_name.lower()
+                # Extracts repo name from URL
                 url_repo = ""
                 if s['repo_url']:
                     url_parts = s['repo_url'].strip().rstrip('/').split('/')
                     if url_parts: url_repo = url_parts[-1].replace('.git', '')
                 
-                if name_match or (url_repo.lower() == repo_name.lower()):
-                    print_status(f"Auto-deploying: {s['name']}", "info")
+                # Check for exact OR partial matches (handles spelling differences)
+                name_match = (repo_name.lower() in s['name'].lower()) or (s['name'].lower() in repo_name.lower())
+                url_match = (repo_name.lower() in url_repo.lower()) or (url_repo.lower() in repo_name.lower())
+
+                if name_match or url_match:
+                    print_status(f"Match found! Auto-deploying: {s['name']}", "info")
+                    audit_log("BLUE_GREEN_START", s['name'], {"triggered_by": repo_name})
                     asyncio.create_task(zero_downtime_update(s['name']))
                     match_found = True
                     break
             
             if not match_found:
-                print_status(f"No match for '{repo_name}'", "warning")
+                logger.warning(f"No matching service for '{repo_name}'")
+                audit_log("WEBHOOK_MATCH_FAILED", repo_name)
         
         response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
         writer.write(response.encode())
