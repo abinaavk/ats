@@ -1805,7 +1805,47 @@ async def service_operations():
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
     elif choice == "4":
-        await zero_downtime_update(name)
+        # GIT PULL AND RESTART
+        print(f"\n{C_YELLOW}Updating code...{C_RESET}")
+        try:
+            service_path = get_service_path(svc['storage_path'], name)
+            print("Pulling from git...")
+
+            returncode, stdout, stderr = run_as_gaia(
+                ["git", "pull"],
+                cwd=service_path,
+                capture=True
+            )
+
+            if returncode == 0:
+                print(f"{C_GREEN}✓ Code updated{C_RESET}")
+
+                if "Already up to date" in stdout or "Already up-to-date" in stdout:
+                    print("  (no new changes)")
+
+                print("\nRestarting service...")
+                subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+                time.sleep(2)
+
+                result = subprocess.run(
+                    ["systemctl", "is-active", name],
+                    capture_output=True,
+                    timeout=5
+                )
+
+                if result.stdout.strip() == b"active":
+                    print(f"{C_GREEN}✓ Service restarted with new code{C_RESET}")
+                    audit_log("UPDATE", name, {"method": "git-pull"})
+                else:
+                    print(f"{C_RED}✗ Service restart failed{C_RESET}")
+            else:
+                print(f"{C_RED}✗ Git pull failed{C_RESET}")
+                if stderr:
+                    print(f"Error: {stderr[:200]}")
+        except Exception as e:
+            print(f"{C_RED}✗ Error: {e}{C_RESET}")
+
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
     elif choice == "5":
 
@@ -2081,101 +2121,53 @@ async def service_operations():
         print_status("Invalid choice", "warning")
         time.sleep(1)
 
-async def zero_downtime_update(name: str):
-    """Blue-Green deployment: Stage new code, verify, then swap"""
-    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
-    print_status(f"Starting Zero-Downtime Update for {name}...", "info")
-    
-    storage = svc['storage_path']
-    stage_dir = os.path.join(storage, "api", f"{name}_staging")
-    current_dir = os.path.join(storage, "api", name)
-    temp_port = 59999 # Temporary port for health check
-    
-    try:
-        if os.path.exists(stage_dir): shutil.rmtree(stage_dir)
-        
-        print_status("Cloning new code to staging...", "info")
-        await run_async_command(["sudo", "-u", SERVICE_USER, "git", "clone", "-b", svc['branch'], svc['repo_url'], f"{name}_staging"], cwd=os.path.join(storage, "api"))
-        
-        # Setup venv and deps in staging
-        print_status("Preparing staging environment...", "info")
-        run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=stage_dir)
-        pip = os.path.join(stage_dir, "venv", "bin", "pip")
-        run_as_gaia([pip, "install", "--upgrade", "pip"], cwd=stage_dir)
-        if os.path.exists(os.path.join(stage_dir, "requirements.txt")):
-            run_as_gaia([pip, "install", "-r", "requirements.txt"], cwd=stage_dir)
-        run_as_gaia([pip, "install", "gunicorn"], cwd=stage_dir)
-        
-        print_status(f"Running health check on temp port {temp_port}...", "info")
-        # Start staging gunicorn briefly
-        stage_proc = await asyncio.create_subprocess_exec(
-            os.path.join(stage_dir, "venv", "bin", "gunicorn"),
-            "--bind", f"127.0.0.1:{temp_port}", "app:app",
-            cwd=stage_dir, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        
-        await asyncio.sleep(5)
-        is_healthy = check_port_listening(temp_port)
-        stage_proc.terminate()
-        await stage_proc.wait()
-        
-        if not is_healthy:
-            raise RuntimeError("New code failed health check in staging!")
-            
-        print_status("Health check passed! Swapping code...", "success")
-        
-        # Swap
-        backup_dir = current_dir + "_old"
-        if os.path.exists(backup_dir): shutil.rmtree(backup_dir)
-        os.rename(current_dir, backup_dir)
-        os.rename(stage_dir, current_dir)
-        
-        run_root(["systemctl", "restart", name])
-        print_status("Update applied successfully with zero downtime (swap complete).", "success")
-        audit_log("BLUE_GREEN_UPDATE", name, {"status": "success"})
-        
-    except Exception as e:
-        logger.error(f"Update failed for {name}: {e}")
-        audit_log("BLUE_GREEN_FAILED", name, {"error": str(e)})
-        print_status(f"Update failed: {e}. Reverting staging...", "error")
-        if os.path.exists(stage_dir): shutil.rmtree(stage_dir)
 
 # ==============================================================================
 #   WEBHOOK LISTENER
 # ==============================================================================
 
 async def direct_update(name: str):
-    """Simple in-place update: Git pull/reset and restart service"""
-    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
-    if not svc: return
-
-    service_path = get_service_path(svc['storage_path'], name)
-    branch = svc.get('branch', 'main')
-    
-    logger.info(f"Starting direct update for {name} on branch {branch}")
-    audit_log("DIRECT_UPDATE_START", name)
-
+    # GIT PULL AND RESTART
+    print(f"\n{C_YELLOW}Updating code...{C_RESET}")
     try:
-        # 1. Update code in-place
-        print_status(f"Updating code for {name}...", "info")
-        # We use fetch + reset to ensure we match the remote exactly
-        cmd = ["sudo", "-u", SERVICE_USER, "git", "fetch", "--all"]
-        await run_async_command(cmd, cwd=service_path)
-        
-        cmd = ["sudo", "-u", SERVICE_USER, "git", "reset", "--hard", f"origin/{branch}"]
-        await run_async_command(cmd, cwd=service_path)
+        service_path = get_service_path(svc['storage_path'], name)
+        print("Pulling from git...")
 
-        # 2. Restart service
-        print_status(f"Restarting service {name}...", "info")
-        run_root(["systemctl", "restart", name])
-        
-        print_status(f"Direct update successful for {name}", "success")
-        audit_log("DIRECT_UPDATE_SUCCESS", name)
-        
+        returncode, stdout, stderr = run_as_gaia(
+                ["git", "pull"],
+                cwd=service_path,
+                capture=True
+            )
+
+        if returncode == 0:
+            print(f"{C_GREEN}✓ Code updated{C_RESET}")
+
+            if "Already up to date" in stdout or "Already up-to-date" in stdout:
+                print("  (no new changes)")
+
+            print("\nRestarting service...")
+            subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+            time.sleep(2)
+
+            result = subprocess.run(
+                    ["systemctl", "is-active", name],
+                    capture_output=True,
+                    timeout=5
+                )
+
+            if result.stdout.strip() == b"active":
+                print(f"{C_GREEN}✓ Service restarted with new code{C_RESET}")
+                audit_log("UPDATE", name, {"method": "git-pull"})
+            else:
+                print(f"{C_RED}✗ Service restart failed{C_RESET}")
+        else:
+            print(f"{C_RED}✗ Git pull failed{C_RESET}")
+            if stderr:
+                print(f"Error: {stderr[:200]}")
     except Exception as e:
-        logger.error(f"Direct update failed for {name}: {e}")
-        audit_log("DIRECT_UPDATE_FAILED", name, {"error": str(e)})
-        print_status(f"Update failed: {e}", "error")
+        print(f"{C_RED}✗ Error: {e}{C_RESET}")
+
+    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
 async def handle_webhook(reader, writer):
     """Robust GitHub/GitLab webhook handler - Points to direct_update"""
