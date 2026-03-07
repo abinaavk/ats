@@ -2164,6 +2164,7 @@ async def handle_webhook(reader, writer):
         
         if repo_name:
             print(f"\n{C_MAGENTA}{C_BOLD}[ WEBHOOK RECEIVED ]{C_RESET} Repository: {repo_name}")
+            audit_log("WEBHOOK_RECEIVED", repo_name)
             
             # Find matching service
             services = db.query("SELECT name, repo_url FROM services", fetch_all=True)
@@ -2849,6 +2850,8 @@ def create_local_backup(svc):
         db.query("INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
                  (name, filename, file_size, checksum))
         
+        audit_log("BACKUP_CREATE", name, {"filename": filename, "size_mb": round(file_size/1024/1024, 2)})
+
         # --- RETENTION LOGIC (Keep max 7) ---
         backups = db.query("SELECT id, filename FROM backups WHERE service_name=? ORDER BY timestamp DESC", (name,), fetch_all=True)
         if len(backups) > 7:
@@ -2861,6 +2864,7 @@ def create_local_backup(svc):
                         pass
                 db.query("DELETE FROM backups WHERE id=?", (oldest['id'],))
                 logger.info(f"Retention: Deleted old backup for {name}: {oldest['filename']}")
+                audit_log("BACKUP_RETENTION_DELETE", name, {"filename": oldest['filename']})
 
         print_status(f"Local backup created: {filename} ({file_size/1024/1024:.2f} MB)", "success")
         return backup_path
@@ -4405,6 +4409,7 @@ async def auto_backup_scheduler():
             
             # --- START MIDNIGHT BACKUP ---
             logger.info("Triggering scheduled midnight backup for all services...")
+            audit_log("SCHEDULED_BACKUP_START", "SYSTEM")
             services = db.query("SELECT * FROM services", fetch_all=True)
             
             if services:
@@ -4416,8 +4421,10 @@ async def auto_backup_scheduler():
                         if config and config['auto_offload']:
                             await offload_backup(backup_file, config)
                 logger.info(f"Midnight backup completed for {len(services)} services.")
+                audit_log("SCHEDULED_BACKUP_END", "SYSTEM", {"services_count": len(services)})
             else:
                 logger.info("No services found for scheduled backup.")
+                audit_log("SCHEDULED_BACKUP_SKIP", "SYSTEM", {"reason": "no_services"})
                 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
