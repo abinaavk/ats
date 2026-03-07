@@ -2205,11 +2205,22 @@ async def start_webhook_server():
         await server.serve_forever()
 
 async def run_webhook_listener():
-    """Menu wrapper to start listener"""
+    """Menu wrapper to start listener with Cloudflare tunnel auto-config"""
     print_header()
+    webhook_domain = f"webhook.{MAIN_DOMAIN}"
+    print_status(f"Ensuring Cloudflare route: {webhook_domain}...", "info")
+    
+    try:
+        # Automatically add/verify the route in Cloudflare Tunnel
+        cloudflare.add_route(webhook_domain, 9999)
+        print_status("Cloudflare Tunnel configured for webhooks.", "success")
+    except Exception as e:
+        logger.warning(f"Cloudflare auto-config skipped: {e}")
+        print_status("Note: Ensure port 9999 is tunnelled manually if auto-config failed.", "warning")
+
     print_status("Starting background Webhook Listener...", "info")
-    print(f"  → Endpoint: {C_CYAN}http://{MAIN_DOMAIN}:9999{C_RESET}")
-    print(f"  → Payload:  {C_CYAN}application/json{C_RESET}")
+    print(f"  → Public URL: {C_CYAN}https://{webhook_domain}{C_RESET}")
+    print(f"  → Payload:    {C_CYAN}application/json{C_RESET}")
     print(f"\n{C_YELLOW}Listener is now running in the background.{C_RESET}")
     
     # Ensure it only starts once
