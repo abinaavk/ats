@@ -3153,6 +3153,95 @@ def database_cleanup():
 
         input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}")
 
+async def update_database_async():
+    """Update service statuses or edit metadata in the database"""
+    while True:
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ DATABASE MANAGEMENT ═══{C_RESET}\n")
+        print(f"  {C_BOLD}[1]{C_RESET} Refresh All Service Statuses (Health Check)")
+        print(f"  {C_BOLD}[2]{C_RESET} Edit Service Metadata (Name, Repo Link)")
+        print(f"  {C_BOLD}[0]{C_RESET} Return to Main Menu\n")
+
+        choice = input(f"  {C_BOLD}Select action:{C_RESET} ").strip()
+
+        if choice == "0":
+            break
+
+        if choice == "1":
+            services = db.query("SELECT * FROM services", fetch_all=True)
+            if not services:
+                print_status("No services in database to update.", "warning")
+                time.sleep(1)
+                continue
+
+            print_status(f"Updating status for {len(services)} services...", "info")
+            health_dict = await parallel_health_checks(services)
+
+            updated_count = 0
+            for svc in services:
+                is_healthy = health_dict.get(svc['name'], False)
+                status = 'active' if is_healthy else 'inactive'
+
+                db.query(
+                    "UPDATE services SET status=?, last_health_check=? WHERE id=?",
+                    (status, datetime.datetime.now().isoformat(), svc['id'])
+                )
+                updated_count += 1
+                status_icon = f"{C_GREEN}●{C_RESET}" if is_healthy else f"{C_RED}●{C_RESET}"
+                print(f"  {status_icon} {svc['name']:<30} → {status}")
+
+            print_status(f"Updated {updated_count} records.", "success")
+            audit_log("DATABASE_REFRESH", "ATS", {"updated_count": updated_count})
+            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+        elif choice == "2":
+            services = db.query("SELECT id, name, repo_url FROM services ORDER BY name", fetch_all=True)
+            if not services:
+                print_status("No services available to edit.", "warning")
+                time.sleep(1)
+                continue
+
+            print(f"\n  {C_BOLD}{'ID':<4} {'NAME':<20} {'REPO LINK'}{C_RESET}")
+            print(f"  {C_CYAN}{'─' * 60}{C_RESET}")
+            for s in services:
+                repo = (s['repo_url'][:35] + "..") if len(s['repo_url']) > 35 else s['repo_url']
+                print(f"  {s['id']:<4} {s['name']:<20} {repo}")
+
+            svc_id = input(f"\n  {C_BOLD}Enter Service ID to edit (or 0 to cancel):{C_RESET} ").strip()
+            if svc_id == "0" or not svc_id: continue
+
+            svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
+            if not svc:
+                print_status("Invalid ID.", "error")
+                time.sleep(1)
+                continue
+
+            print(f"\n  {C_CYAN}Editing: {C_BOLD}{svc['name']}{C_RESET}")
+            new_name = input(f"  New Name [{svc['name']}]: ").strip() or svc['name']
+            new_repo = input(f"  New Repo [{svc['repo_url']}]: ").strip() or svc['repo_url']
+
+            if new_name != svc['name'] or new_repo != svc['repo_url']:
+                db.query(
+                    "UPDATE services SET name=?, repo_url=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (new_name, new_repo, svc_id)
+                )
+                # If name changed, update related records
+                if new_name != svc['name']:
+                    db.query("UPDATE backups SET service_name=? WHERE service_name=?", (new_name, svc['name']))
+                    db.query("UPDATE deployments SET service_name=? WHERE service_name=?", (new_name, svc['name']))
+                    db.query("UPDATE metrics_history SET service_name=? WHERE service_name=?", (new_name, svc['name']))
+
+                print_status("Database record updated successfully.", "success")
+                audit_log("DATABASE_EDIT", svc['name'], {"old_name": svc['name'], "new_name": new_name, "new_repo": new_repo})
+            else:
+                print_status("No changes made.", "info")
+
+            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+def update_database():
+    """Wrapper to run async database update"""
+    asyncio.run(update_database_async())
+
 # ==============================================================================
 #   TELEMETRY
 # ==============================================================================
@@ -3262,7 +3351,7 @@ def mainmenu():
             print(menu_row("4", "View Logs", "8", "Export Metrics"))
             print(f"{C_CYAN}╠{'═' * W}╬{'═' * W}╣{C_RESET}")
             print(menu_row("9", "View Database", "10", "Database Cleanup"))
-            print(menu_row("11", "Future", "D", "System Diagnostics"))
+            print(menu_row("11", "Update Database", "D", "System Diagnostics"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
             print(menu_single_row("[ 0 ]", "Exit ATS"))
             print(f"{C_CYAN}╚{'═' * (T-2)}╝{C_RESET}")
@@ -3289,6 +3378,8 @@ def mainmenu():
                 view_database()
             elif choice == "10":
                 database_cleanup()
+            elif choice == "11":
+                update_database()
             elif choice == "d":
                 ats_doctor()
             elif choice == "0":
