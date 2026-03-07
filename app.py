@@ -2199,10 +2199,15 @@ async def handle_webhook(reader, writer):
 
 async def start_webhook_server():
     """Start background webhook listener on port 9999"""
-    server = await asyncio.start_server(handle_webhook, '0.0.0.0', 9999)
-    print_status("Webhook Listener active on port 9999", "success")
-    async with server:
-        await server.serve_forever()
+    try:
+        server = await asyncio.start_server(handle_webhook, '0.0.0.0', 9999)
+        print_status("Webhook Listener active on port 9999", "success")
+        logger.info("Webhook Listener active on port 9999")
+        async with server:
+            await server.serve_forever()
+    except Exception as e:
+        logger.error(f"Could not start webhook server: {e}")
+        print_status(f"Webhook server failed: {e}", "error")
 
 async def run_webhook_listener():
     """Menu wrapper to start listener with Cloudflare tunnel auto-config"""
@@ -4583,6 +4588,15 @@ async def run_daemon():
     """Run ATS in background mode (Scheduler + Webhook Listener)"""
     print_header()
     print(f"{C_GREEN}Starting ATS Daemon v7.0...{C_RESET}")
+    
+    # Ensure Cloudflare route is ready for webhooks
+    webhook_domain = f"webhook.{MAIN_DOMAIN}"
+    try:
+        cloudflare.add_route(webhook_domain, 9999)
+        logger.info(f"Cloudflare route verified: {webhook_domain}")
+    except Exception as e:
+        logger.error(f"Cloudflare daemon config failed: {e}")
+
     print(f"{C_CYAN}→ Auto-Backup Scheduler: ACTIVE{C_RESET}")
     print(f"{C_CYAN}→ Webhook Listener:     ACTIVE (Port 9999){C_RESET}")
     
