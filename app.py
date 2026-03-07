@@ -1264,17 +1264,14 @@ async def deploy_service_async():
 
         audit_log("DEPLOY_FAILED", name or "unknown", {"error": str(e)})
 
-    input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
-
-def deploy_service():
-    """Wrapper to run async deployment"""
-    asyncio.run(deploy_service_async())
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}"))
 
 # ==============================================================================
 #   SERVICE LISTING
 # ==============================================================================
 
-def list_services_detailed():
+async def list_services_detailed():
     """Display detailed service information with smart pagination"""
 
     services = db.query("SELECT * FROM services ORDER BY created_at DESC", fetch_all=True)
@@ -1291,7 +1288,7 @@ def list_services_detailed():
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ SERVICE REGISTRY ═══{C_RESET}\n")
     print_status("Checking service health...", "info")
-    health_results = asyncio.run(parallel_health_checks(services))
+    health_results = await parallel_health_checks(services)
 
     # ── Terminal size ──────────────────────────────────────────────────────────
     try:
@@ -1448,7 +1445,7 @@ def list_services_detailed():
 #   SERVICE OPERATIONS
 # ==============================================================================
 
-def destroy_service():
+async def destroy_service():
     """Enhanced service destruction with confirmation"""
     print_header()
     print(f"{C_RED}{C_BOLD}═══ DESTROY SERVICE ═══{C_RESET}\n")
@@ -1518,7 +1515,7 @@ def destroy_service():
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
-def view_service_logs():
+async def view_service_logs():
     """View service logs with options"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ SERVICE LOGS ═══{C_RESET}\n")
@@ -1586,7 +1583,7 @@ def view_service_logs():
             print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
             print_status("Log streaming stopped", "info")
     elif choice == "6":
-        analyze_service_logs(name, log_dir)
+        await analyze_service_logs(name, log_dir)
     else:
         print(f"{C_CYAN}{'=' * 70}{C_RESET}")
         print(f"{C_CYAN}Last 50 lines of {log_files[choice]}:{C_RESET}")
@@ -1605,7 +1602,7 @@ def view_service_logs():
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
-def analyze_service_logs(name: str, log_dir: str):
+async def analyze_service_logs(name: str, log_dir: str):
     """Scan logs for errors, 404s, and potential attacks"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ LOG INTELLIGENCE: {name} ═══{C_RESET}\n")
@@ -1642,10 +1639,49 @@ def analyze_service_logs(name: str, log_dir: str):
 
     input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-def service_operations():
-    """Service management operations menu"""
-    # ... (header code remains same) ...
-    print(f"\n{C_CYAN}Available Operations:{C_RESET}")
+async def service_operations():
+    """Service management operations menu - COMPLETE WITH VENV REBUILD"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ SERVICE OPERATIONS ═══{C_RESET}\n")
+
+    name = input("Service Name: ").strip()
+    if not name:
+        print_status("Service name cannot be empty", "error")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+
+    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+
+    if not svc:
+        print_status("Service not found", "error")
+        all_services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
+        if all_services:
+            print(f"\n{C_CYAN}Available services:{C_RESET}")
+            for s in all_services:
+                print(f"  - {s['name']}")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        return
+
+    print(f"\n{C_CYAN}Service: {C_BOLD}{name}{C_RESET}")
+    print(f"Domain:  https://{svc['domain']}")
+    print(f"Port:    {svc['port']}")
+
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True,
+            timeout=5
+        )
+        is_active = result.stdout.strip() == b"active"
+        status_icon = f"{C_GREEN}●{C_RESET}" if is_active else f"{C_RED}●{C_RESET}"
+        status_text = "ACTIVE" if is_active else "INACTIVE"
+        print(f"Status:  {status_icon} {status_text}")
+    except:
+        print(f"Status:  {C_YELLOW}UNKNOWN{C_RESET}")
+        is_active = False
+
+    print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
+    print(f"{C_CYAN}Available Operations:{C_RESET}")
     print("  1. Restart service")
     print("  2. Stop service")
     print("  3. Start service")
@@ -1658,9 +1694,345 @@ def service_operations():
 
     choice = input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
 
-    if choice == "4":
-        asyncio.run(zero_downtime_update(name))
-    # ... (rest of choices handling) ...
+    if choice == "1":
+        # RESTART
+        print(f"\n{C_YELLOW}Restarting service...{C_RESET}")
+        try:
+            subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+            time.sleep(2)
+
+            result = subprocess.run(
+                ["systemctl", "is-active", name],
+                capture_output=True,
+                timeout=5
+            )
+
+            if result.stdout.strip() == b"active":
+                print(f"{C_GREEN}✓ Service restarted successfully{C_RESET}")
+                audit_log("RESTART", name)
+            else:
+                print(f"{C_RED}✗ Service restart failed{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}✗ Error: {e}{C_RESET}")
+
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "2":
+        # STOP
+        print(f"\n{C_RED}Stop service '{name}'? (yes/no):{C_RESET} ", end='')
+        if input().strip().lower() == "yes":
+            print(f"\n{C_YELLOW}Stopping service...{C_RESET}")
+            try:
+                subprocess.run(["systemctl", "stop", name], timeout=10, check=True)
+                time.sleep(1)
+                print(f"{C_GREEN}✓ Service stopped{C_RESET}")
+                audit_log("STOP", name)
+            except Exception as e:
+                print(f"{C_RED}✗ Error: {e}{C_RESET}")
+        else:
+            print(f"{C_YELLOW}Cancelled{C_RESET}")
+
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "3":
+        # START
+        print(f"\n{C_YELLOW}Starting service...{C_RESET}")
+        try:
+            subprocess.run(["systemctl", "start", name], timeout=10, check=True)
+            time.sleep(2)
+
+            result = subprocess.run(
+                ["systemctl", "is-active", name],
+                capture_output=True,
+                timeout=5
+            )
+
+            if result.stdout.strip() == b"active":
+                print(f"{C_GREEN}✓ Service started successfully{C_RESET}")
+                audit_log("START", name)
+            else:
+                print(f"{C_RED}✗ Service start failed{C_RESET}")
+        except Exception as e:
+            print(f"{C_RED}✗ Error: {e}{C_RESET}")
+
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "4":
+        await zero_downtime_update(name)
+
+    elif choice == "5":
+
+        print(f"\n{C_YELLOW}Reinstalling dependencies...{C_RESET}")
+
+        try:
+            service_path = get_service_path(svc['storage_path'], name)
+            svc_runtime = svc['runtime'] if 'runtime' in svc.keys() else 'python'
+
+            # ── Node.js branch ────────────────────────────────────────────────
+            if svc_runtime == "node":
+                pkg_json = os.path.join(service_path, "package.json")
+
+                if not os.path.exists(pkg_json):
+                    print(f"{C_RED}✗ package.json not found at {service_path}{C_RESET}")
+                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    return
+
+                print(f"{C_CYAN}Running npm install...{C_RESET}")
+
+                try:
+                    run_as_gaia(["npm", "install", "--production"], cwd=service_path, timeout=300)
+                    print(f"{C_GREEN}✓ npm packages reinstalled{C_RESET}")
+                    print(f"\n{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
+                    if input().strip().lower() == "yes":
+                        subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+                        print(f"{C_GREEN}✓ Service restarted{C_RESET}")
+                except Exception as e:
+                    print(f"{C_RED}✗ npm install failed: {e}{C_RESET}")
+
+                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                return
+
+            # ── Python branch (original logic) ────────────────────────────────
+
+            requirements_file = os.path.join(service_path, "requirements.txt")
+            venv_path = os.path.join(service_path, "venv")
+
+            print(f"Service path: {service_path}")
+            print(f"Virtual env:  {venv_path}")
+
+            if not os.path.exists(service_path):
+                print(f"{C_RED}✗ Service directory not found{C_RESET}")
+                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                return
+
+            if not os.path.exists(requirements_file):
+                print(f"{C_RED}✗ requirements.txt not found{C_RESET}")
+                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                return
+
+            # Determine which pip to use
+            pip3_path = os.path.join(venv_path, "bin", "pip3")
+            pip_path = os.path.join(venv_path, "bin", "pip")
+
+            if os.path.exists(pip3_path):
+                pip_executable = pip3_path
+                print(f"Pip path:     {pip_executable}\n")
+            elif os.path.exists(pip_path):
+                pip_executable = pip_path
+                print(f"Pip path:     {pip_executable}\n")
+            else:
+                # Neither pip nor pip3 found - venv is missing or corrupted
+                print(f"Pip path:     {pip3_path} (not found)\n")
+                print(f"{C_RED}✗ Virtual environment is missing or corrupted{C_RESET}")
+                print(f"{C_YELLOW}Neither pip3 nor pip found in venv/bin/{C_RESET}\n")
+
+                print(f"{C_CYAN}Would you like to rebuild the virtual environment? (yes/no):{C_RESET} ", end='')
+
+                if input().strip().lower() != "yes":
+                    print(f"{C_YELLOW}Cancelled{C_RESET}")
+                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    return
+
+                # REBUILD VENV
+                print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
+                print(f"{C_YELLOW}REBUILDING VIRTUAL ENVIRONMENT{C_RESET}")
+                print(f"{C_YELLOW}{'=' * 70}{C_RESET}\n")
+
+                if os.path.exists(venv_path):
+                    print(f"{C_CYAN}Removing corrupted venv...{C_RESET}")
+                    try:
+                        shutil.rmtree(venv_path)
+                        print(f"{C_GREEN}✓ Old venv removed{C_RESET}")
+                    except Exception as e:
+                        print(f"{C_RED}✗ Failed to remove old venv: {e}{C_RESET}")
+                        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                        return
+
+                print(f"\n{C_CYAN}Creating new virtual environment...{C_RESET}")
+                try:
+                    run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=service_path, timeout=120)
+                    print(f"{C_GREEN}✓ Virtual environment created{C_RESET}")
+                except Exception as e:
+                    print(f"{C_RED}✗ Failed to create venv: {e}{C_RESET}")
+                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    return
+
+                if os.path.exists(pip3_path):
+                    pip_executable = pip3_path
+                elif os.path.exists(pip_path):
+                    pip_executable = pip_path
+                else:
+                    print(f"{C_RED}✗ Failed to create pip executable{C_RESET}")
+                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    return
+
+                print(f"{C_GREEN}✓ Using: {pip_executable}{C_RESET}")
+
+            # Upgrade pip
+            print(f"\n{C_CYAN}Upgrading pip and setuptools...{C_RESET}")
+            try:
+                returncode, stdout, stderr = run_as_gaia(
+                    [pip_executable, "install", "--upgrade", "pip", "setuptools", "wheel"],
+                    cwd=service_path,
+                    capture=True,
+                    timeout=120
+                )
+
+                if returncode == 0:
+                    print(f"{C_GREEN}✓ Pip upgraded{C_RESET}")
+                else:
+                    print(f"{C_YELLOW}⚠ Pip upgrade had warnings (continuing anyway){C_RESET}")
+            except Exception as e:
+                print(f"{C_YELLOW}⚠ Pip upgrade warning: {e}{C_RESET}")
+
+            # Install requirements
+            print(f"\n{C_CYAN}Installing requirements.txt...{C_RESET}")
+            print(f"  This may take several minutes...\n")
+
+            start_time = time.time()
+
+            try:
+                returncode, stdout, stderr = run_as_gaia(
+                    [pip_executable, "install", "-r", "requirements.txt"],
+                    cwd=service_path,
+                    capture=True,
+                    timeout=600
+                )
+
+                duration = time.time() - start_time
+
+                if returncode == 0:
+                    print(f"{C_GREEN}✓ Dependencies installed successfully ({duration:.1f}s){C_RESET}")
+
+                    if "Successfully installed" in stdout:
+                        packages = [line for line in stdout.split("\n") if "Successfully installed" in line]
+                        if packages:
+                            pkg_line = packages[0].replace("Successfully installed", "").strip()
+                            pkg_count = len(pkg_line.split())
+                            print(f"  {C_CYAN}Installed {pkg_count} packages{C_RESET}")
+
+                    # Install gunicorn
+                    print(f"\n{C_CYAN}Installing gunicorn...{C_RESET}")
+                    try:
+                        returncode, stdout, stderr = run_as_gaia(
+                            [pip_executable, "install", "gunicorn"],
+                            cwd=service_path,
+                            capture=True,
+                            timeout=60
+                        )
+                        if returncode == 0:
+                            print(f"{C_GREEN}✓ Gunicorn installed{C_RESET}")
+                        else:
+                            print(f"{C_YELLOW}⚠ Gunicorn installation warning{C_RESET}")
+                    except Exception as e:
+                        print(f"{C_YELLOW}⚠ Gunicorn warning: {e}{C_RESET}")
+
+                    # Offer to restart
+                    print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
+                    print(f"{C_GREEN}All dependencies installed successfully!{C_RESET}")
+                    print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
+
+                    print(f"{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
+                    if input().strip().lower() == "yes":
+                        print(f"\n{C_YELLOW}Restarting {name}...{C_RESET}")
+
+                        try:
+                            subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+                            time.sleep(2)
+
+                            result = subprocess.run(
+                                ["systemctl", "is-active", name],
+                                capture_output=True,
+                                timeout=5
+                            )
+
+                            if result.stdout.strip() == b"active":
+                                print(f"{C_GREEN}✓ Service restarted successfully{C_RESET}")
+
+                                time.sleep(1)
+                                if check_port_listening(svc['port'], timeout=2.0):
+                                    print(f"{C_GREEN}✓ Service is responding on port {svc['port']}{C_RESET}")
+                                else:
+                                    print(f"{C_YELLOW}⚠ Service active but port not responding yet{C_RESET}")
+
+                                audit_log("REINSTALL_DEPS", name, {"rebuilt_venv": True})
+                            else:
+                                print(f"{C_RED}✗ Service failed to start{C_RESET}")
+                                print(f"{C_YELLOW}Check logs: journalctl -u {name} -n 50{C_RESET}")
+                        except Exception as e:
+                            print(f"{C_RED}✗ Restart failed: {e}{C_RESET}")
+                    else:
+                        print(f"{C_YELLOW}Restart cancelled{C_RESET}")
+
+                else:
+                    print(f"{C_RED}✗ Installation failed{C_RESET}")
+                    print(f"\n{C_YELLOW}Error output (last 20 lines):{C_RESET}")
+                    if stderr:
+                        error_lines = [l for l in stderr.split("\n") if l.strip()][-20:]
+                        for line in error_lines:
+                            print(f"  {line}")
+
+            except TimeoutError:
+                print(f"{C_RED}✗ Installation timed out after 10 minutes{C_RESET}")
+            except Exception as e:
+                print(f"{C_RED}✗ Installation error: {e}{C_RESET}")
+
+        except Exception as e:
+            print(f"{C_RED}✗ Unexpected error: {e}{C_RESET}")
+
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "6":
+        # VIEW SYSTEMD STATUS
+        print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
+        try:
+            subprocess.run(["systemctl", "status", name, "--no-pager"])
+        except:
+            pass
+        print(f"{C_CYAN}{'=' * 70}{C_RESET}")
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "7":
+        # VIEW RESOURCE USAGE
+        print(f"\n{C_CYAN}Resource Usage for '{name}':{C_RESET}\n")
+
+        pid = get_service_pid(name)
+
+        if pid and psutil:
+            try:
+                process = psutil.Process(pid)
+
+                cpu = process.cpu_percent(interval=1)
+                mem_info = process.memory_info()
+                mem_mb = mem_info.rss / 1024 / 1024
+
+                print(f"  {C_BOLD}PID:{C_RESET}        {pid}")
+                print(f"  {C_BOLD}CPU:{C_RESET}        {cpu:.1f}%")
+                print(f"  {C_BOLD}Memory:{C_RESET}     {mem_mb:.1f} MB")
+                print(f"  {C_BOLD}Threads:{C_RESET}    {process.num_threads()}")
+
+                children = process.children(recursive=True)
+                if children:
+                    print(f"  {C_BOLD}Workers:{C_RESET}    {len(children)} child processes")
+
+            except Exception as e:
+                print(f"{C_YELLOW}Could not retrieve resource usage: {e}{C_RESET}")
+        elif not psutil:
+            print(f"{C_YELLOW}psutil not available - install for detailed metrics{C_RESET}")
+            print(f"Install with: {C_CYAN}pip install psutil{C_RESET}")
+        else:
+            print(f"{C_YELLOW}Service is not running or PID not found{C_RESET}")
+
+        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+    elif choice == "8":
+        update_service_config(name)
+
+    elif choice == "0":
+        return
+    else:
+        print_status("Invalid choice", "warning")
+        time.sleep(1)
 
 async def zero_downtime_update(name: str):
     """Blue-Green deployment: Stage new code, verify, then swap"""
@@ -1781,14 +2153,23 @@ async def start_webhook_server():
     async with server:
         await server.serve_forever()
 
-def run_webhook_listener():
+async def run_webhook_listener():
     """Menu wrapper to start listener"""
     print_header()
     print_status("Starting background Webhook Listener...", "info")
-    print(f"Configure your Git repo to POST to: {C_CYAN}http://{MAIN_DOMAIN}:9999{C_RESET}")
-    print(f"{C_YELLOW}Listener will run in background until ATS exits.{C_RESET}")
-    asyncio.create_task(start_webhook_server())
-    time.sleep(2)
+    print(f"  → Endpoint: {C_CYAN}http://{MAIN_DOMAIN}:9999{C_RESET}")
+    print(f"  → Payload:  {C_CYAN}application/json{C_RESET}")
+    print(f"\n{C_YELLOW}Listener is now running in the background.{C_RESET}")
+    
+    # Ensure it only starts once
+    if not hasattr(run_webhook_listener, "started"):
+        asyncio.create_task(start_webhook_server())
+        run_webhook_listener.started = True
+    else:
+        print_status("Listener already running.", "info")
+        
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}"))
 
 def service_operations():
     """Service management operations menu - COMPLETE WITH VENV REBUILD"""
@@ -2346,7 +2727,7 @@ def update_service_config(name: str):
 #   BACKUP MANAGEMENT
 # ==============================================================================
 
-def backup_service():
+async def backup_service():
     """Create backup of service database with optional remote offloading"""
     while True:
         print_header()
@@ -2356,18 +2737,19 @@ def backup_service():
         print(f"  {C_BOLD}[3]{C_RESET} Manual Sync Backups to Remote")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-        choice = input(f"  {C_BOLD}Select action:{C_RESET} ").strip()
+        loop = asyncio.get_event_loop()
+        choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select action:{C_RESET} "))).strip()
 
         if choice == "0":
             break
 
         if choice == "1":
-            name = input("\n  Service Name: ").strip()
+            name = (await loop.run_in_executor(None, lambda: input("\n  Service Name: "))).strip()
             svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
 
             if not svc:
                 print_status("Service not found", "error")
-                time.sleep(1)
+                await asyncio.sleep(1)
                 continue
 
             backup_file = create_local_backup(svc)
@@ -2375,15 +2757,15 @@ def backup_service():
                 # Check if auto-offload is enabled for this service
                 config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (name,), fetch_one=True)
                 if config and config['auto_offload']:
-                    offload_backup(backup_file, config)
+                    await offload_backup(backup_file, config)
 
-            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
         elif choice == "2":
-            configure_remote_offloading()
+            await configure_remote_offloading()
 
         elif choice == "3":
-            sync_all_backups_remote()
+            await sync_all_backups_remote()
 
 def create_local_backup(svc):
     """Internal logic to create a zip of the database"""
@@ -2423,15 +2805,22 @@ def create_local_backup(svc):
         print_status(f"Local backup failed: {e}", "error")
         return None
 
-def configure_remote_offloading():
+async def configure_remote_offloading():
     """Setup remote storage targets using rclone or scp"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ REMOTE OFFLOAD CONFIG ═══{C_RESET}\n")
     
-    name = input("  Service Name to configure: ").strip()
+    loop = asyncio.get_event_loop()
+    name = (await loop.run_in_executor(None, lambda: input("  Service Name to configure: "))).strip()
+    if not name:
+        print_status("Service name cannot be empty.", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to exit...{C_RESET}"))
+        return
+
     svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
     if not svc:
-        print_status("Service not found", "error")
+        print_status(f"Service '{name}' not found.", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to exit...{C_RESET}"))
         return
 
     print(f"\n  Current configuration for {C_BOLD}{name}{C_RESET}:")
@@ -2446,64 +2835,110 @@ def configure_remote_offloading():
     print(f"  {C_BOLD}[2]{C_RESET} Setup Rclone (S3/Drive/Dropbox)")
     print(f"  {C_BOLD}[0]{C_RESET} Cancel")
 
-    rtype = input(f"\n  Choice: ").strip()
+    rtype = (await loop.run_in_executor(None, lambda: input(f"\n  Choice: "))).strip()
     if rtype == "0": return
+    if rtype not in ["1", "2"]:
+        print_status("Invalid choice.", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to exit...{C_RESET}"))
+        return
 
-    target = ""
     method = "scp" if rtype == "1" else "rclone"
     
     if rtype == "1":
         print(f"\n  Example target: {C_CYAN}user@backup-server:/path/to/backups{C_RESET}")
-        target = input("  Remote Target: ").strip()
+        target = (await loop.run_in_executor(None, lambda: input("  Remote Target: "))).strip()
     else:
         print(f"\n  Example target: {C_CYAN}my-s3-bucket:ats-backups{C_RESET}")
-        target = input("  Rclone Remote:Target: ").strip()
+        target = (await loop.run_in_executor(None, lambda: input("  Rclone Remote:Target: "))).strip()
 
-    auto = input("  Enable auto-offload after every backup? (y/n): ").lower() == 'y'
+    if not target:
+        print_status("Remote target cannot be empty.", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to exit...{C_RESET}"))
+        return
+
+    auto_input = (await loop.run_in_executor(None, lambda: input("  Enable auto-offload after every backup? (y/n): "))).lower()
+    auto = auto_input == 'y'
 
     db.query("DELETE FROM remote_configs WHERE service_name=?", (name,))
     db.query("INSERT INTO remote_configs (service_name, type, target, auto_offload) VALUES (?, ?, ?, ?)",
              (name, method, target, 1 if auto else 0))
     
     print_status("Remote configuration saved.", "success")
-    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+    await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
-def offload_backup(file_path: str, config: Dict):
+async def offload_backup(file_path: str, config: Dict):
     """Send a file to the remote target"""
     filename = os.path.basename(file_path)
     print_status(f"Offloading {filename} to {config['target']}...", "info")
     
     try:
         if config['type'] == "scp":
-            cmd = ["scp", "-q", "-o", "BatchMode=yes", file_path, config['target']]
+            # BatchMode=yes prevents hanging on password prompts
+            cmd = ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", file_path, config['target']]
         else:
             cmd = ["rclone", "copy", file_path, config['target']]
             
-        subprocess.run(cmd, check=True)
-        print_status("Offload successful!", "success")
-        audit_log("BACKUP_OFFLOAD", config['service_name'], {"filename": filename, "target": config['target']})
+        process = await asyncio.create_subprocess_exec(*cmd)
+        await process.wait()
+        
+        if process.returncode == 0:
+            print_status(f"Successfully offloaded {filename}", "success")
+            audit_log("BACKUP_OFFLOAD", config['service_name'], {"filename": filename, "target": config['target']})
+            return True
+        else:
+            print_status(f"Offload failed for {filename} with exit code {process.returncode}", "error")
+            return False
     except Exception as e:
-        print_status(f"Offload failed: {e}", "error")
+        print_status(f"Offload failed for {filename}: {e}", "error")
+        return False
 
-def sync_all_backups_remote():
+async def sync_all_backups_remote():
     """Manually push all local backups to configured remotes"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ MANUAL REMOTE SYNC ═══{C_RESET}\n")
+
     configs = db.query("SELECT * FROM remote_configs", fetch_all=True)
+    loop = asyncio.get_event_loop()
     if not configs:
-        print_status("No remote configurations found.", "warning")
+        print_status("No remote configurations found. Please configure Option 2 first.", "warning")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
         return
+
+    print_status(f"Found {len(configs)} remote configurations. Starting sync...\n", "info")
+
+    total_synced = 0
+    total_failed = 0
 
     for cfg in configs:
         name = cfg['service_name']
         backups = db.query("SELECT filename FROM backups WHERE service_name=?", (name,), fetch_all=True)
-        print(f"\n{C_CYAN}Syncing {len(backups)} backups for {name}...{C_RESET}")
+        
+        if not backups:
+            print(f"  {C_YELLOW}! No local backups found for {name}{C_RESET}")
+            continue
+
+        print(f"  {C_CYAN}Syncing {len(backups)} backups for {C_BOLD}{name}{C_RESET} to {cfg['target']}...")
         for b in backups:
             path = os.path.join(BACKUP_DIR, b['filename'])
             if os.path.exists(path):
-                offload_backup(path, cfg)
+                if await offload_backup(path, cfg):
+                    total_synced += 1
+                else:
+                    total_failed += 1
+            else:
+                print(f"    {C_RED}✗ Local file missing: {b['filename']}{C_RESET}")
+                total_failed += 1
     
-    input(f"\n{C_CYAN}Sync complete. Press Enter...{C_RESET}")
+    print(f"\n{C_CYAN}{'─' * 55}{C_RESET}")
+    print(f"  {C_BOLD}Sync Results:{C_RESET}")
+    print(f"  {C_GREEN}✓ Successfully synced: {total_synced}{C_RESET}")
+    if total_failed > 0:
+        print(f"  {C_RED}✗ Failed/Missing:     {total_failed}{C_RESET}")
+    print(f"{C_CYAN}{'─' * 55}{C_RESET}")
 
-def list_backups():
+    await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Manual sync complete. Press Enter to return to menu...{C_RESET}"))
+
+async def list_backups():
     """List all backups and allow restoration"""
     while True:
         print_header()
@@ -2514,16 +2949,20 @@ def list_backups():
             fetch_all=True
         )
 
+        loop = asyncio.get_event_loop()
         if not backups:
             print_status("No backups found", "warning")
-            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
             return
 
         print(f"{C_CYAN}Total Backups: {C_BOLD}{len(backups)}{C_RESET}\n")
 
         total_size = sum(b['size_bytes'] or 0 for b in backups)
-        size_mb = total_size / 1024 / 1024
-        print(f"{C_CYAN}Total Storage Used: {C_BOLD}{size_mb:.2f} GB{C_RESET}\n")
+        if total_size >= 1024 * 1024 * 1024:
+            size_str = f"{total_size / (1024 ** 3):.2f} GB"
+        else:
+            size_str = f"{total_size / (1024 ** 2):.2f} MB"
+        print(f"{C_CYAN}Total Storage Used: {C_BOLD}{size_str}{C_RESET}\n")
 
         print(f"{C_BOLD}{'ID':<4} {'SERVICE':<15} {'SIZE (MB)':<12} {'DATE':<20} {'STATUS'}{C_RESET}")
         print(f"{C_CYAN}{'─' * 80}{C_RESET}")
@@ -2541,7 +2980,7 @@ def list_backups():
         print(f"{C_CYAN}{'─' * 80}{C_RESET}")
         print(f"\n  {C_BOLD}[ID]{C_RESET} Restore Backup  |  {C_BOLD}[0]{C_RESET} Back")
         
-        choice = input(f"\n  {C_CYAN}Selection:{C_RESET} ").strip()
+        choice = (await loop.run_in_executor(None, lambda: input(f"\n  {C_CYAN}Selection:{C_RESET} "))).strip()
 
         if choice == "0":
             break
@@ -2549,20 +2988,21 @@ def list_backups():
         try:
             idx = int(choice)
             if 1 <= idx <= len(backups):
-                restore_backup(backups[idx-1])
+                await restore_backup(backups[idx-1])
             else:
                 print_status("Invalid ID", "error")
-                time.sleep(1)
+                await asyncio.sleep(1)
         except ValueError:
             print_status("Invalid input", "error")
-            time.sleep(1)
+            await asyncio.sleep(1)
 
-def restore_backup(backup: Dict):
+async def restore_backup(backup: Dict):
     """Automatically restore database files from a backup zip"""
     name = backup['service_name']
     filename = backup['filename']
     backup_path = os.path.join(BACKUP_DIR, filename)
 
+    loop = asyncio.get_event_loop()
     if not os.path.exists(backup_path):
         print_status(f"Backup file missing: {filename}", "error")
         return
@@ -2575,7 +3015,8 @@ def restore_backup(backup: Dict):
     print(f"\n{C_RED}{C_BOLD}═══ RESTORE DATABASE: {name} ═══{C_RESET}")
     print(f"{C_YELLOW}WARNING: This will overwrite current database files with backup from {backup['timestamp']}{C_RESET}\n")
     
-    if input(f"  Type 'RESTORE' to confirm: ").strip() != "RESTORE":
+    confirm = (await loop.run_in_executor(None, lambda: input(f"  Type 'RESTORE' to confirm: "))).strip()
+    if confirm != "RESTORE":
         print_status("Restore cancelled", "warning")
         return
 
@@ -2613,23 +3054,24 @@ def restore_backup(backup: Dict):
         
         print_status("Restore successful", "success")
         audit_log("BACKUP_RESTORE", name, {"filename": filename})
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
     except Exception as e:
         logger.error(f"Restore failed: {e}")
         print_status(f"Restore failed: {e}", "error")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
-def global_operations():
+async def global_operations():
     """Perform actions on all deployed services at once"""
     while True:
         print_header()
         print(f"{C_CYAN}{C_BOLD}═══ GLOBAL OPERATIONS ═══{C_RESET}\n")
         
         services = db.query("SELECT name FROM services", fetch_all=True)
+        loop = asyncio.get_event_loop()
         if not services:
             print_status("No services deployed.", "warning")
-            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
             return
 
         print(f"  Targeting {len(services)} services.\n")
@@ -2639,7 +3081,7 @@ def global_operations():
         print(f"  {C_BOLD}[4]{C_RESET} Bulk Dependency Audit")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-        choice = input(f"  {C_BOLD}Select action:{C_RESET} ").strip()
+        choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select action:{C_RESET} "))).strip()
 
         if choice == "0":
             break
@@ -2647,9 +3089,10 @@ def global_operations():
         if choice in ["1", "2", "3"]:
             action = {"1": "restart", "2": "stop", "3": "start"}[choice]
             print(f"\n{C_RED}{C_BOLD}!!! CONFIRM MASS {action.upper()} !!!{C_RESET}")
-            if input(f"  Type 'GLOBAL {action.upper()}' to confirm: ").strip() != f"GLOBAL {action.upper()}":
+            confirm = (await loop.run_in_executor(None, lambda: input(f"  Type 'GLOBAL {action.upper()}' to confirm: "))).strip()
+            if confirm != f"GLOBAL {action.upper()}":
                 print_status("Action cancelled", "warning")
-                time.sleep(1)
+                await asyncio.sleep(1)
                 continue
 
             print()
@@ -2663,12 +3106,12 @@ def global_operations():
             
             print_status(f"Mass {action} completed", "success")
             audit_log(f"MASS_{action.upper()}", "GLOBAL")
-            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
         elif choice == "4":
-            dependency_audit()
+            await dependency_audit()
 
-def dependency_audit():
+async def dependency_audit():
     """Scan all services for outdated/insecure dependencies"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ DEPENDENCY AUDIT ═══{C_RESET}\n")
@@ -2720,13 +3163,14 @@ def dependency_audit():
                 print(f"    {C_RED}✗ Failed to run npm audit{C_RESET}")
         print()
 
-    input(f"{C_CYAN}Press Enter to continue...{C_RESET}")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: input(f"{C_CYAN}Press Enter to continue...{C_RESET}"))
 
 # ==============================================================================
 #   METRICS & MONITORING
 # ==============================================================================
 
-def export_metrics():
+async def export_metrics():
     """Export Prometheus metrics"""
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ EXPORT METRICS ═══{C_RESET}\n")
@@ -2748,7 +3192,7 @@ def export_metrics():
 
         # ── Health checks ──────────────────────────────────────────────────────
         print_status("Checking service health...", "info")
-        health_results = asyncio.run(parallel_health_checks(services))
+        health_results = await parallel_health_checks(services)
 
         online_count  = 0
         offline_count = 0
@@ -3234,15 +3678,11 @@ async def run_diagnostics():
 
     input(f"  {C_CYAN}Press Enter to continue...{C_RESET}")
 
-def ats_doctor():
-    """Wrapper for async diagnostics"""
-    asyncio.run(run_diagnostics())
-
 # ==============================================================================
 #   OPTION 10: VIEW DATABASE
 # ==============================================================================
 
-def view_database():
+async def view_database():
     """View and browse ATS database tables"""
 
     while True:
@@ -3255,7 +3695,8 @@ def view_database():
         print(f"  {C_BOLD}[5]{C_RESET} All Tables Summary")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-        choice = input(f"  {C_BOLD}Select table:{C_RESET} ").strip()
+        loop = asyncio.get_event_loop()
+        choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select table:{C_RESET} "))).strip()
 
         if choice == "0":
             return
@@ -3284,7 +3725,7 @@ def view_database():
                               f"{svc['workers']:<8} {status_col:<18} {created:<20}")
 
                     print(f"\n  {C_CYAN}Enter service ID for full details (or Enter to skip):{C_RESET} ", end='')
-                    detail_id = input().strip()
+                    detail_id = (await loop.run_in_executor(None, lambda: input())).strip()
                     if detail_id.isdigit():
                         svc = db.query("SELECT * FROM services WHERE id=?", (int(detail_id),), fetch_one=True)
                         if svc:
@@ -3386,14 +3827,14 @@ def view_database():
             print_status(f"Error: {e}", "error")
 
         print(f"\n  {C_CYAN}{'─' * 70}{C_RESET}")
-        input(f"  {C_CYAN}Press Enter to go back...{C_RESET}")
+        await loop.run_in_executor(None, lambda: input(f"  {C_CYAN}Press Enter to go back...{C_RESET}"))
 
 
 # ==============================================================================
 #   OPTION 11: DATABASE CLEANUP
 # ==============================================================================
 
-def database_cleanup():
+async def database_cleanup():
     """Clean up old/orphaned database records"""
 
     while True:
@@ -3412,14 +3853,15 @@ def database_cleanup():
         print(f"  {C_BOLD}[D]{C_RESET} Database health report             (stats + warnings)")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-        choice = input(f"  {C_BOLD}Select action:{C_RESET} ").strip().lower()
+        loop = asyncio.get_event_loop()
+        choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select action:{C_RESET} "))).strip().lower()
 
         if choice == "0":
             return
 
         if choice not in ("1","2","3","4","5","6","7","8","9","d"):
             print_status("Invalid choice.", "warning")
-            time.sleep(1)
+            await asyncio.sleep(1)
             continue
 
         # ── Database Health Report (no confirmation needed) ────────────────────
@@ -3495,7 +3937,7 @@ def database_cleanup():
                     print(f"  {C_GREEN}✓ WAL file size normal ({wal_size:.1f} KB){C_RESET}")
 
             print(f"\n  {C_CYAN}{'─' * 52}{C_RESET}")
-            input(f"  {C_CYAN}Press Enter to continue...{C_RESET}")
+            await loop.run_in_executor(None, lambda: input(f"  {C_CYAN}Press Enter to continue...{C_RESET}"))
             continue
 
         # ── Confirmation for destructive actions ───────────────────────────────
@@ -3503,11 +3945,11 @@ def database_cleanup():
         print_header()
         print(f"{C_RED}{C_BOLD}═══ CONFIRM CLEANUP ═══{C_RESET}\n")
         print(f"  {C_YELLOW}This action cannot be undone.{C_RESET}\n")
-        confirm = input(f"  Type {C_BOLD}CLEANUP{C_RESET} to confirm: ").strip()
+        confirm = (await loop.run_in_executor(None, lambda: input(f"  Type {C_BOLD}CLEANUP{C_RESET} to confirm: "))).strip()
 
         if confirm != "CLEANUP":
             print_status("Cleanup cancelled.", "warning")
-            time.sleep(1)
+            await asyncio.sleep(1)
             continue
 
         os.system('clear')
@@ -3580,7 +4022,7 @@ def database_cleanup():
                 services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
                 if not services:
                     print_status("No services in database.", "warning")
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     continue
 
                 print(f"  {C_CYAN}Available services:{C_RESET}")
@@ -3588,10 +4030,10 @@ def database_cleanup():
                     print(f"  {C_CYAN}│{C_RESET}  {s['name']}")
                 print()
 
-                service_name = input(f"  {C_BOLD}Service name to delete:{C_RESET} ").strip()
+                service_name = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Service name to delete:{C_RESET} "))).strip()
                 if not service_name:
                     print_status("No name entered. Cancelled.", "warning")
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     continue
 
                 svc = db.query("SELECT * FROM services WHERE name=?", (service_name,), fetch_one=True)
@@ -3604,7 +4046,7 @@ def database_cleanup():
                     print(f"  {C_CYAN}│{C_RESET}  Deployment history")
                     print(f"  {C_CYAN}│{C_RESET}  Metrics history")
                     print()
-                    confirm2 = input(f"  Type {C_BOLD}'{service_name}'{C_RESET} to confirm: ").strip()
+                    confirm2 = (await loop.run_in_executor(None, lambda: input(f"  Type {C_BOLD}'{service_name}'{C_RESET} to confirm: "))).strip()
                     if confirm2 == service_name:
                         db.query("DELETE FROM metrics_history WHERE service_name=?", (service_name,))
                         db.query("DELETE FROM deployments    WHERE service_name=?", (service_name,))
@@ -3648,7 +4090,7 @@ def database_cleanup():
                 services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
                 if not services:
                     print_status("No services in database.", "warning")
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     continue
 
                 print(f"  {C_CYAN}Available services:{C_RESET}")
@@ -3660,10 +4102,10 @@ def database_cleanup():
                     print(f"  {C_CYAN}│{C_RESET}  {s['name']:<25} {count['count'] if count else 0} records")
                 print()
 
-                service_name = input(f"  {C_BOLD}Service name to clear metrics:{C_RESET} ").strip()
+                service_name = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Service name to clear metrics:{C_RESET} "))).strip()
                 if not service_name:
                     print_status("No name entered. Cancelled.", "warning")
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     continue
 
                 result = db.query(
@@ -3681,10 +4123,10 @@ def database_cleanup():
             # ── Option 9: Delete backups older than N days ─────────────────────
             if choice == "9":
                 print()
-                days_str = input(f"  {C_BOLD}Delete backups older than how many days?{C_RESET} ").strip()
+                days_str = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Delete backups older than how many days?{C_RESET} "))).strip()
                 if not days_str.isdigit() or int(days_str) < 1:
                     print_status("Invalid number. Enter a positive integer.", "warning")
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     continue
 
                 days = int(days_str)
@@ -3734,7 +4176,7 @@ def database_cleanup():
             logger.error(f"Database cleanup error: {e}")
             print_status(f"Cleanup failed: {e}", "error")
 
-        input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(None, lambda: input(f"\n  {C_CYAN}Press Enter to continue...{C_RESET}"))
 
 async def update_database_async():
     """Update service statuses or edit metadata in the database"""
@@ -3821,10 +4263,6 @@ async def update_database_async():
 
             input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
-def update_database():
-    """Wrapper to run async database update"""
-    asyncio.run(update_database_async())
-
 # ==============================================================================
 #   TELEMETRY
 # ==============================================================================
@@ -3834,7 +4272,8 @@ async def get_telemetry_async() -> Tuple[float, str, str, int]:
     if not psutil:
         return 0.0, "N/A", "N/A", 0
 
-    cpu = psutil.cpu_percent(interval=0.1)
+    # Non-blocking CPU check
+    cpu = psutil.cpu_percent(interval=None) 
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
 
@@ -3850,12 +4289,12 @@ async def get_telemetry_async() -> Tuple[float, str, str, int]:
 #   MAIN MENU
 # ==============================================================================
 
-def mainmenu():
+async def mainmenu():
     while True:
         try:
             print_header()
 
-            cpu, ram, disk, svccount = asyncio.run(get_telemetry_async())
+            cpu, ram, disk, svccount = await get_telemetry_async()
 
             print(f"{C_CYAN}{'═' * 68}{C_RESET}")
             print(f"{C_CYAN}│{C_RESET} {C_BOLD}System{C_RESET}: CPU {cpu:.1f}% | RAM: {ram} | Disk: {disk} | Services: {svccount} {C_CYAN}│{C_RESET}")
@@ -3865,7 +4304,7 @@ def mainmenu():
             services = db.query("SELECT * FROM services ORDER BY name", fetch_all=True)
 
             if services:
-                health_results = asyncio.run(parallel_health_checks(services))
+                health_results = await parallel_health_checks(services)
 
                 # Table Header
                 header = f"  {'S.No.':<6} {'NAME':<40} {'PORT':<7} {'STATUS':<12} {'DOMAIN':<42} {'LOCATION':<60}"
@@ -3904,14 +4343,10 @@ def mainmenu():
             def menu_row(left_num, left_text, right_num, right_text, col_width=53):
                 left = f"{C_BOLD}{left_num}{C_RESET}  {left_text}"
                 right = f"{C_BOLD}{right_num}{C_RESET}  {right_text}"
-
-                # Visible length (strip ANSI codes for width calculation)
                 left_visible = len(left_num) + 2 + len(left_text)
                 right_visible = len(right_num) + 2 + len(right_text)
-
                 left_pad = col_width - left_visible
                 right_pad = col_width - right_visible
-
                 return (
                     f"{C_CYAN}║{C_RESET}  {left}{' ' * left_pad}"
                     f"{C_CYAN}║{C_RESET}  {right}{' ' * right_pad}"
@@ -3925,8 +4360,7 @@ def mainmenu():
                 return f"{C_CYAN}║{C_RESET}  {content}{' ' * pad}{C_CYAN}║{C_RESET}"
 
             print(f"\n{C_CYAN}╔{'═' * W}╦{'═' * W}╗{C_RESET}")
-            print(
-                f"{C_CYAN}║{C_RESET}  {C_BOLD}{'DEPLOYMENT & SERVICES':<{W - 2}}{C_CYAN}║{C_RESET}  {C_BOLD}{'SYSTEM & DATABASE':<{W - 2}}{C_CYAN}║{C_RESET}")
+            print(f"{C_CYAN}║{C_RESET}  {C_BOLD}{'DEPLOYMENT & SERVICES':<{W - 2}}{C_CYAN}║{C_RESET}  {C_BOLD}{'SYSTEM & DATABASE':<{W - 2}}{C_CYAN}║{C_RESET}")
             print(f"{C_CYAN}╠{'═' * W}╬{'═' * W}╣{C_RESET}")
             print(menu_row("1", "Deploy Service", "5", "Service Operations"))
             print(menu_row("2", "List Services", "6", "Backup Service"))
@@ -3940,36 +4374,38 @@ def mainmenu():
             print(menu_single_row("[ 0 ]", "Exit ATS"))
             print(f"{C_CYAN}╚{'═' * (T-2)}╝{C_RESET}")
 
-            choice = input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} ").strip().lower()
+            # Run input in executor to avoid blocking the event loop
+            loop = asyncio.get_event_loop()
+            choice = (await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} "))).strip().lower()
 
             if choice == "1":
-                deploy_service()
+                await deploy_service_async()
             elif choice == "2":
-                list_services_detailed()
+                await list_services_detailed()
             elif choice == "3":
-                destroy_service()
+                await destroy_service()
             elif choice == "4":
-                view_service_logs()
+                await view_service_logs()
             elif choice == "5":
-                service_operations()
+                await service_operations()
             elif choice == "6":
-                backup_service()
+                await backup_service()
             elif choice == "7":
-                list_backups()
+                await list_backups()
             elif choice == "8":
-                export_metrics()
+                await export_metrics()
             elif choice == "9":
-                view_database()
+                await view_database()
             elif choice == "10":
-                database_cleanup()
+                await database_cleanup()
             elif choice == "11":
-                update_database()
+                await update_database_async()
             elif choice == "d":
-                ats_doctor()
+                await run_diagnostics()
             elif choice == "g":
-                global_operations()
+                await global_operations()
             elif choice == "w":
-                run_webhook_listener()
+                await run_webhook_listener()
             elif choice == "0":
                 print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
                 print(f"{C_CYAN}Thank you for using ATS v7.0!{C_RESET}")
@@ -3977,16 +4413,15 @@ def mainmenu():
                 sys.exit(0)
             else:
                 print_status("Invalid choice", "warning")
-                time.sleep(1)
+                await asyncio.sleep(1)
 
         except KeyboardInterrupt:
             print(f"\n{C_YELLOW}Use option [0] to exit properly.{C_RESET}")
-            time.sleep(1)
+            await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Menu error: {e}")
             print_status(f"Error: {e}", "error")
-            time.sleep(2)
-
+            await asyncio.sleep(2)
 
 # ==============================================================================
 #   ENTRY POINT
@@ -4006,10 +4441,9 @@ if __name__ == "__main__":
 
     print_header()
     print(f"{C_GREEN}Initializing ATS v7.0...{C_RESET}")
-    time.sleep(0.5)
-
+    
     try:
-        mainmenu()
+        asyncio.run(mainmenu())
     except KeyboardInterrupt:
         print(f"\n{C_CYAN}Shutting down ATS...{C_RESET}")
         sys.exit(0)
