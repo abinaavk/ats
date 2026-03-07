@@ -592,17 +592,22 @@ class CloudflareManager:
 
             ingress = config['ingress']
 
-            if any(r.get('hostname') == domain for r in ingress):
-                logger.warning(f"Route {domain} already exists")
-                return
-
-            new_rule = {'hostname': domain, 'service': f'http://localhost:{port}'}
-            catch_all_idx = next((i for i, r in enumerate(ingress) if r.get('service') == 'http_status:404'), -1)
-
-            if catch_all_idx != -1:
-                ingress.insert(catch_all_idx, new_rule)
+            existing_route = next((r for r in ingress if r.get('hostname') == domain), None)
+            if existing_route:
+                if existing_route.get('service') == f'http://localhost:{port}':
+                    logger.info(f"Route {domain} already exists and is correct")
+                    return
+                else:
+                    logger.info(f"Updating existing route {domain} to port {port}")
+                    existing_route['service'] = f'http://localhost:{port}'
             else:
-                ingress.append(new_rule)
+                new_rule = {'hostname': domain, 'service': f'http://localhost:{port}'}
+                catch_all_idx = next((i for i, r in enumerate(ingress) if r.get('service') == 'http_status:404'), -1)
+
+                if catch_all_idx != -1:
+                    ingress.insert(catch_all_idx, new_rule)
+                else:
+                    ingress.append(new_rule)
 
             with open(self.config_path, 'w') as f:
                 yaml.dump(config, f, sort_keys=False, default_flow_style=False)
@@ -2693,7 +2698,7 @@ def update_service_config(name: str):
                     content = f.read()
 
                 content = content.replace(f"--bind 127.0.0.1:{svc['port']}", f"--bind 127.0.0.1:{new_port}")
-                content = content.replace(f'Environment="PORT={svc['port']}"', f'Environment="PORT={new_port}"')
+                content = content.replace(f'Environment="PORT={svc["port"]}"', f'Environment="PORT={new_port}"')
 
                 with open(svc_file, 'w') as f:
                     f.write(content)
