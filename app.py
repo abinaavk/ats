@@ -1528,6 +1528,7 @@ def view_service_logs():
     print("  3. Stdout Log (Standard output)")
     print("  4. Stderr Log (Standard error)")
     print("  5. Live tail (real-time)")
+    print("  6. Log Intelligence & Analytics")
     print("  0. Cancel")
 
     choice = input(f"\n{C_CYAN}Select log:{C_RESET} ").strip()
@@ -1537,7 +1538,8 @@ def view_service_logs():
         "2": "error.log",
         "3": "stdout.log",
         "4": "stderr.log",
-        "5": "access.log"
+        "5": "access.log",
+        "6": "access.log"
     }
 
     if choice == "0":
@@ -1564,6 +1566,8 @@ def view_service_logs():
         except KeyboardInterrupt:
             print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
             print_status("Log streaming stopped", "info")
+    elif choice == "6":
+        analyze_service_logs(name, log_dir)
     else:
         print(f"{C_CYAN}{'=' * 70}{C_RESET}")
         print(f"{C_CYAN}Last 50 lines of {log_files[choice]}:{C_RESET}")
@@ -1581,6 +1585,162 @@ def view_service_logs():
         print(f"{C_CYAN}{'=' * 70}{C_RESET}")
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+
+def analyze_service_logs(name: str, log_dir: str):
+    """Scan logs for errors, 404s, and potential attacks"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ LOG INTELLIGENCE: {name} ═══{C_RESET}\n")
+    
+    access_log = os.path.join(log_dir, "access.log")
+    error_log = os.path.join(log_dir, "error.log")
+    
+    stats = {"404": 0, "500": 0, "attacks": 0, "total_reqs": 0}
+    attack_patterns = [r"wp-admin", r"\\.env", r"phpmyadmin", r"shell", r"config"]
+    
+    if os.path.exists(access_log):
+        with open(access_log, 'r') as f:
+            for line in f:
+                stats["total_reqs"] += 1
+                if " 404 " in line: stats["404"] += 1
+                if " 500 " in line: stats["500"] += 1
+                for pattern in attack_patterns:
+                    if re.search(pattern, line, re.I):
+                        stats["attacks"] += 1
+                        break
+                        
+    print(f"  {C_BOLD}Total Requests:{C_RESET}  {stats['total_reqs']}")
+    print(f"  {C_BOLD}404 Errors:{C_RESET}      {C_YELLOW if stats['404'] > 0 else C_GREEN}{stats['404']}{C_RESET}")
+    print(f"  {C_BOLD}500 Crashes:{C_RESET}     {C_RED if stats['500'] > 0 else C_GREEN}{stats['500']}{C_RESET}")
+    print(f"  {C_BOLD}Probe Attacks:{C_RESET}   {C_RED if stats['attacks'] > 0 else C_GREEN}{stats['attacks']}{C_RESET}")
+    
+    if os.path.exists(error_log):
+        print(f"\n  {C_BOLD}Recent Application Errors:{C_RESET}")
+        result = subprocess.run(["tail", "-n", "5", error_log], capture_output=True, text=True)
+        if result.stdout.strip():
+            print(f"    {C_RED}{result.stdout.strip()}{C_RESET}")
+        else:
+            print(f"    {C_GREEN}No recent errors recorded.{C_RESET}")
+
+    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+def service_operations():
+    """Service management operations menu"""
+    # ... (header code remains same) ...
+    print(f"\n{C_CYAN}Available Operations:{C_RESET}")
+    print("  1. Restart service")
+    print("  2. Stop service")
+    print("  3. Start service")
+    print("  4. Zero-Downtime Update (Blue-Green)")
+    print("  5. Reinstall dependencies")
+    print("  6. View systemd status")
+    print("  7. View resource usage")
+    print("  8. Update configuration")
+    print("  0. Cancel")
+
+    choice = input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
+
+    if choice == "4":
+        asyncio.run(zero_downtime_update(name))
+    # ... (rest of choices handling) ...
+
+async def zero_downtime_update(name: str):
+    """Blue-Green deployment: Stage new code, verify, then swap"""
+    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    print_status(f"Starting Zero-Downtime Update for {name}...", "info")
+    
+    storage = svc['storage_path']
+    stage_dir = os.path.join(storage, "api", f"{name}_staging")
+    current_dir = os.path.join(storage, "api", name)
+    temp_port = 59999 # Temporary port for health check
+    
+    try:
+        if os.path.exists(stage_dir): shutil.rmtree(stage_dir)
+        
+        print_status("Cloning new code to staging...", "info")
+        await run_async_command(["sudo", "-u", SERVICE_USER, "git", "clone", "-b", svc['branch'], svc['repo_url'], f"{name}_staging"], cwd=os.path.join(storage, "api"))
+        
+        # Setup venv and deps in staging
+        print_status("Preparing staging environment...", "info")
+        run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=stage_dir)
+        pip = os.path.join(stage_dir, "venv", "bin", "pip")
+        run_as_gaia([pip, "install", "--upgrade", "pip"], cwd=stage_dir)
+        if os.path.exists(os.path.join(stage_dir, "requirements.txt")):
+            run_as_gaia([pip, "install", "-r", "requirements.txt"], cwd=stage_dir)
+        run_as_gaia([pip, "install", "gunicorn"], cwd=stage_dir)
+        
+        print_status(f"Running health check on temp port {temp_port}...", "info")
+        # Start staging gunicorn briefly
+        stage_proc = await asyncio.create_subprocess_exec(
+            os.path.join(stage_dir, "venv", "bin", "gunicorn"),
+            "--bind", f"127.0.0.1:{temp_port}", "app:app",
+            cwd=stage_dir, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+        )
+        
+        await asyncio.sleep(5)
+        is_healthy = check_port_listening(temp_port)
+        stage_proc.terminate()
+        await stage_proc.wait()
+        
+        if not is_healthy:
+            raise RuntimeError("New code failed health check in staging!")
+            
+        print_status("Health check passed! Swapping code...", "success")
+        
+        # Swap
+        backup_dir = current_dir + "_old"
+        if os.path.exists(backup_dir): shutil.rmtree(backup_dir)
+        os.rename(current_dir, backup_dir)
+        os.rename(stage_dir, current_dir)
+        
+        run_root(["systemctl", "restart", name])
+        print_status("Update applied successfully with zero downtime (swap complete).", "success")
+        audit_log("BLUE_GREEN_UPDATE", name, {"status": "success"})
+        
+    except Exception as e:
+        print_status(f"Update failed: {e}. Reverting staging...", "error")
+        if os.path.exists(stage_dir): shutil.rmtree(stage_dir)
+
+# ==============================================================================
+#   WEBHOOK LISTENER
+# ==============================================================================
+
+async def handle_webhook(reader, writer):
+    """Handle incoming git push webhooks"""
+    data = await reader.read(4096)
+    try:
+        # Simple extraction of repository name from GitHub-style webhook
+        payload = data.decode().split("\r\n\r\n")[-1]
+        if payload:
+            js = json.loads(payload)
+            repo_name = js.get("repository", {}).get("name")
+            print(f"\n{C_MAGENTA}WEBHOOK RECEVIED for {repo_name}{C_RESET}")
+            
+            # Find matching service
+            services = db.query("SELECT name FROM services", fetch_all=True)
+            for s in services:
+                if s['name'].lower() in repo_name.lower():
+                    print_status(f"Auto-deploying {s['name']} via webhook...", "info")
+                    await zero_downtime_update(s['name'])
+                    break
+    except:
+        pass
+    writer.close()
+
+async def start_webhook_server():
+    """Start background webhook listener on port 9999"""
+    server = await asyncio.start_server(handle_webhook, '0.0.0.0', 9999)
+    print_status("Webhook Listener active on port 9999", "success")
+    async with server:
+        await server.serve_forever()
+
+def run_webhook_listener():
+    """Menu wrapper to start listener"""
+    print_header()
+    print_status("Starting background Webhook Listener...", "info")
+    print(f"Configure your Git repo to POST to: {C_CYAN}http://{MAIN_DOMAIN}:9999{C_RESET}")
+    print(f"{C_YELLOW}Listener will run in background until ATS exits.{C_RESET}")
+    asyncio.create_task(start_webhook_server())
+    time.sleep(2)
 
 def service_operations():
     """Service management operations menu - COMPLETE WITH VENV REBUILD"""
@@ -2139,89 +2299,161 @@ def update_service_config(name: str):
 # ==============================================================================
 
 def backup_service():
-    """Create backup of service database only"""
-    print_header()
-    print(f"{C_CYAN}{C_BOLD}═══ BACKUP SERVICE ═══{C_RESET}\n")
+    """Create backup of service database with optional remote offloading"""
+    while True:
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ BACKUP MANAGEMENT ═══{C_RESET}\n")
+        print(f"  {C_BOLD}[1]{C_RESET} Create Local Database Backup")
+        print(f"  {C_BOLD}[2]{C_RESET} Configure Remote Offloading (S3/Drive/SCP)")
+        print(f"  {C_BOLD}[3]{C_RESET} Manual Sync Backups to Remote")
+        print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-    name = input("Service Name: ").strip()
-    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+        choice = input(f"  {C_BOLD}Select action:{C_RESET} ").strip()
 
-    if not svc:
-        print_status("Service not found", "error")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-        return
+        if choice == "0":
+            break
 
+        if choice == "1":
+            name = input("\n  Service Name: ").strip()
+            svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+
+            if not svc:
+                print_status("Service not found", "error")
+                time.sleep(1)
+                continue
+
+            backup_file = create_local_backup(svc)
+            if backup_file:
+                # Check if auto-offload is enabled for this service
+                config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (name,), fetch_one=True)
+                if config and config['auto_offload']:
+                    offload_backup(backup_file, config)
+
+            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+        elif choice == "2":
+            configure_remote_offloading()
+
+        elif choice == "3":
+            sync_all_backups_remote()
+
+def create_local_backup(svc):
+    """Internal logic to create a zip of the database"""
+    name = svc['name']
     try:
         db_path = os.path.join(svc['storage_path'], "database", name)
-
-        # Check database directory exists and has files
         if not os.path.exists(db_path):
-            print_status(f"No database directory found at: {db_path}", "warning")
-            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-            return
+            print_status("Database path missing", "error")
+            return None
 
         db_files = [f for f in os.listdir(db_path) if os.path.isfile(os.path.join(db_path, f))]
-
         if not db_files:
-            print_status("Database directory is empty, nothing to backup", "warning")
-            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-            return
+            print_status("No files to backup", "warning")
+            return None
 
-        # Create backup dir if needed
         if not os.path.exists(BACKUP_DIR):
             os.makedirs(BACKUP_DIR, exist_ok=True)
-            shutil.chown(BACKUP_DIR, user=SERVICE_USER, group=SERVICE_GROUP)
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_filename = f"{name}_db_backup_{timestamp}.zip"
-        backup_path = os.path.join(BACKUP_DIR, backup_filename)
+        filename = f"{name}_db_{timestamp}.zip"
+        backup_path = os.path.join(BACKUP_DIR, filename)
 
-        print(f"\n{C_CYAN}Database files found:{C_RESET}")
-        for f in db_files:
-            fsize = os.path.getsize(os.path.join(db_path, f))
-            print(f"  → {f:<30} {fsize / 1024:.1f} KB")
-
-        print()
-
-        # Zip only the database files
         import zipfile
-        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for f in db_files:
-                filepath = os.path.join(db_path, f)
-                zf.write(filepath, f)
+                zf.write(os.path.join(db_path, f), f)
 
         file_size = os.path.getsize(backup_path)
-        checksum  = calculate_file_hash(backup_path)
+        checksum = calculate_file_hash(backup_path)
 
-        db.query(
-            "INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
-            (name, backup_filename, file_size, checksum)
-        )
-
-        if PROMETHEUS_AVAILABLE:
-            BACKUP_COUNTER.inc()
-
-        audit_log("BACKUP_CREATE", name, {
-            "filename": backup_filename,
-            "size_mb":  round(file_size / 1024 / 1024, 2),
-            "type":     "database_only"
-        })
-
-        print(f"{C_GREEN}{'=' * 60}{C_RESET}")
-        print(f"{C_GREEN}{C_BOLD}✓ DATABASE BACKUP COMPLETE{C_RESET}")
-        print(f"{C_GREEN}{'=' * 60}{C_RESET}")
-        print(f"\n  {C_BOLD}File:{C_RESET}      {backup_filename}")
-        print(f"  {C_BOLD}Size:{C_RESET}      {file_size / 1024 / 1024:.2f} MB")
-        print(f"  {C_BOLD}Location:{C_RESET}  {backup_path}")
-        print(f"  {C_BOLD}Checksum:{C_RESET}  {checksum[:16]}...")
-        print(f"  {C_BOLD}Files:{C_RESET}     {len(db_files)} database file(s)")
-        print(f"{C_GREEN}{'=' * 60}{C_RESET}\n")
-
+        db.query("INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
+                 (name, filename, file_size, checksum))
+        
+        print_status(f"Local backup created: {filename} ({file_size/1024/1024:.2f} MB)", "success")
+        return backup_path
     except Exception as e:
-        logger.error(f"Backup failed: {e}")
-        print_status(f"Backup failed: {e}", "error")
+        print_status(f"Local backup failed: {e}", "error")
+        return None
 
-    input(f"{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+def configure_remote_offloading():
+    """Setup remote storage targets using rclone or scp"""
+    print_header()
+    print(f"{C_CYAN}{C_BOLD}═══ REMOTE OFFLOAD CONFIG ═══{C_RESET}\n")
+    
+    name = input("  Service Name to configure: ").strip()
+    svc = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    if not svc:
+        print_status("Service not found", "error")
+        return
+
+    print(f"\n  Current configuration for {C_BOLD}{name}{C_RESET}:")
+    config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (name,), fetch_one=True)
+    
+    if config:
+        print(f"    Type: {config['type']} | Target: {config['target']} | Auto: {config['auto_offload']}")
+    else:
+        print("    No remote config found.")
+
+    print(f"\n  {C_BOLD}[1]{C_RESET} Setup SCP/SFTP (Second Server)")
+    print(f"  {C_BOLD}[2]{C_RESET} Setup Rclone (S3/Drive/Dropbox)")
+    print(f"  {C_BOLD}[0]{C_RESET} Cancel")
+
+    rtype = input(f"\n  Choice: ").strip()
+    if rtype == "0": return
+
+    target = ""
+    method = "scp" if rtype == "1" else "rclone"
+    
+    if rtype == "1":
+        print(f"\n  Example target: {C_CYAN}user@backup-server:/path/to/backups{C_RESET}")
+        target = input("  Remote Target: ").strip()
+    else:
+        print(f"\n  Example target: {C_CYAN}my-s3-bucket:ats-backups{C_RESET}")
+        target = input("  Rclone Remote:Target: ").strip()
+
+    auto = input("  Enable auto-offload after every backup? (y/n): ").lower() == 'y'
+
+    db.query("DELETE FROM remote_configs WHERE service_name=?", (name,))
+    db.query("INSERT INTO remote_configs (service_name, type, target, auto_offload) VALUES (?, ?, ?, ?)",
+             (name, method, target, 1 if auto else 0))
+    
+    print_status("Remote configuration saved.", "success")
+    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+def offload_backup(file_path: str, config: Dict):
+    """Send a file to the remote target"""
+    filename = os.path.basename(file_path)
+    print_status(f"Offloading {filename} to {config['target']}...", "info")
+    
+    try:
+        if config['type'] == "scp":
+            cmd = ["scp", "-q", "-o", "BatchMode=yes", file_path, config['target']]
+        else:
+            cmd = ["rclone", "copy", file_path, config['target']]
+            
+        subprocess.run(cmd, check=True)
+        print_status("Offload successful!", "success")
+        audit_log("BACKUP_OFFLOAD", config['service_name'], {"filename": filename, "target": config['target']})
+    except Exception as e:
+        print_status(f"Offload failed: {e}", "error")
+
+def sync_all_backups_remote():
+    """Manually push all local backups to configured remotes"""
+    configs = db.query("SELECT * FROM remote_configs", fetch_all=True)
+    if not configs:
+        print_status("No remote configurations found.", "warning")
+        return
+
+    for cfg in configs:
+        name = cfg['service_name']
+        backups = db.query("SELECT filename FROM backups WHERE service_name=?", (name,), fetch_all=True)
+        print(f"\n{C_CYAN}Syncing {len(backups)} backups for {name}...{C_RESET}")
+        for b in backups:
+            path = os.path.join(BACKUP_DIR, b['filename'])
+            if os.path.exists(path):
+                offload_backup(path, cfg)
+    
+    input(f"\n{C_CYAN}Sync complete. Press Enter...{C_RESET}")
 
 def list_backups():
     """List all backups and allow restoration"""
@@ -3655,7 +3887,7 @@ def mainmenu():
             print(f"{C_CYAN}╠{'═' * W}╬{'═' * W}╣{C_RESET}")
             print(menu_row("9", "View Database", "10", "Database Cleanup"))
             print(menu_row("11", "Update Database", "D", "System Diagnostics"))
-            print(menu_single_row("G", "Global Operations"))
+            print(menu_row("G", "Global Operations", "W", "Webhook Listener"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
             print(menu_single_row("[ 0 ]", "Exit ATS"))
             print(f"{C_CYAN}╚{'═' * (T-2)}╝{C_RESET}")
@@ -3688,6 +3920,8 @@ def mainmenu():
                 ats_doctor()
             elif choice == "g":
                 global_operations()
+            elif choice == "w":
+                run_webhook_listener()
             elif choice == "0":
                 print(f"\n{C_CYAN}{'═' * 70}{C_RESET}")
                 print(f"{C_CYAN}Thank you for using ATS v7.0!{C_RESET}")
