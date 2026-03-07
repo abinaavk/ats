@@ -2129,6 +2129,8 @@ async def zero_downtime_update(name: str):
         audit_log("BLUE_GREEN_UPDATE", name, {"status": "success"})
         
     except Exception as e:
+        logger.error(f"Update failed for {name}: {e}")
+        audit_log("BLUE_GREEN_FAILED", name, {"error": str(e)})
         print_status(f"Update failed: {e}. Reverting staging...", "error")
         if os.path.exists(stage_dir): shutil.rmtree(stage_dir)
 
