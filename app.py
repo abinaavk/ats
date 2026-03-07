@@ -4582,6 +4582,23 @@ async def run_daemon():
     asyncio.create_task(auto_backup_scheduler())
     await start_webhook_server() # This runs forever
 
+async def run_backup_all():
+    """Perform a one-off backup of all services and exit"""
+    print_status("Starting manual system-wide backup...", "info")
+    audit_log("MANUAL_SYSTEM_BACKUP_START", "SYSTEM")
+    services = db.query("SELECT * FROM services", fetch_all=True)
+    if services:
+        for svc in services:
+            backup_file = create_local_backup(svc)
+            if backup_file:
+                config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],), fetch_one=True)
+                if config and config['auto_offload']:
+                    await offload_backup(backup_file, config)
+        print_status(f"System-wide backup complete for {len(services)} services.", "success")
+        audit_log("MANUAL_SYSTEM_BACKUP_END", "SYSTEM", {"count": len(services)})
+    else:
+        print_status("No services found to backup.", "warning")
+
 if __name__ == "__main__":
     if os.geteuid() != 0:
         print(f"{C_RED}ERROR: ATS requires root privileges.{C_RESET}")
@@ -4591,6 +4608,14 @@ if __name__ == "__main__":
     if not os.path.exists(ATS_HOME):
         os.makedirs(ATS_HOME, exist_ok=True)
         os.chmod(ATS_HOME, 0o700)
+
+    # Check for non-blocking flags before locking
+    if len(sys.argv) > 1 and sys.argv[1] == "--backup-all":
+        try:
+            asyncio.run(run_backup_all())
+        except KeyboardInterrupt:
+            pass
+        sys.exit(0)
 
     lock = acquire_lock()
 
