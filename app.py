@@ -1724,26 +1724,55 @@ async def zero_downtime_update(name: str):
 # ==============================================================================
 
 async def handle_webhook(reader, writer):
-    """Handle incoming git push webhooks"""
-    data = await reader.read(4096)
+    """Handle incoming git push webhooks with basic HTTP parsing"""
     try:
-        # Simple extraction of repository name from GitHub-style webhook
-        payload = data.decode().split("\r\n\r\n")[-1]
-        if payload:
-            js = json.loads(payload)
-            repo_name = js.get("repository", {}).get("name")
-            print(f"\n{C_MAGENTA}WEBHOOK RECEVIED for {repo_name}{C_RESET}")
+        data = await reader.read(8192)
+        request = data.decode('utf-8', errors='ignore')
+        
+        if not request.startswith("POST"):
+            writer.close()
+            return
+
+        # Extract Body (after \r\n\r\n)
+        parts = request.split("\r\n\r\n")
+        if len(parts) < 2:
+            writer.close()
+            return
+            
+        payload_str = parts[1]
+        if not payload_str:
+            writer.close()
+            return
+
+        js = json.loads(payload_str)
+        repo_name = js.get("repository", {}).get("name")
+        
+        if repo_name:
+            print(f"\n{C_MAGENTA}{C_BOLD}[ WEBHOOK RECEIVED ]{C_RESET} Repository: {repo_name}")
             
             # Find matching service
             services = db.query("SELECT name FROM services", fetch_all=True)
+            match_found = False
             for s in services:
-                if s['name'].lower() in repo_name.lower():
-                    print_status(f"Auto-deploying {s['name']} via webhook...", "info")
-                    await zero_downtime_update(s['name'])
+                if s['name'].lower() == repo_name.lower():
+                    print_status(f"Auto-deploying matching service: {s['name']}", "info")
+                    asyncio.create_task(zero_downtime_update(s['name']))
+                    match_found = True
                     break
-    except:
-        pass
-    writer.close()
+            
+            if not match_found:
+                print_status(f"No matching service found for repository '{repo_name}'", "warning")
+        
+        # Send simple HTTP 200 OK response
+        response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK"
+        writer.write(response.encode())
+        await writer.drain()
+
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+    finally:
+        writer.close()
+        await writer.wait_closed()
 
 async def start_webhook_server():
     """Start background webhook listener on port 9999"""
