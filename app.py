@@ -46,8 +46,11 @@ ATS_HOME = "/home/gaia/ats"
 DB_FILE = os.path.join(ATS_HOME, "ats.db")
 LOG_FILE = os.path.join(ATS_HOME, "ats.log")
 AUDIT_FILE = os.path.join(ATS_HOME, "audit.trace")
-LOCK_FILE = "/tmp/ats.lock"
 METRICS_FILE = os.path.join(ATS_HOME, "metrics.prom")
+
+# --- Dynamic Locking ---
+IS_DAEMON = "--daemon" in sys.argv
+LOCK_FILE = f"/tmp/ats_{'daemon' if IS_DAEMON else 'cli'}.lock"
 
 SERVICE_USER = "gaia"
 SERVICE_GROUP = "gaia"
@@ -2844,6 +2847,19 @@ def create_local_backup(svc):
         db.query("INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
                  (name, filename, file_size, checksum))
         
+        # --- RETENTION LOGIC (Keep max 7) ---
+        backups = db.query("SELECT id, filename FROM backups WHERE service_name=? ORDER BY timestamp DESC", (name,), fetch_all=True)
+        if len(backups) > 7:
+            for oldest in backups[7:]:
+                old_path = os.path.join(BACKUP_DIR, oldest['filename'])
+                if os.path.exists(old_path):
+                    try:
+                        os.remove(old_path)
+                    except:
+                        pass
+                db.query("DELETE FROM backups WHERE id=?", (oldest['id'],))
+                logger.info(f"Retention: Deleted old backup for {name}: {oldest['filename']}")
+
         print_status(f"Local backup created: {filename} ({file_size/1024/1024:.2f} MB)", "success")
         return backup_path
     except Exception as e:
