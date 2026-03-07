@@ -1732,7 +1732,7 @@ async def service_operations():
     print("  1. Restart service")
     print("  2. Stop service")
     print("  3. Start service")
-    print("  4. Zero-Downtime Update (Blue-Green)")
+    print("  4. Git Pull and Restart")
     print("  5. Reinstall dependencies")
     print("  6. View systemd status")
     print("  7. View resource usage")
