@@ -2939,62 +2939,99 @@ async def sync_all_backups_remote():
     await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Manual sync complete. Press Enter to return to menu...{C_RESET}"))
 
 async def list_backups():
-    """List all backups and allow restoration"""
+    """Service-specific backup management with deletion"""
     while True:
         print_header()
-        print(f"{C_CYAN}{C_BOLD}═══ BACKUP HISTORY & RESTORE ═══{C_RESET}\n")
-
-        backups = db.query(
-            "SELECT * FROM backups ORDER BY timestamp DESC LIMIT 50",
-            fetch_all=True
-        )
-
-        loop = asyncio.get_event_loop()
-        if not backups:
-            print_status("No backups found", "warning")
-            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        print(f"{C_CYAN}{C_BOLD}═══ BACKUP EXPLORER ═══{C_RESET}\n")
+        
+        services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
+        if not services:
+            print_status("No services deployed.", "warning")
+            await asyncio.sleep(1)
             return
 
-        print(f"{C_CYAN}Total Backups: {C_BOLD}{len(backups)}{C_RESET}\n")
-
-        total_size = sum(b['size_bytes'] or 0 for b in backups)
-        if total_size >= 1024 * 1024 * 1024:
-            size_str = f"{total_size / (1024 ** 3):.2f} GB"
-        else:
-            size_str = f"{total_size / (1024 ** 2):.2f} MB"
-        print(f"{C_CYAN}Total Storage Used: {C_BOLD}{size_str}{C_RESET}\n")
-
-        print(f"{C_BOLD}{'ID':<4} {'SERVICE':<15} {'SIZE (MB)':<12} {'DATE':<20} {'STATUS'}{C_RESET}")
-        print(f"{C_CYAN}{'─' * 80}{C_RESET}")
-
-        for idx, backup in enumerate(backups, 1):
-            size_mb = (backup['size_bytes'] / 1024 / 1024) if backup['size_bytes'] else 0
-            timestamp = backup['timestamp'][:19] if backup['timestamp'] else "Unknown"
-
-            backup_file = os.path.join(BACKUP_DIR, backup['filename'])
-            exists = os.path.exists(backup_file)
-            status = f"{C_GREEN}✓ EXISTS{C_RESET}" if exists else f"{C_RED}✗ MISSING{C_RESET}"
-
-            print(f"{idx:<4} {backup['service_name']:<15} {size_mb:<12.2f} {timestamp:<20} {status}")
-
-        print(f"{C_CYAN}{'─' * 80}{C_RESET}")
-        print(f"\n  {C_BOLD}[ID]{C_RESET} Restore Backup  |  {C_BOLD}[0]{C_RESET} Back")
+        print(f"  {C_BOLD}{'ID':<6} {'SERVICE NAME'}{C_RESET}")
+        print(f"  {C_CYAN}{'─' * 30}{C_RESET}")
+        for s in services:
+            print(f"  {s['id']:<6} {s['name']}")
         
-        choice = (await loop.run_in_executor(None, lambda: input(f"\n  {C_CYAN}Selection:{C_RESET} "))).strip()
-
-        if choice == "0":
-            break
-
-        try:
-            idx = int(choice)
-            if 1 <= idx <= len(backups):
-                await restore_backup(backups[idx-1])
-            else:
-                print_status("Invalid ID", "error")
-                await asyncio.sleep(1)
-        except ValueError:
-            print_status("Invalid input", "error")
+        loop = asyncio.get_event_loop()
+        svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID to view backups (0 to back):{C_RESET} "))).strip()
+        
+        if svc_id == "0" or not svc_id: break
+        
+        svc = db.query("SELECT name FROM services WHERE id=?", (svc_id,), fetch_one=True)
+        if not svc:
+            print_status("Invalid Service ID.", "error")
             await asyncio.sleep(1)
+            continue
+
+        await show_service_backups(svc['name'])
+
+async def show_service_backups(name: str):
+    """View and manage backups for a specific service"""
+    while True:
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ BACKUPS: {name} ═══{C_RESET}\n")
+        
+        backups = db.query("SELECT * FROM backups WHERE service_name=? ORDER BY timestamp DESC", (name,), fetch_all=True)
+        
+        if not backups:
+            print_status(f"No backups found for {name}", "warning")
+            await asyncio.get_event_loop().run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+
+        print(f"  {C_BOLD}{'ID':<4} {'SIZE (MB)':<12} {'DATE':<20} {'STATUS'}{C_RESET}")
+        print(f"  {C_CYAN}{'─' * 60}{C_RESET}")
+        for idx, b in enumerate(backups, 1):
+            size_mb = b['size_bytes'] / 1024 / 1024
+            ts = b['timestamp'][:19]
+            backup_file = os.path.join(BACKUP_DIR, b['filename'])
+            status = f"{C_GREEN}✓{C_RESET}" if os.path.exists(backup_file) else f"{C_RED}✗{C_RESET}"
+            print(f"  {idx:<4} {size_mb:<12.2f} {ts:<20} {status}")
+
+        print(f"\n  {C_BOLD}[ID]{C_RESET} Restore  |  {C_BOLD}[D + ID]{C_RESET} Delete (ex: d1)  |  {C_BOLD}[0]{C_RESET} Back")
+        
+        loop = asyncio.get_event_loop()
+        choice = (await loop.run_in_executor(None, lambda: input(f"\n  Selection: "))).strip().lower()
+        
+        if choice == "0": break
+        
+        if choice.startswith('d'):
+            try:
+                idx = int(choice[1:])
+                if 1 <= idx <= len(backups):
+                    await delete_backup(backups[idx-1])
+                else: raise ValueError
+            except:
+                print_status("Invalid selection", "error")
+                await asyncio.sleep(1)
+        else:
+            try:
+                idx = int(choice)
+                if 1 <= idx <= len(backups):
+                    await restore_backup(backups[idx-1])
+                else: raise ValueError
+            except:
+                print_status("Invalid selection", "error")
+                await asyncio.sleep(1)
+
+async def delete_backup(backup: Dict):
+    """Permanently delete a backup file and database record"""
+    filename = backup['filename']
+    path = os.path.join(BACKUP_DIR, filename)
+    
+    print(f"\n{C_RED}Delete backup {filename}? (yes/no):{C_RESET} ", end="")
+    loop = asyncio.get_event_loop()
+    confirm = (await loop.run_in_executor(None, lambda: input())).strip().lower()
+    
+    if confirm == "yes":
+        if os.path.exists(path):
+            os.remove(path)
+        db.query("DELETE FROM backups WHERE id=?", (backup['id'],))
+        print_status("Backup deleted successfully", "success")
+        audit_log("BACKUP_DELETE", backup['service_name'], {"filename": filename})
+        await asyncio.sleep(1)
 
 async def restore_backup(backup: Dict):
     """Automatically restore database files from a backup zip"""
@@ -4289,7 +4326,44 @@ async def get_telemetry_async() -> Tuple[float, str, str, int]:
 #   MAIN MENU
 # ==============================================================================
 
+async def auto_backup_scheduler():
+    """Background task to backup all services every day at 12:00 AM"""
+    logger.info("Auto-backup scheduler started.")
+    while True:
+        try:
+            now = datetime.datetime.now()
+            # Calculate time until next midnight
+            tomorrow = now + datetime.timedelta(days=1)
+            next_midnight = datetime.datetime.combine(tomorrow, datetime.time.min)
+            sleep_seconds = (next_midnight - now).total_seconds()
+            
+            logger.info(f"Next auto-backup scheduled for 12:00 AM (in {sleep_seconds/3600:.1f} hours)")
+            await asyncio.sleep(sleep_seconds)
+            
+            # --- START MIDNIGHT BACKUP ---
+            logger.info("Triggering scheduled midnight backup for all services...")
+            services = db.query("SELECT * FROM services", fetch_all=True)
+            
+            if services:
+                for svc in services:
+                    backup_file = create_local_backup(svc)
+                    if backup_file:
+                        # Check for remote offloading
+                        config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],), fetch_one=True)
+                        if config and config['auto_offload']:
+                            await offload_backup(backup_file, config)
+                logger.info(f"Midnight backup completed for {len(services)} services.")
+            else:
+                logger.info("No services found for scheduled backup.")
+                
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+            await asyncio.sleep(60) # Sleep 1 minute before retrying
+
 async def mainmenu():
+    # Start the scheduler as a background task within the same event loop
+    asyncio.create_task(auto_backup_scheduler())
+    
     while True:
         try:
             print_header()
