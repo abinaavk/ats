@@ -4546,6 +4546,17 @@ async def mainmenu():
 #   ENTRY POINT
 # ==============================================================================
 
+async def run_daemon():
+    """Run ATS in background mode (Scheduler + Webhook Listener)"""
+    print_header()
+    print(f"{C_GREEN}Starting ATS Daemon v7.0...{C_RESET}")
+    print(f"{C_CYAN}→ Auto-Backup Scheduler: ACTIVE{C_RESET}")
+    print(f"{C_CYAN}→ Webhook Listener:     ACTIVE (Port 9999){C_RESET}")
+    
+    # Start tasks
+    asyncio.create_task(auto_backup_scheduler())
+    await start_webhook_server() # This runs forever
+
 if __name__ == "__main__":
     if os.geteuid() != 0:
         print(f"{C_RED}ERROR: ATS requires root privileges.{C_RESET}")
@@ -4557,6 +4568,14 @@ if __name__ == "__main__":
         os.chmod(ATS_HOME, 0o700)
 
     lock = acquire_lock()
+
+    # Check for daemon flag
+    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
+        try:
+            asyncio.run(run_daemon())
+        except KeyboardInterrupt:
+            pass
+        sys.exit(0)
 
     print_header()
     print(f"{C_GREEN}Initializing ATS v7.0...{C_RESET}")
