@@ -2996,14 +2996,24 @@ def create_local_backup(svc):
     """Internal logic to create a zip of the database"""
     name = svc['name']
     try:
-        db_path = os.path.join(svc['storage_path'], "database", name)
+        # FIX: storage_path may include trailing /api from deployment
+        storage_base = svc['storage_path'].rstrip('/')
+        if storage_base.endswith('/api'):
+            storage_base = storage_base[:-4]
+
+        db_path = os.path.join(storage_base, "database", name)
+
         if not os.path.exists(db_path):
-            print_status("Database path missing", "error")
+            logger.error(f"[{name}] Backup failed: database path missing: {db_path}")
+            print_status(f"Database path missing: {db_path}", "error")
+            audit_log("BACKUP_FAILED", name, {"stage": "path_check", "path": db_path})
             return None
 
         db_files = [f for f in os.listdir(db_path) if os.path.isfile(os.path.join(db_path, f))]
         if not db_files:
-            print_status("No files to backup", "warning")
+            logger.warning(f"[{name}] Backup skipped: no files in {db_path}")
+            print_status(f"No files to backup in {db_path}", "warning")
+            audit_log("BACKUP_SKIPPED", name, {"reason": "no_files", "path": db_path})
             return None
 
         if not os.path.exists(BACKUP_DIR):
@@ -3021,29 +3031,43 @@ def create_local_backup(svc):
         file_size = os.path.getsize(backup_path)
         checksum = calculate_file_hash(backup_path)
 
-        db.query("INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
-                 (name, filename, file_size, checksum))
-        
-        audit_log("BACKUP_CREATE", name, {"filename": filename, "size_mb": round(file_size/1024/1024, 2)})
+        db.query(
+            "INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
+            (name, filename, file_size, checksum)
+        )
+
+        logger.info(f"[{name}] Backup created: {filename} ({file_size/1024/1024:.2f} MB)")
+        print_status(f"Local backup created: {filename} ({file_size/1024/1024:.2f} MB)", "success")
+        audit_log("BACKUP_CREATE", name, {
+            "filename": filename,
+            "size_mb": round(file_size/1024/1024, 2),
+            "files_backed_up": len(db_files),
+            "path": db_path
+        })
 
         # --- RETENTION LOGIC (Keep max 7) ---
-        backups = db.query("SELECT id, filename FROM backups WHERE service_name=? ORDER BY timestamp DESC", (name,), fetch_all=True)
+        backups = db.query(
+            "SELECT id, filename FROM backups WHERE service_name=? ORDER BY timestamp DESC",
+            (name,), fetch_all=True
+        )
         if len(backups) > 7:
             for oldest in backups[7:]:
                 old_path = os.path.join(BACKUP_DIR, oldest['filename'])
                 if os.path.exists(old_path):
                     try:
                         os.remove(old_path)
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[{name}] Could not delete old backup file: {e}")
                 db.query("DELETE FROM backups WHERE id=?", (oldest['id'],))
-                logger.info(f"Retention: Deleted old backup for {name}: {oldest['filename']}")
+                logger.info(f"[{name}] Retention: deleted {oldest['filename']}")
                 audit_log("BACKUP_RETENTION_DELETE", name, {"filename": oldest['filename']})
 
-        print_status(f"Local backup created: {filename} ({file_size/1024/1024:.2f} MB)", "success")
         return backup_path
+
     except Exception as e:
+        logger.error(f"[{name}] Backup failed: {e}")
         print_status(f"Local backup failed: {e}", "error")
+        audit_log("BACKUP_FAILED", name, {"stage": "unexpected", "error": str(e)})
         return None
 
 async def configure_remote_offloading():
@@ -4569,7 +4593,13 @@ async def get_telemetry_async() -> Tuple[float, str, str, int]:
 
 async def auto_backup_scheduler():
     """Background task to backup all services every day at 12:00 AM"""
+    if getattr(auto_backup_scheduler, "started", False):
+        logger.warning("Auto-backup scheduler already running — skipping duplicate start")
+        return
+    auto_backup_scheduler.started = True
+
     logger.info("Auto-backup scheduler started.")
+    
     while True:
         try:
             now = datetime.datetime.now()
@@ -4606,7 +4636,8 @@ async def auto_backup_scheduler():
 
 async def mainmenu():
     # Start the scheduler as a background task within the same event loop
-    asyncio.create_task(auto_backup_scheduler())
+    if not getattr(auto_backup_scheduler, "started", False):
+        asyncio.create_task(auto_backup_scheduler())
     
     while True:
         try:
