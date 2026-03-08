@@ -2240,20 +2240,33 @@ async def direct_update(name: str, svc: dict):           # FIX: added svc param
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_service_by_name(name: str) -> Optional[dict]:
-    """Look up a service record by name, returns dict or None"""
+    """Look up service by name first, then fall back to repo URL match"""
     row = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
     if row:
         return dict(row)
+
+    # Fallback: match against the repo URL (GitHub repo name may differ from service name)
+    # e.g. repo 'abinaavk_portfolio' should match service with repo_url ending in 'abinaavk_portfolio'
+    row = db.query(
+        "SELECT * FROM services WHERE repo_url LIKE ?",
+        (f"%/{name}",),
+        fetch_one=True
+    )
+    if row:
+        return dict(row)
+
+    # Also try with .git suffix
+    row = db.query(
+        "SELECT * FROM services WHERE repo_url LIKE ?",
+        (f"%/{name}.git",),
+        fetch_one=True
+    )
+    if row:
+        return dict(row)
+
     return None
 
 async def handle_webhook(reader, writer):
-    """
-    Robust GitHub/GitLab webhook handler.
-
-    Expects an HTTP POST to  /webhook/<service-name>
-    Reads headers to determine Content-Length, reads the JSON body,
-    responds 200 OK immediately, then triggers _do_git_update() in the background.
-    """
     try:
         # ── Read request line ────────────────────────────────────────────────
         request_line = await asyncio.wait_for(reader.readline(), timeout=10)
