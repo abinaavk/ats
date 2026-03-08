@@ -2239,6 +2239,13 @@ async def direct_update(name: str, svc: dict):           # FIX: added svc param
 #   handle_webhook  — GitHub / GitLab push-event handler
 # ──────────────────────────────────────────────────────────────────────────────
 
+def get_service_by_name(name: str) -> Optional[dict]:
+    """Look up a service record by name, returns dict or None"""
+    row = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    if row:
+        return dict(row)
+    return None
+
 async def handle_webhook(reader, writer):
     """
     Robust GitHub/GitLab webhook handler.
