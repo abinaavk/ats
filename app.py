@@ -2129,51 +2129,94 @@ async def service_operations():
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def _do_git_update(name: str, svc: dict) -> bool:
-    """
-    Pull latest code and restart the named service.
-    Returns True on full success, False otherwise.
-    Used by both direct_update() and handle_webhook().
-    """
+    loop = asyncio.get_running_loop()
+
+    # ── resolve path ──────────────────────────────────────────────────────────
     try:
         service_path = get_service_path(svc['storage_path'], name)
-        print("Pulling from git...")
-
-        returncode, stdout, stderr = run_as_gaia(
-            ["git", "pull"],
-            cwd=service_path,
-            capture=True
-        )
-
-        if returncode != 0:
-            print(f"{C_RED}✗ Git pull failed{C_RESET}")
-            if stderr:
-                print(f"Error: {stderr[:200]}")
-            return False
-
-        print(f"{C_GREEN}✓ Code updated{C_RESET}")
-        if "Already up to date" in stdout or "Already up-to-date" in stdout:
-            print("  (no new changes)")
-
-        print("\nRestarting service...")
-        subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
-        await asyncio.sleep(2)                          # FIX: was time.sleep(2)
-
-        result = subprocess.run(
-            ["systemctl", "is-active", name],
-            capture_output=True,
-            timeout=5
-        )
-
-        if result.stdout.strip() == b"active":
-            print(f"{C_GREEN}✓ Service restarted with new code{C_RESET}")
-            audit_log("UPDATE", name, {"method": "git-pull"})
-            return True
-        else:
-            print(f"{C_RED}✗ Service restart failed{C_RESET}")
-            return False
-
     except Exception as e:
-        print(f"{C_RED}✗ Error: {e}{C_RESET}")
+        logger.error(f"[{name}] Could not resolve service path: {e}")
+        audit_log("UPDATE_FAILED", name, {"stage": "path_resolution", "error": str(e)})
+        return False
+
+    logger.info(f"[{name}] Starting git pull at {service_path}")
+    audit_log("UPDATE_STARTED", name, {"method": "git-pull", "path": service_path})
+
+    # ── git pull ──────────────────────────────────────────────────────────────
+    try:
+        returncode, stdout, stderr = await loop.run_in_executor(  # FIX: was blocking
+            None,
+            lambda: run_as_gaia(["git", "pull"], cwd=service_path, capture=True)
+        )
+    except Exception as e:
+        logger.error(f"[{name}] git pull raised exception: {e}")
+        audit_log("UPDATE_FAILED", name, {"stage": "git_pull", "error": str(e)})
+        return False
+
+    if returncode != 0:
+        logger.error(f"[{name}] git pull failed (rc={returncode}): {stderr[:300]}")
+        audit_log("UPDATE_FAILED", name, {
+            "stage": "git_pull",
+            "returncode": returncode,
+            "stderr": stderr[:300]
+        })
+        return False
+
+    already_up_to_date = "Already up to date" in stdout or "Already up-to-date" in stdout
+    logger.info(f"[{name}] git pull OK — {'no new changes' if already_up_to_date else 'new code pulled'}")
+
+    if already_up_to_date:
+        audit_log("UPDATE_SKIPPED", name, {"reason": "already_up_to_date"})
+        return True  # nothing to restart
+
+    # ── systemctl restart ─────────────────────────────────────────────────────
+    logger.info(f"[{name}] Restarting service...")
+    try:
+        await loop.run_in_executor(  # FIX: was blocking
+            None,
+            lambda: subprocess.run(
+                ["systemctl", "restart", name],
+                timeout=10,
+                check=True
+            )
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[{name}] systemctl restart failed: {e}")
+        audit_log("UPDATE_FAILED", name, {"stage": "restart", "error": str(e)})
+        return False
+    except Exception as e:
+        logger.error(f"[{name}] Unexpected restart error: {e}")
+        audit_log("UPDATE_FAILED", name, {"stage": "restart", "error": str(e)})
+        return False
+
+    await asyncio.sleep(2)
+
+    # ── confirm active ────────────────────────────────────────────────────────
+    try:
+        result = await loop.run_in_executor(  # FIX: was blocking
+            None,
+            lambda: subprocess.run(
+                ["systemctl", "is-active", name],
+                capture_output=True,
+                timeout=5
+            )
+        )
+    except Exception as e:
+        logger.error(f"[{name}] Could not check service status: {e}")
+        audit_log("UPDATE_FAILED", name, {"stage": "status_check", "error": str(e)})
+        return False
+
+    if result.stdout.strip() == b"active":
+        logger.info(f"[{name}] Service is active — update complete")
+        audit_log("UPDATE", name, {"method": "git-pull", "stdout": stdout[:500]})
+        return True
+    else:
+        status = result.stdout.strip().decode(errors="replace")
+        logger.error(f"[{name}] Service not active after restart — status: '{status}'")
+        audit_log("UPDATE_FAILED", name, {
+            "stage": "post_restart_check",
+            "systemd_status": status
+        })
         return False
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2267,6 +2310,7 @@ async def handle_webhook(reader, writer):
         if service_name:
             svc = get_service_by_name(service_name)      # look up from services config
             if svc:
+                audit_log("WEBHOOK_RECEIVED", service_name, {"source": headers.get("x-github-event") or headers.get("x-gitlab-event") or "unknown", "delivery": headers.get("x-github-delivery") or headers.get("x-gitlab-event-uuid") or "unknown",})
                 logger.info(f"Webhook: triggering update for '{service_name}'")
                 asyncio.create_task(_do_git_update(service_name, svc))
             else:
@@ -2300,7 +2344,6 @@ async def start_webhook_server():
     except Exception as e:
         logger.error(f"Could not start webhook server: {e}")
         print_status(f"Webhook server failed: {e}", "error")
-
 
 async def run_webhook_listener():
     """Menu wrapper to start listener with Cloudflare tunnel auto-config"""
