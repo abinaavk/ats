@@ -781,7 +781,6 @@ def health_check_deployment(name: str, port: int, max_retries: int = 5) -> bool:
     print_status("Health check FAILED", "error")
     return False
 
-
 # ==============================================================================
 #   DEPLOYMENT ENGINE
 # ==============================================================================
@@ -2121,70 +2120,174 @@ async def service_operations():
         print_status("Invalid choice", "warning")
         time.sleep(1)
 
-
 # ==============================================================================
 #   WEBHOOK LISTENER
 # ==============================================================================
 
-async def direct_update(name: str):
-    # GIT PULL AND RESTART
-    print(f"\n{C_YELLOW}Updating code...{C_RESET}")
+# ──────────────────────────────────────────────────────────────────────────────
+#   INTERNAL HELPER — shared git-pull + restart logic (no blocking I/O)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _do_git_update(name: str, svc: dict) -> bool:
+    """
+    Pull latest code and restart the named service.
+    Returns True on full success, False otherwise.
+    Used by both direct_update() and handle_webhook().
+    """
     try:
         service_path = get_service_path(svc['storage_path'], name)
         print("Pulling from git...")
 
         returncode, stdout, stderr = run_as_gaia(
-                ["git", "pull"],
-                cwd=service_path,
-                capture=True
-            )
+            ["git", "pull"],
+            cwd=service_path,
+            capture=True
+        )
 
-        if returncode == 0:
-            print(f"{C_GREEN}✓ Code updated{C_RESET}")
-
-            if "Already up to date" in stdout or "Already up-to-date" in stdout:
-                print("  (no new changes)")
-
-            print("\nRestarting service...")
-            subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
-            time.sleep(2)
-
-            result = subprocess.run(
-                    ["systemctl", "is-active", name],
-                    capture_output=True,
-                    timeout=5
-                )
-
-            if result.stdout.strip() == b"active":
-                print(f"{C_GREEN}✓ Service restarted with new code{C_RESET}")
-                audit_log("UPDATE", name, {"method": "git-pull"})
-            else:
-                print(f"{C_RED}✗ Service restart failed{C_RESET}")
-        else:
+        if returncode != 0:
             print(f"{C_RED}✗ Git pull failed{C_RESET}")
             if stderr:
                 print(f"Error: {stderr[:200]}")
+            return False
+
+        print(f"{C_GREEN}✓ Code updated{C_RESET}")
+        if "Already up to date" in stdout or "Already up-to-date" in stdout:
+            print("  (no new changes)")
+
+        print("\nRestarting service...")
+        subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
+        await asyncio.sleep(2)                          # FIX: was time.sleep(2)
+
+        result = subprocess.run(
+            ["systemctl", "is-active", name],
+            capture_output=True,
+            timeout=5
+        )
+
+        if result.stdout.strip() == b"active":
+            print(f"{C_GREEN}✓ Service restarted with new code{C_RESET}")
+            audit_log("UPDATE", name, {"method": "git-pull"})
+            return True
+        else:
+            print(f"{C_RED}✗ Service restart failed{C_RESET}")
+            return False
+
     except Exception as e:
         print(f"{C_RED}✗ Error: {e}{C_RESET}")
+        return False
 
-    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+# ──────────────────────────────────────────────────────────────────────────────
+#   direct_update  — interactive menu action (git pull + restart)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def direct_update(name: str, svc: dict):           # FIX: added svc param
+    # GIT PULL AND RESTART
+    print(f"\n{C_YELLOW}Updating code...{C_RESET}")
+
+    await _do_git_update(name, svc)                       # FIX: delegate to shared helper
+
+    loop = asyncio.get_running_loop()                     # FIX: not get_event_loop()
+    await loop.run_in_executor(                           # FIX: was blocking input()
+        None,
+        lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+#   handle_webhook  — GitHub / GitLab push-event handler
+# ──────────────────────────────────────────────────────────────────────────────
 
 async def handle_webhook(reader, writer):
-    """Robust GitHub/GitLab webhook handler - Points to direct_update"""
+    """
+    Robust GitHub/GitLab webhook handler.
+
+    Expects an HTTP POST to  /webhook/<service-name>
+    Reads headers to determine Content-Length, reads the JSON body,
+    responds 200 OK immediately, then triggers _do_git_update() in the background.
+    """
     try:
-        # ... (headers reading logic remains same) ...
-        
-        response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+        # ── Read request line ────────────────────────────────────────────────
+        request_line = await asyncio.wait_for(reader.readline(), timeout=10)
+        request_line = request_line.decode(errors="replace").strip()
+
+        # Extract service name from path:  POST /webhook/my-service HTTP/1.1
+        service_name = None
+        parts = request_line.split()
+        if len(parts) >= 2:
+            path = parts[1]                              # e.g. /webhook/my-service
+            segments = [s for s in path.split("/") if s]
+            # Path may be /webhook/<name>  or just /<name>
+            if len(segments) >= 2 and segments[0] == "webhook":
+                service_name = segments[1]
+            elif len(segments) == 1:
+                service_name = segments[0]
+
+        # ── Read headers ─────────────────────────────────────────────────────
+        headers = {}
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+            line = line.decode(errors="replace").strip()
+            if not line:
+                break                                    # blank line = end of headers
+            if ":" in line:
+                key, _, val = line.partition(":")
+                headers[key.strip().lower()] = val.strip()
+
+        # ── Read body ────────────────────────────────────────────────────────
+        payload = {}
+        content_length = int(headers.get("content-length", 0))
+        if content_length > 0:
+            raw_body = await asyncio.wait_for(
+                reader.readexactly(content_length), timeout=15
+            )
+            try:
+                payload = json.loads(raw_body.decode(errors="replace"))
+            except json.JSONDecodeError:
+                logger.warning("Webhook: could not parse JSON body")
+
+        # ── Fallback: try to get repo/service name from payload ──────────────
+        if not service_name:
+            # GitHub sends repository.name; GitLab sends repository.name too
+            service_name = (
+                payload.get("repository", {}).get("name")
+                or payload.get("project", {}).get("name")
+            )
+
+        # ── Respond 200 OK immediately (before doing the update) ─────────────
+        response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 2\r\n"
+            "Connection: close\r\n"
+            "\r\nOK"
+        )
         writer.write(response.encode())
         await writer.drain()
 
+        # ── Trigger update in background ──────────────────────────────────────
+        if service_name:
+            svc = get_service_by_name(service_name)      # look up from services config
+            if svc:
+                logger.info(f"Webhook: triggering update for '{service_name}'")
+                asyncio.create_task(_do_git_update(service_name, svc))
+            else:
+                logger.warning(f"Webhook: unknown service '{service_name}'")
+        else:
+            logger.warning("Webhook: could not determine target service from request")
+
+    except asyncio.TimeoutError:
+        logger.error("Webhook error: timed out reading request")
     except Exception as e:
         logger.error(f"Webhook error: {e}")
     finally:
         try:
             writer.close()
             await writer.wait_closed()
-        except: pass
+        except:
+            pass
+
+# ──────────────────────────────────────────────────────────────────────────────
+#   start_webhook_server / run_webhook_listener
+# ──────────────────────────────────────────────────────────────────────────────
 
 async def start_webhook_server():
     """Start background webhook listener on port 9999"""
@@ -2198,14 +2301,14 @@ async def start_webhook_server():
         logger.error(f"Could not start webhook server: {e}")
         print_status(f"Webhook server failed: {e}", "error")
 
+
 async def run_webhook_listener():
     """Menu wrapper to start listener with Cloudflare tunnel auto-config"""
     print_header()
     webhook_domain = f"webhook.{MAIN_DOMAIN}"
     print_status(f"Ensuring Cloudflare route: {webhook_domain}...", "info")
-    
+
     try:
-        # Automatically add/verify the route in Cloudflare Tunnel
         cloudflare.add_route(webhook_domain, 9999)
         print_status("Cloudflare Tunnel configured for webhooks.", "success")
     except Exception as e:
@@ -2216,21 +2319,24 @@ async def run_webhook_listener():
     print(f"  → Public URL: {C_CYAN}https://{webhook_domain}{C_RESET}")
     print(f"  → Payload:    {C_CYAN}application/json{C_RESET}")
     print(f"\n{C_YELLOW}Listener is now running in the background.{C_RESET}")
-    
-    # Ensure it only starts once
+
     if not hasattr(run_webhook_listener, "started"):
         asyncio.create_task(start_webhook_server())
         run_webhook_listener.started = True
     else:
         print_status("Listener already running.", "info")
-        
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}"))
+
+    loop = asyncio.get_running_loop()                    # FIX: was get_event_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
+    )
 
 # ==============================================================================
-#   SERVICE LISTING
+#   SERVICE LISTING / MANAGEMENT
 # ==============================================================================
 
+async def manage_service(name: str, svc: dict):          # FIX: was floating orphan code
     print(f"\n{C_CYAN}Service: {C_BOLD}{name}{C_RESET}")
     print(f"Domain:  https://{svc['domain']}")
     print(f"Port:    {svc['port']}")
@@ -2260,14 +2366,19 @@ async def run_webhook_listener():
     print("  7. View resource usage")
     print("  0. Cancel")
 
-    choice = input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
+    loop = asyncio.get_running_loop()                    # FIX: needed for all input() calls
+
+    choice = await loop.run_in_executor(                 # FIX: was blocking input()
+        None,
+        lambda: input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
+    )
 
     if choice == "1":
         # RESTART
         print(f"\n{C_YELLOW}Restarting service...{C_RESET}")
         try:
             subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
-            time.sleep(2)
+            await asyncio.sleep(2)                       # FIX: was time.sleep(2)
 
             result = subprocess.run(
                 ["systemctl", "is-active", name],
@@ -2283,16 +2394,20 @@ async def run_webhook_listener():
         except Exception as e:
             print(f"{C_RED}✗ Error: {e}{C_RESET}")
 
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(                      # FIX: was blocking input()
+            None,
+            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        )
 
     elif choice == "2":
         # STOP
-        print(f"\n{C_RED}Stop service '{name}'? (yes/no):{C_RESET} ", end='')
-        if input().strip().lower() == "yes":
+        print(f"\n{C_RED}Stop service '{name}'? (yes/no):{C_RESET} ", end='', flush=True)
+        confirm = await loop.run_in_executor(None, input)  # FIX: was blocking input()
+        if confirm.strip().lower() == "yes":
             print(f"\n{C_YELLOW}Stopping service...{C_RESET}")
             try:
                 subprocess.run(["systemctl", "stop", name], timeout=10, check=True)
-                time.sleep(1)
+                await asyncio.sleep(1)                   # FIX: was time.sleep(1)
                 print(f"{C_GREEN}✓ Service stopped{C_RESET}")
                 audit_log("STOP", name)
             except Exception as e:
@@ -2300,14 +2415,17 @@ async def run_webhook_listener():
         else:
             print(f"{C_YELLOW}Cancelled{C_RESET}")
 
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(
+            None,
+            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        )
 
     elif choice == "3":
         # START
         print(f"\n{C_YELLOW}Starting service...{C_RESET}")
         try:
             subprocess.run(["systemctl", "start", name], timeout=10, check=True)
-            time.sleep(2)
+            await asyncio.sleep(2)                       # FIX: was time.sleep(2)
 
             result = subprocess.run(
                 ["systemctl", "is-active", name],
@@ -2323,54 +2441,16 @@ async def run_webhook_listener():
         except Exception as e:
             print(f"{C_RED}✗ Error: {e}{C_RESET}")
 
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(
+            None,
+            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        )
 
     elif choice == "4":
-        # GIT PULL AND RESTART
-        print(f"\n{C_YELLOW}Updating code...{C_RESET}")
-        try:
-            service_path = get_service_path(svc['storage_path'], name)
-            print("Pulling from git...")
-
-            returncode, stdout, stderr = run_as_gaia(
-                ["git", "pull"],
-                cwd=service_path,
-                capture=True
-            )
-
-            if returncode == 0:
-                print(f"{C_GREEN}✓ Code updated{C_RESET}")
-
-                if "Already up to date" in stdout or "Already up-to-date" in stdout:
-                    print("  (no new changes)")
-
-                print("\nRestarting service...")
-                subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
-                time.sleep(2)
-
-                result = subprocess.run(
-                    ["systemctl", "is-active", name],
-                    capture_output=True,
-                    timeout=5
-                )
-
-                if result.stdout.strip() == b"active":
-                    print(f"{C_GREEN}✓ Service restarted with new code{C_RESET}")
-                    audit_log("UPDATE", name, {"method": "git-pull"})
-                else:
-                    print(f"{C_RED}✗ Service restart failed{C_RESET}")
-            else:
-                print(f"{C_RED}✗ Git pull failed{C_RESET}")
-                if stderr:
-                    print(f"Error: {stderr[:200]}")
-        except Exception as e:
-            print(f"{C_RED}✗ Error: {e}{C_RESET}")
-
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
-
+        # GIT PULL AND RESTART — delegate to direct_update (no duplication)
+        await direct_update(name, svc)                   # FIX: was duplicated inline
 
     elif choice == "5":
-
         print(f"\n{C_YELLOW}Reinstalling dependencies...{C_RESET}")
 
         try:
@@ -2383,7 +2463,10 @@ async def run_webhook_listener():
 
                 if not os.path.exists(pkg_json):
                     print(f"{C_RED}✗ package.json not found at {service_path}{C_RESET}")
-                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    await loop.run_in_executor(
+                        None,
+                        lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    )
                     return
 
                 print(f"{C_CYAN}Running npm install...{C_RESET}")
@@ -2391,17 +2474,21 @@ async def run_webhook_listener():
                 try:
                     run_as_gaia(["npm", "install", "--production"], cwd=service_path, timeout=300)
                     print(f"{C_GREEN}✓ npm packages reinstalled{C_RESET}")
-                    print(f"\n{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
-                    if input().strip().lower() == "yes":
+                    print(f"\n{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='', flush=True)
+                    ans = await loop.run_in_executor(None, input)   # FIX: blocking input
+                    if ans.strip().lower() == "yes":
                         subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
                         print(f"{C_GREEN}✓ Service restarted{C_RESET}")
                 except Exception as e:
                     print(f"{C_RED}✗ npm install failed: {e}{C_RESET}")
 
-                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                await loop.run_in_executor(
+                    None,
+                    lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                )
                 return
 
-            # ── Python branch (original logic) ────────────────────────────────
+            # ── Python branch ────────────────────────────────────────────────
 
             requirements_file = os.path.join(service_path, "requirements.txt")
             venv_path = os.path.join(service_path, "venv")
@@ -2411,17 +2498,22 @@ async def run_webhook_listener():
 
             if not os.path.exists(service_path):
                 print(f"{C_RED}✗ Service directory not found{C_RESET}")
-                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                await loop.run_in_executor(
+                    None,
+                    lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                )
                 return
 
             if not os.path.exists(requirements_file):
                 print(f"{C_RED}✗ requirements.txt not found{C_RESET}")
-                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                await loop.run_in_executor(
+                    None,
+                    lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                )
                 return
 
-            # Determine which pip to use
             pip3_path = os.path.join(venv_path, "bin", "pip3")
-            pip_path = os.path.join(venv_path, "bin", "pip")
+            pip_path  = os.path.join(venv_path, "bin", "pip")
 
             if os.path.exists(pip3_path):
                 pip_executable = pip3_path
@@ -2430,16 +2522,19 @@ async def run_webhook_listener():
                 pip_executable = pip_path
                 print(f"Pip path:     {pip_executable}\n")
             else:
-                # Neither pip nor pip3 found - venv is missing or corrupted
                 print(f"Pip path:     {pip3_path} (not found)\n")
                 print(f"{C_RED}✗ Virtual environment is missing or corrupted{C_RESET}")
                 print(f"{C_YELLOW}Neither pip3 nor pip found in venv/bin/{C_RESET}\n")
 
-                print(f"{C_CYAN}Would you like to rebuild the virtual environment? (yes/no):{C_RESET} ", end='')
+                print(f"{C_CYAN}Would you like to rebuild the virtual environment? (yes/no):{C_RESET} ", end='', flush=True)
+                ans = await loop.run_in_executor(None, input)       # FIX: blocking input
 
-                if input().strip().lower() != "yes":
+                if ans.strip().lower() != "yes":
                     print(f"{C_YELLOW}Cancelled{C_RESET}")
-                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    await loop.run_in_executor(
+                        None,
+                        lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    )
                     return
 
                 # REBUILD VENV
@@ -2454,7 +2549,10 @@ async def run_webhook_listener():
                         print(f"{C_GREEN}✓ Old venv removed{C_RESET}")
                     except Exception as e:
                         print(f"{C_RED}✗ Failed to remove old venv: {e}{C_RESET}")
-                        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                        await loop.run_in_executor(
+                            None,
+                            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                        )
                         return
 
                 print(f"\n{C_CYAN}Creating new virtual environment...{C_RESET}")
@@ -2463,7 +2561,10 @@ async def run_webhook_listener():
                     print(f"{C_GREEN}✓ Virtual environment created{C_RESET}")
                 except Exception as e:
                     print(f"{C_RED}✗ Failed to create venv: {e}{C_RESET}")
-                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    await loop.run_in_executor(
+                        None,
+                        lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    )
                     return
 
                 if os.path.exists(pip3_path):
@@ -2472,7 +2573,10 @@ async def run_webhook_listener():
                     pip_executable = pip_path
                 else:
                     print(f"{C_RED}✗ Failed to create pip executable{C_RESET}")
-                    input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    await loop.run_in_executor(
+                        None,
+                        lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                    )
                     return
 
                 print(f"{C_GREEN}✓ Using: {pip_executable}{C_RESET}")
@@ -2486,7 +2590,6 @@ async def run_webhook_listener():
                     capture=True,
                     timeout=120
                 )
-
                 if returncode == 0:
                     print(f"{C_GREEN}✓ Pip upgraded{C_RESET}")
                 else:
@@ -2541,13 +2644,13 @@ async def run_webhook_listener():
                     print(f"{C_GREEN}All dependencies installed successfully!{C_RESET}")
                     print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
 
-                    print(f"{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='')
-                    if input().strip().lower() == "yes":
+                    print(f"{C_CYAN}Restart service to apply changes? (yes/no):{C_RESET} ", end='', flush=True)
+                    ans = await loop.run_in_executor(None, input)    # FIX: blocking input
+                    if ans.strip().lower() == "yes":
                         print(f"\n{C_YELLOW}Restarting {name}...{C_RESET}")
-
                         try:
                             subprocess.run(["systemctl", "restart", name], timeout=10, check=True)
-                            time.sleep(2)
+                            await asyncio.sleep(2)                   # FIX: was time.sleep(2)
 
                             result = subprocess.run(
                                 ["systemctl", "is-active", name],
@@ -2557,8 +2660,8 @@ async def run_webhook_listener():
 
                             if result.stdout.strip() == b"active":
                                 print(f"{C_GREEN}✓ Service restarted successfully{C_RESET}")
+                                await asyncio.sleep(1)               # FIX: was time.sleep(1)
 
-                                time.sleep(1)
                                 if check_port_listening(svc['port'], timeout=2.0):
                                     print(f"{C_GREEN}✓ Service is responding on port {svc['port']}{C_RESET}")
                                 else:
@@ -2589,7 +2692,10 @@ async def run_webhook_listener():
         except Exception as e:
             print(f"{C_RED}✗ Unexpected error: {e}{C_RESET}")
 
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(
+            None,
+            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        )
 
     elif choice == "6":
         # VIEW SYSTEMD STATUS
@@ -2599,7 +2705,10 @@ async def run_webhook_listener():
         except:
             pass
         print(f"{C_CYAN}{'=' * 70}{C_RESET}")
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(
+            None,
+            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        )
 
     elif choice == "7":
         # VIEW RESOURCE USAGE
@@ -2610,7 +2719,6 @@ async def run_webhook_listener():
         if pid and psutil:
             try:
                 process = psutil.Process(pid)
-
                 cpu = process.cpu_percent(interval=1)
                 mem_info = process.memory_info()
                 mem_mb = mem_info.rss / 1024 / 1024
@@ -2632,16 +2740,20 @@ async def run_webhook_listener():
         else:
             print(f"{C_YELLOW}Service is not running or PID not found{C_RESET}")
 
-        input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        await loop.run_in_executor(
+            None,
+            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        )
 
     elif choice == "8":
         update_service_config(name)
 
     elif choice == "0":
         return
+
     else:
         print_status("Invalid choice", "warning")
-        time.sleep(1)
+        await asyncio.sleep(1)
 
 def update_service_config(name: str):
     """Interactively update service configuration (port, domain, resources)"""
