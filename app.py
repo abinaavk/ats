@@ -2112,7 +2112,8 @@ async def service_operations():
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
     elif choice == "8":
-        update_service_config(name)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, update_service_config, name)
 
     elif choice == "0":
         return
@@ -2247,18 +2248,19 @@ def get_service_by_name(name: str) -> Optional[dict]:
 
     # Fallback: match against the repo URL (GitHub repo name may differ from service name)
     # e.g. repo 'abinaavk_portfolio' should match service with repo_url ending in 'abinaavk_portfolio'
+    safe_name = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     row = db.query(
-        "SELECT * FROM services WHERE repo_url LIKE ?",
-        (f"%/{name}",),
+        "SELECT * FROM services WHERE repo_url LIKE ? ESCAPE '\\'",
+        (f"%/{safe_name}",),
         fetch_one=True
     )
     if row:
         return dict(row)
 
-    # Also try with .git suffix
     row = db.query(
-        "SELECT * FROM services WHERE repo_url LIKE ?",
-        (f"%/{name}.git",),
+        "SELECT * FROM services WHERE repo_url LIKE ? ESCAPE '\\'",
+        (f"%/{safe_name}.git",),
         fetch_one=True
     )
     if row:
@@ -2296,8 +2298,22 @@ async def handle_webhook(reader, writer):
                 headers[key.strip().lower()] = val.strip()
 
         # ── Read body ────────────────────────────────────────────────────────
+        if headers.get("x-github-event") == "ping":
+            logger.info("Webhook: GitHub ping received — ignoring")
+            response = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 2\r\n"
+                "Connection: close\r\n"
+                "\r\nOK"
+            )
+            writer.write(response.encode())
+            await writer.drain()
+            return
+
         payload = {}
         content_length = int(headers.get("content-length", 0))
+
         if content_length > 0:
             raw_body = await asyncio.wait_for(
                 reader.readexactly(content_length), timeout=15
@@ -2809,7 +2825,7 @@ async def manage_service(name: str, svc: dict):          # FIX: was floating orp
         )
 
     elif choice == "8":
-        update_service_config(name)
+        await loop.run_in_executor(None, update_service_config, name)
 
     elif choice == "0":
         return
@@ -2977,7 +2993,7 @@ async def backup_service():
                 await asyncio.sleep(1)
                 continue
 
-            backup_file = create_local_backup(svc)
+            backup_file = backup_file = await loop.run_in_executor(None, create_local_backup, svc)
             if backup_file:
                 # Check if auto-offload is enabled for this service
                 config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],), fetch_one=True)
@@ -4598,8 +4614,13 @@ async def auto_backup_scheduler():
         return
     auto_backup_scheduler.started = True
 
+    if getattr(auto_backup_scheduler, "started", False):
+        logger.warning("auto_backup_scheduler: already running — skipping duplicate start")
+        return
+    auto_backup_scheduler.started = True
+
     logger.info("Auto-backup scheduler started.")
-    
+
     while True:
         try:
             now = datetime.datetime.now()
@@ -4617,13 +4638,14 @@ async def auto_backup_scheduler():
             services = db.query("SELECT * FROM services", fetch_all=True)
             
             if services:
-                for svc in services:
-                    backup_file = create_local_backup(svc)
-                    if backup_file:
-                        # Check for remote offloading
-                        config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],), fetch_one=True)
-                        if config and config['auto_offload']:
-                            await offload_backup(backup_file, config)
+                backup_file = create_local_backup(svc)
+                if backup_file:
+                    # Check for remote offloading
+                    config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],),
+                                      fetch_one=True)
+                    if config and config['auto_offload']:
+                        await offload_backup(backup_file, config)
+
                 logger.info(f"Midnight backup completed for {len(services)} services.")
                 audit_log("SCHEDULED_BACKUP_END", "SYSTEM", {"services_count": len(services)})
             else:
@@ -4636,8 +4658,7 @@ async def auto_backup_scheduler():
 
 async def mainmenu():
     # Start the scheduler as a background task within the same event loop
-    if not getattr(auto_backup_scheduler, "started", False):
-        asyncio.create_task(auto_backup_scheduler())
+    asyncio.create_task(auto_backup_scheduler())
     
     while True:
         try:
@@ -4805,8 +4826,9 @@ async def run_backup_all():
     audit_log("MANUAL_SYSTEM_BACKUP_START", "SYSTEM")
     services = db.query("SELECT * FROM services", fetch_all=True)
     if services:
+        loop = asyncio.get_running_loop()
         for svc in services:
-            backup_file = create_local_backup(svc)
+            backup_file = await loop.run_in_executor(None, create_local_backup, svc)
             if backup_file:
                 config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],), fetch_one=True)
                 if config and config['auto_offload']:
