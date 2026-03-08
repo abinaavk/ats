@@ -2328,15 +2328,15 @@ async def handle_webhook(reader, writer):
 
         # ── Trigger update in background ──────────────────────────────────────
         if service_name:
-            svc = get_service_by_name(service_name)      # look up from services config
+            audit_log("WEBHOOK_RECEIVED", service_name, {"source": headers.get("x-github-event") or headers.get("x-gitlab-event") or "unknown", "delivery": headers.get("x-github-delivery") or headers.get("x-gitlab-event-uuid") or "unknown",})
+            svc = get_service_by_name(service_name)
             if svc:
-                audit_log("WEBHOOK_RECEIVED", service_name, {"source": headers.get("x-github-event") or headers.get("x-gitlab-event") or "unknown", "delivery": headers.get("x-github-delivery") or headers.get("x-gitlab-event-uuid") or "unknown",})
-                logger.info(f"Webhook: triggering update for '{service_name}'")
-                asyncio.create_task(_do_git_update(service_name, svc))
+                actual_name = svc['name']  # FIX: use DB service name, not repo name
+                logger.info(f"Webhook: repo '{service_name}' matched service '{actual_name}'")
+                asyncio.create_task(_do_git_update(actual_name, svc))
             else:
                 logger.warning(f"Webhook: unknown service '{service_name}'")
-        else:
-            logger.warning("Webhook: could not determine target service from request")
+                audit_log("WEBHOOK_UNKNOWN_SERVICE", service_name, {})
 
     except asyncio.TimeoutError:
         logger.error("Webhook error: timed out reading request")
