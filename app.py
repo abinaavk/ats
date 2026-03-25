@@ -2191,6 +2191,7 @@ async def service_operations():
             returncode, stdout, stderr = run_as_gaia(
                 ["git", "clone", "-b", new_branch, new_repo_url, name],
                 cwd=api_parent,
+                capture=True,
                 timeout=300
             )
 
