@@ -4503,6 +4503,7 @@ async def update_database_async():
         print(f"{C_CYAN}{C_BOLD}═══ DATABASE MANAGEMENT ═══{C_RESET}\n")
         print(f"  {C_BOLD}[1]{C_RESET} Refresh All Service Statuses (Health Check)")
         print(f"  {C_BOLD}[2]{C_RESET} Edit Service Metadata (Name, Repo Link)")
+        print(f"  {C_BOLD}[3]{C_RESET} Update Service Location (Storage Path)")
         print(f"  {C_BOLD}[0]{C_RESET} Return to Main Menu\n")
 
         choice = input(f"  {C_BOLD}Select action:{C_RESET} ").strip()
@@ -4578,6 +4579,279 @@ async def update_database_async():
                 audit_log("DATABASE_EDIT", svc['name'], {"old_name": svc['name'], "new_name": new_name, "new_repo": new_repo})
             else:
                 print_status("No changes made.", "info")
+
+            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+
+        elif choice == "3":
+            services = db.query("SELECT id, name, storage_path FROM services ORDER BY name", fetch_all=True)
+            if not services:
+                print_status("No services available to update.", "warning")
+                logger.warning("Location update: no services found in database")
+                time.sleep(1)
+                continue
+
+            print(f"\n  {C_BOLD}{'ID':<4} {'NAME':<20} {'STORAGE PATH'}{C_RESET}")
+            print(f"  {C_CYAN}{'─' * 60}{C_RESET}")
+            for s in services:
+                spath = (s['storage_path'][:40] + "..") if len(s['storage_path']) > 40 else s['storage_path']
+                print(f"  {s['id']:<4} {s['name']:<20} {spath}")
+
+            svc_id = input(f"\n  {C_BOLD}Enter Service ID to update location (0 to cancel):{C_RESET} ").strip()
+            if svc_id == "0" or not svc_id:
+                logger.info("Location update: user cancelled at service selection")
+                continue
+
+            svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
+            if not svc:
+                print_status("Invalid ID.", "error")
+                logger.error(f"Location update: invalid service ID '{svc_id}'")
+                time.sleep(1)
+                continue
+
+            name = svc['name']
+            old_storage = svc['storage_path']
+            old_api_dir = os.path.join(old_storage, "api", name)
+            old_db_dir = os.path.join(old_storage, "database", name)
+
+            logger.info(f"[{name}] Location update initiated — current storage: {old_storage}")
+            audit_log("LOCATION_UPDATE_INIT", name, {
+                "old_storage": old_storage,
+                "service_id": svc_id
+            })
+
+            print(f"\n  {C_CYAN}Service: {C_BOLD}{name}{C_RESET}")
+            print(f"  {C_CYAN}Current Storage: {C_BOLD}{old_storage}{C_RESET}")
+
+            new_storage = input(f"  {C_BOLD}New Storage Path: {C_RESET}").strip()
+            if not new_storage:
+                print_status("No path entered. Cancelled.", "warning")
+                logger.info(f"[{name}] Location update: cancelled — no path entered")
+                time.sleep(1)
+                continue
+
+            try:
+                new_storage = validate_storage(new_storage)
+            except ValueError as ve:
+                print_status(f"Invalid path: {ve}", "error")
+                logger.error(f"[{name}] Location update: invalid new path — {ve}")
+                audit_log("LOCATION_UPDATE_FAILED", name, {"stage": "validate_path", "error": str(ve)})
+                input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+                continue
+
+            new_api_dir = os.path.join(new_storage, "api", name)
+            new_db_dir = os.path.join(new_storage, "database", name)
+
+            print(f"\n  {C_YELLOW}{'=' * 60}{C_RESET}")
+            print(f"  {C_YELLOW}Moving service from:{C_RESET}")
+            print(f"    {old_storage}")
+            print(f"  {C_YELLOW}To:{C_RESET}")
+            print(f"    {new_storage}")
+            print(f"  {C_YELLOW}{'=' * 60}{C_RESET}")
+
+            confirm = input(f"\n  {C_BOLD}Type 'MOVE' to confirm: {C_RESET}").strip()
+            if confirm != "MOVE":
+                print_status("Location update cancelled.", "warning")
+                logger.info(f"[{name}] Location update: cancelled by user at confirmation")
+                audit_log("LOCATION_UPDATE_CANCELLED", name, {"new_storage": new_storage})
+                time.sleep(1)
+                continue
+
+            logger.info(f"[{name}] Location update confirmed — moving from {old_storage} to {new_storage}")
+            audit_log("LOCATION_UPDATE_START", name, {
+                "old_storage": old_storage,
+                "new_storage": new_storage,
+                "old_api_dir": old_api_dir,
+                "new_api_dir": new_api_dir,
+                "old_db_dir": old_db_dir,
+                "new_db_dir": new_db_dir
+            })
+
+            try:
+                # Stop service
+                print_status("Stopping service...", "info")
+                try:
+                    run_root(["systemctl", "stop", name])
+                    logger.info(f"[{name}] Service stopped for location migration")
+                except Exception as stop_err:
+                    print_status("Service was not running", "warning")
+                    logger.warning(f"[{name}] Service stop during migration: {stop_err}")
+                    audit_log("LOCATION_UPDATE_WARN", name, {"stage": "stop_service", "warning": str(stop_err)})
+
+                # Create new directories
+                print_status("Creating new directory structure...", "info")
+                new_api_parent = os.path.join(new_storage, "api")
+                os.makedirs(new_api_parent, exist_ok=True)
+                shutil.chown(new_api_parent, user=SERVICE_USER, group=SERVICE_GROUP)
+                os.chmod(new_api_parent, 0o755)
+                logger.info(f"[{name}] Created API parent directory: {new_api_parent}")
+
+                new_db_parent = os.path.join(new_storage, "database")
+                os.makedirs(new_db_parent, exist_ok=True)
+                shutil.chown(new_db_parent, user=SERVICE_USER, group=SERVICE_GROUP)
+                logger.info(f"[{name}] Created database parent directory: {new_db_parent}")
+
+                # Move api directory
+                if os.path.exists(old_api_dir):
+                    print_status(f"Moving code from {old_api_dir} to {new_api_dir}...", "info")
+                    logger.info(f"[{name}] Moving code: {old_api_dir} → {new_api_dir}")
+                    shutil.move(old_api_dir, new_api_dir)
+                    print_status("Code directory moved", "success")
+                    logger.info(f"[{name}] Code directory moved successfully")
+                else:
+                    print_status(f"Old code directory not found ({old_api_dir}) — cloning fresh", "warning")
+                    logger.warning(f"[{name}] Old code directory missing at {old_api_dir} — attempting git clone")
+                    audit_log("LOCATION_UPDATE_WARN", name, {
+                        "stage": "move_code",
+                        "warning": "old_dir_missing",
+                        "old_api_dir": old_api_dir
+                    })
+                    os.makedirs(new_api_dir, exist_ok=True)
+                    try:
+                        returncode, stdout, stderr = run_as_gaia(
+                            ["git", "clone", "-b", svc.get('branch', 'main'), svc['repo_url'], name],
+                            cwd=new_api_parent, capture=True, timeout=300
+                        )
+                        if returncode == 0:
+                            print_status("Repository cloned to new location", "success")
+                            logger.info(f"[{name}] Fresh clone succeeded: {svc['repo_url']} → {new_api_dir}")
+                        else:
+                            error_msg = stderr[:200] if stderr else "unknown"
+                            print_status(f"Git clone warning: {error_msg}", "warning")
+                            logger.warning(f"[{name}] Git clone returned non-zero (rc={returncode}): {error_msg}")
+                    except Exception as git_err:
+                        print_status(f"Git clone failed: {git_err}", "warning")
+                        logger.error(f"[{name}] Git clone exception: {git_err}")
+                        audit_log("LOCATION_UPDATE_WARN", name, {
+                            "stage": "git_clone",
+                            "error": str(git_err)
+                        })
+
+                # Move database directory
+                if os.path.exists(old_db_dir):
+                    os.makedirs(new_db_parent, exist_ok=True)
+                    print_status(f"Moving database from {old_db_dir} to {new_db_dir}...", "info")
+                    logger.info(f"[{name}] Moving database: {old_db_dir} → {new_db_dir}")
+                    shutil.move(old_db_dir, new_db_dir)
+                    print_status("Database directory moved", "success")
+                    logger.info(f"[{name}] Database directory moved successfully")
+                else:
+                    print_status(f"Old database directory not found ({old_db_dir}) — creating empty", "warning")
+                    logger.warning(f"[{name}] Old DB directory missing at {old_db_dir} — creating empty")
+                    os.makedirs(new_db_dir, exist_ok=True)
+                    audit_log("LOCATION_UPDATE_WARN", name, {
+                        "stage": "move_database",
+                        "warning": "old_dir_missing",
+                        "old_db_dir": old_db_dir
+                    })
+
+                # Ensure log directory exists in new location
+                new_log_dir = os.path.join(new_api_dir, "logs")
+                os.makedirs(new_log_dir, exist_ok=True)
+                logger.info(f"[{name}] Log directory ensured at {new_log_dir}")
+
+                # Set permissions on new directories
+                for d in [new_api_dir, new_db_dir, new_log_dir]:
+                    try:
+                        shutil.chown(d, user=SERVICE_USER, group=SERVICE_GROUP)
+                        os.chmod(d, 0o750)
+                    except Exception as perm_err:
+                        logger.warning(f"[{name}] Permission set failed for {d}: {perm_err}")
+                        audit_log("LOCATION_UPDATE_WARN", name, {
+                            "stage": "permissions",
+                            "directory": d,
+                            "warning": str(perm_err)
+                        })
+                logger.info(f"[{name}] Permissions set on new directories")
+
+                # Update systemd service file
+                svc_file = f"/etc/systemd/system/{name}.service"
+                if os.path.exists(svc_file):
+                    print_status("Updating systemd service file...", "info")
+                    logger.info(f"[{name}] Updating systemd file: {svc_file}")
+
+                    with open(svc_file, 'r') as f:
+                        content = f.read()
+
+                    old_log_dir = os.path.join(old_api_dir, "logs")
+
+                    content = content.replace(old_api_dir, new_api_dir)
+                    content = content.replace(old_log_dir, new_log_dir)
+                    content = content.replace(old_db_dir, new_db_dir)
+
+                    with open(svc_file, 'w') as f:
+                        f.write(content)
+
+                    print_status("Service file updated", "success")
+                    logger.info(f"[{name}] Systemd service file paths updated")
+                    audit_log("LOCATION_UPDATE_SYSTEMD", name, {
+                        "svc_file": svc_file,
+                        "replaced": {
+                            "api_dir": f"{old_api_dir} → {new_api_dir}",
+                            "log_dir": f"{old_log_dir} → {new_log_dir}",
+                            "db_dir": f"{old_db_dir} → {new_db_dir}"
+                        }
+                    })
+                else:
+                    print_status("Service file not found — skipping systemd update", "warning")
+                    logger.warning(f"[{name}] Systemd file missing at {svc_file} — skipped")
+                    audit_log("LOCATION_UPDATE_WARN", name, {
+                        "stage": "systemd_update",
+                        "warning": "service_file_not_found",
+                        "svc_file": svc_file
+                    })
+
+                # Update database
+                print_status("Updating database record...", "info")
+                db.query(
+                    "UPDATE services SET storage_path=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (new_storage, svc['id'])
+                )
+                logger.info(f"[{name}] DB record updated: storage_path={new_storage}")
+                print_status("Database updated", "success")
+
+                # Reload and start service
+                try:
+                    run_root(["systemctl", "daemon-reload"])
+                    logger.info(f"[{name}] systemd daemon-reload completed")
+                    run_root(["systemctl", "start", name])
+                    print_status(f"Service {name} restarted", "success")
+                    logger.info(f"[{name}] Service started after location migration")
+                except Exception as start_err:
+                    print_status(f"Service start warning: {start_err}", "warning")
+                    logger.error(f"[{name}] Service restart failed after migration: {start_err}")
+                    audit_log("LOCATION_UPDATE_WARN", name, {
+                        "stage": "service_start",
+                        "error": str(start_err)
+                    })
+
+                audit_log("LOCATION_UPDATE_SUCCESS", name, {
+                    "old_storage": old_storage,
+                    "new_storage": new_storage,
+                    "api_dir": new_api_dir,
+                    "db_dir": new_db_dir,
+                    "log_dir": new_log_dir,
+                    "svc_file": svc_file
+                })
+
+                print(f"\n  {C_GREEN}{'=' * 60}{C_RESET}")
+                print(f"  {C_GREEN}{C_BOLD}✓ LOCATION UPDATED SUCCESSFULLY{C_RESET}")
+                print(f"  {C_GREEN}{'=' * 60}{C_RESET}")
+                print(f"\n  {C_BOLD}Old:{C_RESET}  {old_storage}")
+                print(f"  {C_BOLD}New:{C_RESET}  {new_storage}")
+                print(f"  {C_BOLD}Code:{C_RESET} {new_api_dir}")
+                print(f"  {C_BOLD}DB:{C_RESET}   {new_db_dir}")
+                print(f"  {C_GREEN}{'=' * 60}{C_RESET}")
+
+                logger.info(f"[{name}] Location migration completed successfully")
+
+            except Exception as e:
+                logger.error(f"[{name}] Location update failed: {e}")
+                print_status(f"Location update failed: {e}", "error")
+                audit_log("LOCATION_UPDATE_FAILED", name, {
+                    "error": str(e),
+                    "old_storage": old_storage,
+                    "new_storage": new_storage
+                })
 
             input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
