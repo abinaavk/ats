@@ -3582,11 +3582,16 @@ def backup_gdrive_now():
     if not services:
         reason = "No services found to backup"
         _write_backup_log(reason)
+        logger.warning("GDrive backup: no services found")
+        audit_log("GDRIVE_BACKUP_SKIP", "SYSTEM", {"reason": "no_services"})
         return (False, reason)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     results = []
     all_ok = True
+
+    logger.info(f"GDrive backup started for {len(services)} services")
+    audit_log("GDRIVE_BACKUP_START", "SYSTEM", {"services": len(services)})
 
     for svc in services:
         name = svc['name']
@@ -3649,6 +3654,8 @@ def backup_gdrive_now():
                 )
                 if result.returncode == 0:
                     _write_backup_log(f"[{name}] Backup successful: {backup_filename}")
+                    logger.info(f"[{name}] GDrive backup uploaded: {backup_filename} -> {remote_target}")
+                    audit_log("GDRIVE_BACKUP_OK", name, {"filename": backup_filename, "target": remote_target})
                     results.append(f"{name}: {backup_filename}")
                     uploaded = True
                     break
@@ -3660,6 +3667,8 @@ def backup_gdrive_now():
                         time.sleep(2)
                     else:
                         _write_backup_log(f"[{name}] Backup failed: {reason}")
+                        logger.error(f"[{name}] GDrive backup failed: {reason}")
+                        audit_log("GDRIVE_BACKUP_FAIL", name, {"error": reason})
                         all_ok = False
                         results.append(f"{name}: FAILED - {reason}")
 
@@ -3672,6 +3681,8 @@ def backup_gdrive_now():
         except subprocess.TimeoutExpired:
             reason = f"Command timed out for {name}"
             _write_backup_log(f"[{name}] Backup failed: {reason}")
+            logger.error(f"[{name}] GDrive backup timeout: {reason}")
+            audit_log("GDRIVE_BACKUP_FAIL", name, {"error": reason})
             if not service_restarted:
                 try:
                     subprocess.run(["systemctl", "start", name], timeout=30)
@@ -3688,6 +3699,8 @@ def backup_gdrive_now():
         except Exception as e:
             reason = str(e)
             _write_backup_log(f"[{name}] Backup failed: {reason}")
+            logger.error(f"[{name}] GDrive backup error: {reason}")
+            audit_log("GDRIVE_BACKUP_FAIL", name, {"error": reason})
             if not service_restarted:
                 try:
                     subprocess.run(["systemctl", "start", name], timeout=30)
@@ -3710,9 +3723,13 @@ def backup_gdrive_now():
 
     if all_ok:
         summary = f"Backup successful: {len(services)} services"
+        logger.info(f"GDrive backup completed: {len(services)} services")
+        audit_log("GDRIVE_BACKUP_END", "SYSTEM", {"services_count": len(services), "status": "success"})
     else:
         failed = sum(1 for r in results if "FAILED" in r)
         summary = f"Backup failed: {failed}/{len(services)} services failed"
+        logger.error(f"GDrive backup completed with failures: {failed}/{len(services)}")
+        audit_log("GDRIVE_BACKUP_END", "SYSTEM", {"services_count": len(services), "failed": failed, "status": "partial_fail"})
 
     _write_backup_log(summary)
     return (all_ok, summary)
@@ -3752,6 +3769,9 @@ async def restore_backup_menu():
 async def restore_from_local():
     """Restore a backup from the local /opt/backups directory"""
     loop = asyncio.get_event_loop()
+
+    logger.info("Local restore initiated")
+    audit_log("RESTORE_LOCAL_START", "SYSTEM")
 
     # List services
     services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
@@ -3815,6 +3835,9 @@ async def restore_from_drive():
     """Download and restore a backup from Google Drive"""
     loop = asyncio.get_event_loop()
 
+    logger.info("Google Drive restore initiated")
+    audit_log("RESTORE_DRIVE_START", "SYSTEM")
+
     # List services
     services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
     if not services:
@@ -3848,6 +3871,7 @@ async def restore_from_drive():
         )
         if result.returncode != 0:
             print_status(f"Failed to list remote backups: {result.stderr.strip()}", "error")
+            logger.error(f"GDrive restore list failed for {name}: {result.stderr.strip()}")
             await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
             return
 
@@ -3897,10 +3921,14 @@ async def restore_from_drive():
         )
         if result.returncode != 0:
             print_status(f"Download failed: {result.stderr.strip()}", "error")
+            logger.error(f"GDrive restore download failed for {name}: {result.stderr.strip()}")
+            audit_log("RESTORE_DRIVE_FAIL", name, {"error": result.stderr.strip()})
             await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
             return
     except subprocess.TimeoutExpired:
         print_status("Download timed out.", "error")
+        logger.error(f"GDrive restore download timed out for {name}")
+        audit_log("RESTORE_DRIVE_FAIL", name, {"error": "download_timeout"})
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
         return
 
@@ -3929,14 +3957,20 @@ async def _do_restore(svc, backup_path, filename):
     confirm = (await loop.run_in_executor(None, lambda: input(f"  Type 'RESTORE' to confirm: "))).strip()
     if confirm != "RESTORE":
         print_status("Restore cancelled", "warning")
+        logger.info(f"[{name}] Restore cancelled by user")
+        audit_log("RESTORE_CANCELLED", name, {"filename": filename})
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
         return
 
     try:
         db_path = os.path.join(svc['storage_path'], "database", name)
 
+        logger.info(f"[{name}] Restore started: {filename}")
+        audit_log("RESTORE_START", name, {"filename": filename})
+
         print_status(f"Stopping service {name}...", "info")
         run_root(["systemctl", "stop", name])
+        logger.info(f"[{name}] Service stopped for restore")
 
         # Archive current DB files
         if os.path.exists(db_path) and os.listdir(db_path):
@@ -3944,6 +3978,7 @@ async def _do_restore(svc, backup_path, filename):
             shutil.move(db_path, temp_old)
             os.makedirs(db_path, exist_ok=True)
             print_status("Current database archived to temporary folder", "info")
+            logger.info(f"[{name}] Current DB archived to {temp_old}")
         else:
             os.makedirs(db_path, exist_ok=True)
 
@@ -3951,6 +3986,7 @@ async def _do_restore(svc, backup_path, filename):
         import zipfile
         with zipfile.ZipFile(backup_path, 'r') as zf:
             zf.extractall(db_path)
+        logger.info(f"[{name}] Backup extracted to {db_path}")
 
         # Set permissions
         for root, dirs, files in os.walk(db_path):
@@ -3965,11 +4001,13 @@ async def _do_restore(svc, backup_path, filename):
         run_root(["systemctl", "start", name])
 
         print_status(f"Restore successful: {filename}", "success")
-        audit_log("BACKUP_RESTORE", name, {"filename": filename})
+        logger.info(f"[{name}] Restore completed: {filename}")
+        audit_log("RESTORE_SUCCESS", name, {"filename": filename})
 
     except Exception as e:
-        logger.error(f"Restore failed: {e}")
+        logger.error(f"[{name}] Restore failed: {e}")
         print_status(f"Restore failed: {e}", "error")
+        audit_log("RESTORE_FAILED", name, {"filename": filename, "error": str(e)})
         # Try to restart service anyway
         try:
             run_root(["systemctl", "start", name])
