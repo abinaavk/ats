@@ -63,7 +63,7 @@ BACKUP_DIR = os.path.join(DEFAULT_STORAGE, "backups")
 # --- Google Drive Backup (rclone) ---
 HEYGAIA_DB = "/opt/api/heygaia/gaia.db"
 GDRIVE_REMOTE = "gdrive"
-GDRIVE_FOLDER = "gdrive:gaia-backups"
+GDRIVE_FOLDER = "gdrive:backups"
 HEYGAIA_LOG_DIR = "/opt/api/heygaia/logs"
 BACKUP_LOG = os.path.join(HEYGAIA_LOG_DIR, "backup.log")
 
@@ -3706,10 +3706,22 @@ async def configure_remote_offloading():
 
     print(f"\n  {C_BOLD}[1]{C_RESET} Setup SCP/SFTP (Second Server)")
     print(f"  {C_BOLD}[2]{C_RESET} Setup Rclone (S3/Drive/Dropbox)")
+    print(f"  {C_BOLD}[3]{C_RESET} Delete Remote Config")
     print(f"  {C_BOLD}[0]{C_RESET} Cancel")
 
     rtype = (await loop.run_in_executor(None, lambda: input(f"\n  Choice: "))).strip()
     if rtype == "0": return
+
+    if rtype == "3":
+        if config:
+            db.query("DELETE FROM remote_configs WHERE service_name=?", (name,))
+            print_status(f"Remote config for '{name}' deleted.", "success")
+            audit_log("REMOTE_CONFIG_DELETE", name)
+        else:
+            print_status(f"No remote config found for '{name}'.", "warning")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
     if rtype not in ["1", "2"]:
         print_status("Invalid choice.", "error")
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to exit...{C_RESET}"))
