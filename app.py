@@ -57,7 +57,7 @@ SERVICE_USER = "gaia"
 SERVICE_GROUP = "gaia"
 MAIN_DOMAIN = "gaiasentinel.online"
 CLOUDFLARE_CONFIG = "/etc/cloudflared/config.yml"
-DEFAULT_STORAGE = "/opt/extra1_1tb"
+DEFAULT_STORAGE = "/opt"
 BACKUP_DIR = os.path.join(DEFAULT_STORAGE, "backups")
 
 BLOCKED_PATHS = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/root", "/run", "/sys", "/usr", "/var"]
@@ -808,7 +808,7 @@ async def deploy_service_async():
         if db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
             raise ValueError(f"Service '{name}' already exists")
 
-        # Storage path - defaults to /opt/extra1_1tb
+        # Storage path - defaults to /opt
         storage_input = input(f"{C_BOLD}Storage Path [{DEFAULT_STORAGE}]:{C_RESET} ").strip()
 
         if not storage_input:
