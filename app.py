@@ -3578,6 +3578,10 @@ def backup_gdrive_now():
     tmp_path = os.path.join("/tmp", backup_filename)
     service_restarted = False
 
+    # Derive service name from DB path and build remote target
+    service_name = os.path.basename(os.path.dirname(HEYGAIA_DB))
+    remote_target = f"{GDRIVE_FOLDER}/{service_name}"
+
     try:
         # Step 1: Stop heygaia service
         _write_backup_log("Stopping heygaia service...")
@@ -3608,9 +3612,9 @@ def backup_gdrive_now():
 
         # Step 4: Upload to Google Drive (with one retry on failure)
         for attempt in range(2):
-            _write_backup_log(f"Uploading to {GDRIVE_FOLDER} (attempt {attempt + 1}/2)...")
+            _write_backup_log(f"Uploading to {remote_target} (attempt {attempt + 1}/2)...")
             result = subprocess.run(
-                ["rclone", "copy", tmp_path, GDRIVE_FOLDER],
+                ["rclone", "copy", tmp_path, remote_target],
                 capture_output=True, text=True, timeout=300
             )
             if result.returncode == 0:
