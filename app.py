@@ -3412,6 +3412,7 @@ async def backup_service():
         print(f"  {C_BOLD}[2]{C_RESET} Configure Remote Offloading (S3/Drive/SCP)")
         print(f"  {C_BOLD}[3]{C_RESET} Manual Sync Backups to Remote")
         print(f"  {C_BOLD}[4]{C_RESET} Google Drive Backup Now (rclone)")
+        print(f"  {C_BOLD}[5]{C_RESET} Restore Backup (Local / Google Drive)")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
         loop = asyncio.get_event_loop()
@@ -3465,6 +3466,9 @@ async def backup_service():
             else:
                 print_status(f"Backup failed: {result}", "error")
             await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+
+        elif choice == "5":
+            await restore_backup_menu()
 
 def create_local_backup(svc):
     """Internal logic to create a zip of the database"""
@@ -3562,124 +3566,417 @@ def _write_backup_log(msg):
 
 def backup_gdrive_now():
     """
-    Backup heygaia database to Google Drive via rclone.
+    Backup all services' databases to Google Drive via rclone.
+    Each service gets its own folder under gdrive:backups/<service_name>/.
 
-    Flow:
-      1. Stop heygaia service
-      2. Copy DB to /tmp with timestamp
-      3. Start heygaia service
-      4. Upload to gdrive:gaia-backups (retry once on failure)
+    Flow per service:
+      1. Stop service
+      2. Copy DB to /tmp/<service_name>-<timestamp>.db
+      3. Start service
+      4. Upload to gdrive:backups/<service_name>/ (retry once on failure)
       5. Remove temp file
 
     Returns: (success: bool, filename_or_reason: str)
     """
+    services = db.query("SELECT * FROM services", fetch_all=True)
+    if not services:
+        reason = "No services found to backup"
+        _write_backup_log(reason)
+        return (False, reason)
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_filename = f"gaia-{timestamp}.db"
-    tmp_path = os.path.join("/tmp", backup_filename)
-    service_restarted = False
+    results = []
+    all_ok = True
 
-    # Derive service name from DB path and build remote target
-    service_name = os.path.basename(os.path.dirname(HEYGAIA_DB))
-    remote_target = f"{GDRIVE_FOLDER}/{service_name}"
+    for svc in services:
+        name = svc['name']
+        storage_base = svc['storage_path'].rstrip('/')
+        if storage_base.endswith('/api'):
+            storage_base = storage_base[:-4]
 
-    try:
-        # Step 1: Stop heygaia service
-        _write_backup_log("Stopping heygaia service...")
-        result = subprocess.run(
-            ["systemctl", "stop", "heygaia"],
-            capture_output=True, text=True, timeout=30
-        )
-        if result.returncode != 0:
-            reason = f"systemctl stop heygaia failed: {result.stderr.strip()}"
-            _write_backup_log(f"ERROR: {reason}")
-            return (False, reason)
+        db_dir = os.path.join(storage_base, "database", name)
+        backup_filename = f"{name}-{timestamp}.zip"
+        tmp_path = os.path.join("/tmp", backup_filename)
+        remote_target = f"{GDRIVE_FOLDER}/{name}"
+        service_restarted = False
 
-        # Step 2: Copy database to /tmp
-        if not os.path.exists(HEYGAIA_DB):
-            reason = f"Database file not found: {HEYGAIA_DB}"
-            _write_backup_log(f"ERROR: {reason}")
-            # Restart service since we stopped it
-            subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
-            return (False, reason)
-
-        shutil.copy2(HEYGAIA_DB, tmp_path)
-        _write_backup_log(f"Database copied to {tmp_path}")
-
-        # Step 3: Restart service immediately after copy
-        subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
-        service_restarted = True
-        _write_backup_log("heygaia service restarted")
-
-        # Step 4: Upload to Google Drive (with one retry on failure)
-        for attempt in range(2):
-            _write_backup_log(f"Uploading to {remote_target} (attempt {attempt + 1}/2)...")
+        try:
+            # Step 1: Stop service
+            _write_backup_log(f"[{name}] Stopping service...")
             result = subprocess.run(
-                ["rclone", "copy", tmp_path, remote_target],
-                capture_output=True, text=True, timeout=300
+                ["systemctl", "stop", name],
+                capture_output=True, text=True, timeout=30
             )
-            if result.returncode == 0:
-                _write_backup_log(f"Backup successful: {backup_filename}")
-                print(f"Backup successful: {backup_filename}")
-                break
-            else:
-                reason = f"rclone failed (exit {result.returncode}): {result.stderr.strip()}"
-                _write_backup_log(f"WARNING: {reason}")
-                if attempt == 0:
-                    _write_backup_log("Retrying upload...")
-                    time.sleep(2)
+            if result.returncode != 0:
+                reason = f"systemctl stop {name} failed: {result.stderr.strip()}"
+                _write_backup_log(f"[{name}] ERROR: {reason}")
+                all_ok = False
+                results.append(f"{name}: FAILED - {reason}")
+                continue
+
+            # Step 2: Copy database files to /tmp
+            db_files = []
+            if os.path.exists(db_dir):
+                db_files = [f for f in os.listdir(db_dir) if os.path.isfile(os.path.join(db_dir, f))]
+
+            if not db_files:
+                reason = f"No database files found at {db_dir}"
+                _write_backup_log(f"[{name}] ERROR: {reason}")
+                subprocess.run(["systemctl", "start", name], timeout=30)
+                all_ok = False
+                results.append(f"{name}: FAILED - {reason}")
+                continue
+
+            # Zip all DB files into a single backup
+            import zipfile
+            with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for f in db_files:
+                    zf.write(os.path.join(db_dir, f), f)
+            _write_backup_log(f"[{name}] Database copied to {tmp_path}")
+
+            # Step 3: Restart service immediately after copy
+            subprocess.run(["systemctl", "start", name], timeout=30)
+            service_restarted = True
+            _write_backup_log(f"[{name}] Service restarted")
+
+            # Step 4: Upload to Google Drive (with one retry on failure)
+            uploaded = False
+            for attempt in range(2):
+                _write_backup_log(f"[{name}] Uploading to {remote_target} (attempt {attempt + 1}/2)...")
+                result = subprocess.run(
+                    ["rclone", "copy", tmp_path, remote_target],
+                    capture_output=True, text=True, timeout=300
+                )
+                if result.returncode == 0:
+                    _write_backup_log(f"[{name}] Backup successful: {backup_filename}")
+                    results.append(f"{name}: {backup_filename}")
+                    uploaded = True
+                    break
                 else:
-                    _write_backup_log(f"Backup failed: {reason}")
-                    print(f"Backup failed: {reason}")
-                    # Clean up temp file
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                    return (False, reason)
+                    reason = f"rclone failed (exit {result.returncode}): {result.stderr.strip()}"
+                    _write_backup_log(f"[{name}] WARNING: {reason}")
+                    if attempt == 0:
+                        _write_backup_log(f"[{name}] Retrying upload...")
+                        time.sleep(2)
+                    else:
+                        _write_backup_log(f"[{name}] Backup failed: {reason}")
+                        all_ok = False
+                        results.append(f"{name}: FAILED - {reason}")
 
-        # Step 5: Remove temporary file
-        try:
-            os.remove(tmp_path)
-        except OSError as e:
-            _write_backup_log(f"WARNING: Could not remove temp file {tmp_path}: {e}")
-
-        return (True, backup_filename)
-
-    except subprocess.TimeoutExpired:
-        reason = "Command timed out during backup"
-        _write_backup_log(f"Backup failed: {reason}")
-        if not service_restarted:
+            # Step 5: Remove temporary file
             try:
-                subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
-            except Exception:
-                pass
-        try:
-            if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-        except OSError:
-            pass
-        return (False, reason)
+            except OSError as e:
+                _write_backup_log(f"[{name}] WARNING: Could not remove temp file: {e}")
 
-    except Exception as e:
-        reason = str(e)
-        _write_backup_log(f"Backup failed: {reason}")
-        if not service_restarted:
+        except subprocess.TimeoutExpired:
+            reason = f"Command timed out for {name}"
+            _write_backup_log(f"[{name}] Backup failed: {reason}")
+            if not service_restarted:
+                try:
+                    subprocess.run(["systemctl", "start", name], timeout=30)
+                except Exception:
+                    pass
             try:
-                subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
-            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
                 pass
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
-        return (False, reason)
+            all_ok = False
+            results.append(f"{name}: FAILED - {reason}")
+
+        except Exception as e:
+            reason = str(e)
+            _write_backup_log(f"[{name}] Backup failed: {reason}")
+            if not service_restarted:
+                try:
+                    subprocess.run(["systemctl", "start", name], timeout=30)
+                except Exception:
+                    pass
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            all_ok = False
+            results.append(f"{name}: FAILED - {reason}")
+
+    # Print summary
+    for r in results:
+        if r.endswith("FAILED") or "FAILED" in r:
+            print(f"  {r}")
+        else:
+            print(f"  {r}")
+
+    if all_ok:
+        summary = f"Backup successful: {len(services)} services"
+    else:
+        failed = sum(1 for r in results if "FAILED" in r)
+        summary = f"Backup failed: {failed}/{len(services)} services failed"
+
+    _write_backup_log(summary)
+    return (all_ok, summary)
 
 
 async def gdrive_backup_now_async():
     """Async wrapper for backup_gdrive_now()"""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, backup_gdrive_now)
+
+
+# ==============================================================================
+#   RESTORE BACKUP MENU
+# ==============================================================================
+
+async def restore_backup_menu():
+    """Restore backup from local or Google Drive"""
+    loop = asyncio.get_event_loop()
+
+    while True:
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ RESTORE BACKUP ═══{C_RESET}\n")
+        print(f"  {C_BOLD}[1]{C_RESET} Restore from Local Backup")
+        print(f"  {C_BOLD}[2]{C_RESET} Restore from Google Drive")
+        print(f"  {C_BOLD}[0]{C_RESET} Back\n")
+
+        choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select action:{C_RESET} "))).strip()
+
+        if choice == "0":
+            break
+        elif choice == "1":
+            await restore_from_local()
+        elif choice == "2":
+            await restore_from_drive()
+
+
+async def restore_from_local():
+    """Restore a backup from the local /opt/backups directory"""
+    loop = asyncio.get_event_loop()
+
+    # List services
+    services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
+    if not services:
+        print_status("No services deployed.", "warning")
+        await asyncio.sleep(1)
+        return
+
+    print(f"\n  {C_BOLD}{'ID':<6} {'SERVICE NAME'}{C_RESET}")
+    print(f"  {C_CYAN}{'─' * 30}{C_RESET}")
+    for s in services:
+        print(f"  {s['id']:<6} {s['name']}")
+
+    svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID to restore (0 to cancel):{C_RESET} "))).strip()
+    if svc_id == "0" or not svc_id:
+        return
+
+    svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
+    if not svc:
+        print_status("Invalid Service ID.", "error")
+        return
+
+    name = svc['name']
+
+    # List local backups for this service
+    backups = db.query(
+        "SELECT id, filename, size_bytes, timestamp FROM backups WHERE service_name=? ORDER BY timestamp DESC",
+        (name,), fetch_all=True
+    )
+    if not backups:
+        print_status(f"No local backups found for '{name}'.", "warning")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
+    print(f"\n  {C_BOLD}Local backups for {name}:{C_RESET}")
+    print(f"  {C_BOLD}{'ID':<6} {'FILENAME':<45} {'SIZE':<12} {'DATE'}{C_RESET}")
+    print(f"  {C_CYAN}{'─' * 80}{C_RESET}")
+    for b in backups:
+        size_mb = b['size_bytes'] / 1024 / 1024 if b['size_bytes'] else 0
+        print(f"  {b['id']:<6} {b['filename']:<45} {size_mb:<12.2f} MB {b['timestamp']}")
+
+    bk_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Backup ID to restore (0 to cancel):{C_RESET} "))).strip()
+    if bk_id == "0" or not bk_id:
+        return
+
+    backup = db.query("SELECT * FROM backups WHERE id=?", (bk_id,), fetch_one=True)
+    if not backup:
+        print_status("Invalid Backup ID.", "error")
+        return
+
+    backup_path = os.path.join(BACKUP_DIR, backup['filename'])
+    if not os.path.exists(backup_path):
+        print_status(f"Backup file missing: {backup['filename']}", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
+    await _do_restore(svc, backup_path, backup['filename'])
+
+
+async def restore_from_drive():
+    """Download and restore a backup from Google Drive"""
+    loop = asyncio.get_event_loop()
+
+    # List services
+    services = db.query("SELECT id, name FROM services ORDER BY name", fetch_all=True)
+    if not services:
+        print_status("No services deployed.", "warning")
+        await asyncio.sleep(1)
+        return
+
+    print(f"\n  {C_BOLD}{'ID':<6} {'SERVICE NAME'}{C_RESET}")
+    print(f"  {C_CYAN}{'─' * 30}{C_RESET}")
+    for s in services:
+        print(f"  {s['id']:<6} {s['name']}")
+
+    svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID to restore (0 to cancel):{C_RESET} "))).strip()
+    if svc_id == "0" or not svc_id:
+        return
+
+    svc = db.query("SELECT * FROM services WHERE id=?", (svc_id,), fetch_one=True)
+    if not svc:
+        print_status("Invalid Service ID.", "error")
+        return
+
+    name = svc['name']
+    remote_path = f"{GDRIVE_FOLDER}/{name}"
+
+    # List backups on Google Drive
+    print(f"\n  {C_CYAN}Fetching backups from {remote_path}...{C_RESET}")
+    try:
+        result = subprocess.run(
+            ["rclone", "lsf", remote_path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            print_status(f"Failed to list remote backups: {result.stderr.strip()}", "error")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+
+        files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+        if not files:
+            print_status(f"No backups found on Google Drive for '{name}'.", "warning")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+
+    except subprocess.TimeoutExpired:
+        print_status("rclone list timed out.", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
+    # Show available backups
+    print(f"\n  {C_BOLD}Google Drive backups for {name}:{C_RESET}")
+    print(f"  {C_BOLD}{'#':<6} {'FILENAME'}{C_RESET}")
+    print(f"  {C_CYAN}{'─' * 60}{C_RESET}")
+    for idx, f in enumerate(files, start=1):
+        print(f"  {idx:<6} {f}")
+
+    sel = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter backup # to restore (0 to cancel):{C_RESET} "))).strip()
+    if sel == "0" or not sel:
+        return
+
+    try:
+        sel_idx = int(sel) - 1
+        if sel_idx < 0 or sel_idx >= len(files):
+            print_status("Invalid selection.", "error")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+    except ValueError:
+        print_status("Invalid selection.", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
+    selected_file = files[sel_idx]
+    remote_file = f"{remote_path}/{selected_file}"
+    local_tmp = os.path.join("/tmp", selected_file)
+
+    # Download from Google Drive
+    print(f"\n  {C_CYAN}Downloading {selected_file}...{C_RESET}")
+    try:
+        result = subprocess.run(
+            ["rclone", "copy", remote_file, "/tmp"],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            print_status(f"Download failed: {result.stderr.strip()}", "error")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+    except subprocess.TimeoutExpired:
+        print_status("Download timed out.", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
+    if not os.path.exists(local_tmp):
+        print_status(f"Downloaded file not found at {local_tmp}", "error")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
+    await _do_restore(svc, local_tmp, selected_file)
+
+    # Clean up downloaded file
+    try:
+        os.remove(local_tmp)
+    except OSError:
+        pass
+
+
+async def _do_restore(svc, backup_path, filename):
+    """Common restore logic for both local and Drive backups"""
+    loop = asyncio.get_event_loop()
+    name = svc['name']
+
+    print(f"\n{C_RED}{C_BOLD}═══ RESTORE DATABASE: {name} ═══{C_RESET}")
+    print(f"{C_YELLOW}WARNING: This will overwrite current database files with: {filename}{C_RESET}\n")
+
+    confirm = (await loop.run_in_executor(None, lambda: input(f"  Type 'RESTORE' to confirm: "))).strip()
+    if confirm != "RESTORE":
+        print_status("Restore cancelled", "warning")
+        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+        return
+
+    try:
+        db_path = os.path.join(svc['storage_path'], "database", name)
+
+        print_status(f"Stopping service {name}...", "info")
+        run_root(["systemctl", "stop", name])
+
+        # Archive current DB files
+        if os.path.exists(db_path) and os.listdir(db_path):
+            temp_old = db_path + "_pre_restore_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.move(db_path, temp_old)
+            os.makedirs(db_path, exist_ok=True)
+            print_status("Current database archived to temporary folder", "info")
+        else:
+            os.makedirs(db_path, exist_ok=True)
+
+        print_status("Extracting backup files...", "info")
+        import zipfile
+        with zipfile.ZipFile(backup_path, 'r') as zf:
+            zf.extractall(db_path)
+
+        # Set permissions
+        for root, dirs, files in os.walk(db_path):
+            for d in dirs:
+                shutil.chown(os.path.join(root, d), user=SERVICE_USER, group=SERVICE_GROUP)
+            for f in files:
+                filepath = os.path.join(root, f)
+                shutil.chown(filepath, user=SERVICE_USER, group=SERVICE_GROUP)
+                os.chmod(filepath, 0o660)
+
+        print_status("Restarting service...", "info")
+        run_root(["systemctl", "start", name])
+
+        print_status(f"Restore successful: {filename}", "success")
+        audit_log("BACKUP_RESTORE", name, {"filename": filename})
+
+    except Exception as e:
+        logger.error(f"Restore failed: {e}")
+        print_status(f"Restore failed: {e}", "error")
+        # Try to restart service anyway
+        try:
+            run_root(["systemctl", "start", name])
+        except Exception:
+            pass
+
+    await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
 
 async def configure_remote_offloading():
