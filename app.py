@@ -1736,6 +1736,7 @@ async def service_operations():
     print("  6. View systemd status")
     print("  7. View resource usage")
     print("  8. Update configuration")
+    print("  9. Redeploy service (new git)")
     print("  0. Cancel")
 
     choice = input(f"\n{C_CYAN}Select operation:{C_RESET} ").strip()
@@ -2826,6 +2827,228 @@ async def manage_service(name: str, svc: dict):          # FIX: was floating orp
 
     elif choice == "8":
         await loop.run_in_executor(None, update_service_config, name)
+
+    elif choice == "9":
+        # REDEPLOY — stop service, delete code dir, clone new repo, reinstall deps, start
+        loop = asyncio.get_event_loop()
+
+        new_repo_url = (await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}New Git Repository URL:{C_RESET} "))).strip()
+        if not new_repo_url:
+            print(f"{C_YELLOW}No URL entered. Cancelled{C_RESET}")
+            await asyncio.sleep(1)
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+
+        new_branch = (await loop.run_in_executor(None, lambda: input(f"{C_CYAN}Branch (default: main):{C_RESET} "))).strip()
+        if not new_branch:
+            new_branch = "main"
+
+        print(f"\n{C_RED}{C_BOLD}{'=' * 60}{C_RESET}")
+        print(f"{C_RED}{C_BOLD}  REDEPLOY SERVICE: {name}{C_RESET}")
+        print(f"{C_RED}  Old Repo: {svc['repo_url']}{C_RESET}")
+        print(f"{C_RED}  New Repo: {new_repo_url}{C_RESET}")
+        print(f"{C_RED}  Branch:   {new_branch}{C_RESET}")
+        print(f"{C_RED}{C_BOLD}{'=' * 60}{C_RESET}")
+
+        confirm = (await loop.run_in_executor(None, lambda: input(f"\n{C_RED}Type 'REDEPLOY' to confirm:{C_RESET} "))).strip()
+        if confirm != "REDEPLOY":
+            print(f"{C_YELLOW}Redeploy cancelled{C_RESET}")
+            logger.info(f"[{name}] Redeploy cancelled by user")
+            await asyncio.sleep(1)
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+
+        logger.info(f"[{name}] Redeploy started — repo: {new_repo_url}, branch: {new_branch}")
+        audit_log("REDEPLOY_START", name, {
+            "old_repo": svc['repo_url'],
+            "new_repo": new_repo_url,
+            "branch": new_branch
+        })
+
+        try:
+            service_path = get_service_path(svc['storage_path'], name)
+            svc_runtime = svc['runtime'] if 'runtime' in svc.keys() else 'python'
+
+            # Stop service
+            print(f"\n{C_YELLOW}[1/6] Stopping service...{C_RESET}")
+            try:
+                subprocess.run(["systemctl", "stop", name], timeout=10, check=True)
+                await asyncio.sleep(1)
+                print(f"{C_GREEN}  ✓ Service stopped{C_RESET}")
+                logger.info(f"[{name}] Service stopped for redeploy")
+            except Exception as stop_err:
+                print(f"{C_YELLOW}  ⚠ Service was not running{C_RESET}")
+                logger.warning(f"[{name}] Redeploy stop: {stop_err}")
+
+            # Remove old code directory
+            print(f"{C_YELLOW}[2/6] Removing old code directory...{C_RESET}")
+            logger.info(f"[{name}] Removing old code at {service_path}")
+            if os.path.exists(service_path):
+                try:
+                    shutil.rmtree(service_path)
+                    print(f"{C_GREEN}  ✓ Old code removed{C_RESET}")
+                    logger.info(f"[{name}] Old code directory removed")
+                except Exception as rm_err:
+                    print(f"{C_RED}  ✗ Failed to remove old code: {rm_err}{C_RESET}")
+                    logger.error(f"[{name}] Failed to remove old code: {rm_err}")
+                    raise RuntimeError(f"Failed to remove old code: {rm_err}")
+            else:
+                print(f"{C_YELLOW}  ⚠ Old code directory not found — continuing{C_RESET}")
+                logger.warning(f"[{name}] Old code directory not found at {service_path}")
+
+            # Clone new repo
+            print(f"{C_YELLOW}[3/6] Cloning new repository...{C_RESET}")
+            logger.info(f"[{name}] Cloning {new_repo_url} (branch: {new_branch}) to {service_path}")
+            api_parent = os.path.dirname(service_path)
+            os.makedirs(api_parent, exist_ok=True)
+
+            returncode, stdout, stderr = run_as_gaia(
+                ["git", "clone", "-b", new_branch, new_repo_url, name],
+                cwd=api_parent,
+                timeout=300
+            )
+
+            if returncode != 0:
+                error_msg = stderr.strip() if stderr else "Unknown git error"
+                logger.error(f"[{name}] Git clone failed: {error_msg}")
+                raise RuntimeError(f"Git clone failed: {error_msg}")
+
+            if not os.path.exists(service_path):
+                raise RuntimeError(f"Git clone completed but directory not found: {service_path}")
+
+            print(f"{C_GREEN}  ✓ Repository cloned{C_RESET}")
+            print(f"  Location: {service_path}")
+            logger.info(f"[{name}] Repository cloned successfully to {service_path}")
+
+            # Create logs directory
+            log_dir = os.path.join(service_path, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            shutil.chown(log_dir, user=SERVICE_USER, group=SERVICE_GROUP)
+            os.chmod(log_dir, 0o750)
+            logger.info(f"[{name}] Logs directory ensured at {log_dir}")
+
+            # Reinstall dependencies
+            if svc_runtime == "node":
+                print(f"{C_YELLOW}[4/6] Installing Node.js dependencies...{C_RESET}")
+                pkg_json = os.path.join(service_path, "package.json")
+                if os.path.exists(pkg_json):
+                    try:
+                        run_as_gaia(["npm", "install", "--production"], cwd=service_path, timeout=300)
+                        print(f"{C_GREEN}  ✓ npm packages installed{C_RESET}")
+                        logger.info(f"[{name}] npm install completed")
+                    except Exception as npm_err:
+                        print(f"{C_RED}  ✗ npm install failed: {npm_err}{C_RESET}")
+                        logger.error(f"[{name}] npm install failed: {npm_err}")
+                else:
+                    print(f"{C_YELLOW}  ⚠ package.json not found — skipping{C_RESET}")
+                    logger.warning(f"[{name}] package.json not found in {service_path}")
+            else:
+                # Python — create venv
+                print(f"{C_YELLOW}[4/6] Creating virtual environment...{C_RESET}")
+                logger.info(f"[{name}] Creating venv at {service_path}")
+                try:
+                    run_as_gaia([sys.executable, "-m", "venv", "venv"], cwd=service_path, timeout=120)
+                    print(f"{C_GREEN}  ✓ Virtual environment created{C_RESET}")
+                    logger.info(f"[{name}] Virtual environment created")
+                except Exception as venv_err:
+                    print(f"{C_RED}  ✗ Venv creation failed: {venv_err}{C_RESET}")
+                    logger.error(f"[{name}] Venv creation failed: {venv_err}")
+                    raise RuntimeError(f"Virtual environment creation failed: {venv_err}")
+
+                # Install requirements
+                requirements_file = os.path.join(service_path, "requirements.txt")
+                pip_path = os.path.join(service_path, "venv", "bin", "pip")
+
+                print(f"{C_YELLOW}[5/6] Installing Python dependencies...{C_RESET}")
+                if os.path.exists(requirements_file):
+                    logger.info(f"[{name}] Installing requirements from {requirements_file}")
+                    start_time = time.time()
+                    try:
+                        returncode, stdout, stderr = run_as_gaia(
+                            [pip_path, "install", "-r", "requirements.txt"],
+                            cwd=service_path,
+                            capture=True,
+                            timeout=600
+                        )
+                        duration = time.time() - start_time
+                        if returncode == 0:
+                            print(f"{C_GREEN}  ✓ Dependencies installed ({duration:.1f}s){C_RESET}")
+                            logger.info(f"[{name}] Requirements installed in {duration:.1f}s")
+                        else:
+                            err_preview = stderr[:200] if stderr else "unknown"
+                            print(f"{C_RED}  ✗ pip install failed: {err_preview}{C_RESET}")
+                            logger.error(f"[{name}] pip install failed (rc={returncode}): {err_preview}")
+                    except Exception as pip_err:
+                        print(f"{C_RED}  ✗ pip install error: {pip_err}{C_RESET}")
+                        logger.error(f"[{name}] pip install exception: {pip_err}")
+                else:
+                    print(f"{C_YELLOW}  ⚠ requirements.txt not found — skipping{C_RESET}")
+                    logger.warning(f"[{name}] requirements.txt not found")
+
+                # Install gunicorn
+                try:
+                    run_as_gaia([pip_path, "install", "gunicorn"], cwd=service_path, timeout=60)
+                    print(f"{C_GREEN}  ✓ Gunicorn installed{C_RESET}")
+                    logger.info(f"[{name}] Gunicorn installed")
+                except Exception as g_err:
+                    print(f"{C_YELLOW}  ⚠ Gunicorn install warning: {g_err}{C_RESET}")
+                    logger.warning(f"[{name}] Gunicorn install warning: {g_err}")
+
+            # Start service
+            print(f"{C_YELLOW}[6/6] Starting service...{C_RESET}")
+            try:
+                subprocess.run(["systemctl", "start", name], timeout=10, check=True)
+                await asyncio.sleep(2)
+                result = subprocess.run(
+                    ["systemctl", "is-active", name],
+                    capture_output=True,
+                    timeout=5
+                )
+                if result.stdout.strip() == b"active":
+                    print(f"{C_GREEN}  ✓ Service started successfully{C_RESET}")
+                    logger.info(f"[{name}] Service started after redeploy")
+                else:
+                    print(f"{C_RED}  ✗ Service failed to start{C_RESET}")
+                    print(f"  {C_YELLOW}Check logs: journalctl -u {name} -n 50{C_RESET}")
+                    logger.error(f"[{name}] Service failed to start after redeploy")
+            except Exception as start_err:
+                print(f"{C_RED}  ✗ Service start failed: {start_err}{C_RESET}")
+                logger.error(f"[{name}] Service start exception after redeploy: {start_err}")
+
+            # Update database with new repo
+            db.query(
+                "UPDATE services SET repo_url=?, branch=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (new_repo_url, new_branch, svc['id'])
+            )
+            logger.info(f"[{name}] DB updated — repo_url={new_repo_url}, branch={new_branch}")
+
+            audit_log("REDEPLOY_SUCCESS", name, {
+                "old_repo": svc['repo_url'],
+                "new_repo": new_repo_url,
+                "branch": new_branch,
+                "runtime": svc_runtime
+            })
+
+            print(f"\n{C_GREEN}{'=' * 60}{C_RESET}")
+            print(f"{C_GREEN}{C_BOLD}  ✓ REDEPLOYMENT COMPLETE: {name}{C_RESET}")
+            print(f"{C_GREEN}{'=' * 60}{C_RESET}")
+
+        except Exception as e:
+            print(f"\n{C_RED}{'=' * 60}{C_RESET}")
+            print(f"{C_RED}  ✗ REDEPLOYMENT FAILED: {name}{C_RESET}")
+            print(f"{C_RED}  Error: {e}{C_RESET}")
+            print(f"{C_RED}{'=' * 60}{C_RESET}")
+            logger.error(f"[{name}] Redeployment failed: {e}")
+            audit_log("REDEPLOY_FAILED", name, {
+                "new_repo": new_repo_url,
+                "branch": new_branch,
+                "error": str(e)
+            })
+
+        await loop.run_in_executor(
+            None,
+            lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
+        )
 
     elif choice == "0":
         return
