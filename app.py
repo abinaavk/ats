@@ -60,6 +60,13 @@ CLOUDFLARE_CONFIG = "/etc/cloudflared/config.yml"
 DEFAULT_STORAGE = "/opt"
 BACKUP_DIR = os.path.join(DEFAULT_STORAGE, "backups")
 
+# --- Google Drive Backup (rclone) ---
+HEYGAIA_DB = "/opt/api/heygaia/gaia.db"
+GDRIVE_REMOTE = "gdrive"
+GDRIVE_FOLDER = "gdrive:gaia-backups"
+HEYGAIA_LOG_DIR = "/opt/api/heygaia/logs"
+BACKUP_LOG = os.path.join(HEYGAIA_LOG_DIR, "backup.log")
+
 BLOCKED_PATHS = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/root", "/run", "/sys", "/usr", "/var"]
 
 # ==============================================================================
@@ -3404,6 +3411,7 @@ async def backup_service():
         print(f"  {C_BOLD}[1]{C_RESET} Create Local Database Backup")
         print(f"  {C_BOLD}[2]{C_RESET} Configure Remote Offloading (S3/Drive/SCP)")
         print(f"  {C_BOLD}[3]{C_RESET} Manual Sync Backups to Remote")
+        print(f"  {C_BOLD}[4]{C_RESET} Google Drive Backup Now (rclone)")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
         loop = asyncio.get_event_loop()
@@ -3448,6 +3456,15 @@ async def backup_service():
 
         elif choice == "3":
             await sync_all_backups_remote()
+
+        elif choice == "4":
+            print(f"\n  {C_CYAN}Running Google Drive backup...{C_RESET}")
+            success, result = await gdrive_backup_now_async()
+            if success:
+                print_status(f"Backup successful: {result}", "success")
+            else:
+                print_status(f"Backup failed: {result}", "error")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
 def create_local_backup(svc):
     """Internal logic to create a zip of the database"""
@@ -3526,6 +3543,140 @@ def create_local_backup(svc):
         print_status(f"Local backup failed: {e}", "error")
         audit_log("BACKUP_FAILED", name, {"stage": "unexpected", "error": str(e)})
         return None
+
+
+# ==============================================================================
+#   GOOGLE DRIVE BACKUP (rclone)
+# ==============================================================================
+
+def _write_backup_log(msg):
+    """Append a timestamped line to the backup log file"""
+    try:
+        os.makedirs(HEYGAIA_LOG_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(BACKUP_LOG, "a") as f:
+            f.write(f"[{ts}] {msg}\n")
+    except Exception as e:
+        logger.error(f"Failed to write backup log: {e}")
+
+
+def backup_gdrive_now():
+    """
+    Backup heygaia database to Google Drive via rclone.
+
+    Flow:
+      1. Stop heygaia service
+      2. Copy DB to /tmp with timestamp
+      3. Start heygaia service
+      4. Upload to gdrive:gaia-backups (retry once on failure)
+      5. Remove temp file
+
+    Returns: (success: bool, filename_or_reason: str)
+    """
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_filename = f"gaia-{timestamp}.db"
+    tmp_path = os.path.join("/tmp", backup_filename)
+    service_restarted = False
+
+    try:
+        # Step 1: Stop heygaia service
+        _write_backup_log("Stopping heygaia service...")
+        result = subprocess.run(
+            ["systemctl", "stop", "heygaia"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            reason = f"systemctl stop heygaia failed: {result.stderr.strip()}"
+            _write_backup_log(f"ERROR: {reason}")
+            return (False, reason)
+
+        # Step 2: Copy database to /tmp
+        if not os.path.exists(HEYGAIA_DB):
+            reason = f"Database file not found: {HEYGAIA_DB}"
+            _write_backup_log(f"ERROR: {reason}")
+            # Restart service since we stopped it
+            subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
+            return (False, reason)
+
+        shutil.copy2(HEYGAIA_DB, tmp_path)
+        _write_backup_log(f"Database copied to {tmp_path}")
+
+        # Step 3: Restart service immediately after copy
+        subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
+        service_restarted = True
+        _write_backup_log("heygaia service restarted")
+
+        # Step 4: Upload to Google Drive (with one retry on failure)
+        for attempt in range(2):
+            _write_backup_log(f"Uploading to {GDRIVE_FOLDER} (attempt {attempt + 1}/2)...")
+            result = subprocess.run(
+                ["rclone", "copy", tmp_path, GDRIVE_FOLDER],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode == 0:
+                _write_backup_log(f"Backup successful: {backup_filename}")
+                print(f"Backup successful: {backup_filename}")
+                break
+            else:
+                reason = f"rclone failed (exit {result.returncode}): {result.stderr.strip()}"
+                _write_backup_log(f"WARNING: {reason}")
+                if attempt == 0:
+                    _write_backup_log("Retrying upload...")
+                    time.sleep(2)
+                else:
+                    _write_backup_log(f"Backup failed: {reason}")
+                    print(f"Backup failed: {reason}")
+                    # Clean up temp file
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    return (False, reason)
+
+        # Step 5: Remove temporary file
+        try:
+            os.remove(tmp_path)
+        except OSError as e:
+            _write_backup_log(f"WARNING: Could not remove temp file {tmp_path}: {e}")
+
+        return (True, backup_filename)
+
+    except subprocess.TimeoutExpired:
+        reason = "Command timed out during backup"
+        _write_backup_log(f"Backup failed: {reason}")
+        if not service_restarted:
+            try:
+                subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
+            except Exception:
+                pass
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return (False, reason)
+
+    except Exception as e:
+        reason = str(e)
+        _write_backup_log(f"Backup failed: {reason}")
+        if not service_restarted:
+            try:
+                subprocess.run(["systemctl", "start", "heygaia"], timeout=30)
+            except Exception:
+                pass
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return (False, reason)
+
+
+async def gdrive_backup_now_async():
+    """Async wrapper for backup_gdrive_now()"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, backup_gdrive_now)
+
 
 async def configure_remote_offloading():
     """Setup remote storage targets using rclone or scp"""
@@ -5366,6 +5517,15 @@ async def auto_backup_scheduler():
             else:
                 logger.info("No services found for scheduled backup.")
                 audit_log("SCHEDULED_BACKUP_SKIP", "SYSTEM", {"reason": "no_services"})
+
+            # --- Google Drive backup at midnight ---
+            logger.info("Triggering scheduled Google Drive backup...")
+            loop = asyncio.get_event_loop()
+            success, result = await loop.run_in_executor(None, backup_gdrive_now)
+            if success:
+                logger.info(f"Google Drive backup successful: {result}")
+            else:
+                logger.error(f"Google Drive backup failed: {result}")
                 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
@@ -5570,6 +5730,16 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             pass
         sys.exit(0)
+
+    # CLI: ats backup now — trigger Google Drive backup immediately
+    if len(sys.argv) > 2 and sys.argv[1] == "backup" and sys.argv[2] == "now":
+        success, result = backup_gdrive_now()
+        if success:
+            print(f"Backup successful: {result}")
+            sys.exit(0)
+        else:
+            print(f"Backup failed: {result}")
+            sys.exit(1)
 
     lock = acquire_lock()
 
