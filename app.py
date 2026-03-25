@@ -66,6 +66,9 @@ GDRIVE_REMOTE = "gdrive"
 GDRIVE_FOLDER = "gdrive:backups"
 HEYGAIA_LOG_DIR = "/opt/api/heygaia/logs"
 BACKUP_LOG = os.path.join(HEYGAIA_LOG_DIR, "backup.log")
+GDRIVE_RETENTION_DAYS = 7
+RCLONE_BWLIMIT = "5M"
+ENCRYPTION_KEY_FILE = "/opt/api/heygaia/.backup_key"
 
 BLOCKED_PATHS = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/root", "/run", "/sys", "/usr", "/var"]
 
@@ -3564,6 +3567,111 @@ def _write_backup_log(msg):
         logger.error(f"Failed to write backup log: {e}")
 
 
+def _get_or_create_key():
+    """Get encryption key from file, or generate and save one"""
+    try:
+        if os.path.exists(ENCRYPTION_KEY_FILE):
+            with open(ENCRYPTION_KEY_FILE, 'r') as f:
+                key = f.read().strip()
+            if key:
+                return key
+
+        # Generate a new 256-bit key
+        key = subprocess.run(
+            ["openssl", "rand", "-hex", "32"],
+            capture_output=True, text=True, timeout=10
+        ).stdout.strip()
+
+        with open(ENCRYPTION_KEY_FILE, 'w') as f:
+            f.write(key)
+        os.chmod(ENCRYPTION_KEY_FILE, 0o600)
+        logger.info(f"Generated new backup encryption key at {ENCRYPTION_KEY_FILE}")
+        return key
+    except Exception as e:
+        logger.error(f"Failed to get/create encryption key: {e}")
+        return None
+
+
+def _encrypt_file(input_path, output_path):
+    """Encrypt a file using AES-256-CBC via OpenSSL. Returns True on success."""
+    key = _get_or_create_key()
+    if not key:
+        return False
+    try:
+        result = subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-salt", "-pbkdf2",
+             "-in", input_path, "-out", output_path, "-pass", f"pass:{key}"],
+            capture_output=True, text=True, timeout=120
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.error(f"Encryption failed: {e}")
+        return False
+
+
+def _decrypt_file(input_path, output_path):
+    """Decrypt a file using AES-256-CBC via OpenSSL. Returns True on success."""
+    key = _get_or_create_key()
+    if not key:
+        return False
+    try:
+        result = subprocess.run(
+            ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2",
+             "-in", input_path, "-out", output_path, "-pass", f"pass:{key}"],
+            capture_output=True, text=True, timeout=120
+        )
+        return result.returncode == 0
+    except Exception as e:
+        logger.error(f"Decryption failed: {e}")
+        return False
+
+
+def _rclone_delete_old(remote_path):
+    """Delete backups older than GDRIVE_RETENTION_DAYS from a remote path"""
+    try:
+        result = subprocess.run(
+            ["rclone", "delete", remote_path,
+             "--min-age", f"{GDRIVE_RETENTION_DAYS}d",
+             "--bwlimit", RCLONE_BWLIMIT],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            if result.stdout.strip():
+                _write_backup_log(f"Retention: deleted old backups from {remote_path}")
+            return True
+        else:
+            _write_backup_log(f"WARNING: Retention cleanup failed for {remote_path}: {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        _write_backup_log(f"WARNING: Retention cleanup error: {e}")
+        return False
+
+
+def _rclone_show_size():
+    """Show total Drive storage used under gdrive:backups"""
+    try:
+        result = subprocess.run(
+            ["rclone", "size", GDRIVE_FOLDER, "--json"],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            import json
+            data = json.loads(result.stdout)
+            total_bytes = data.get("bytes", 0)
+            total_files = data.get("count", 0)
+            size_mb = total_bytes / 1024 / 1024
+            if size_mb >= 1024:
+                size_str = f"{size_mb / 1024:.2f} GB"
+            else:
+                size_str = f"{size_mb:.2f} MB"
+            print(f"  {C_CYAN}Drive usage: {size_str} ({total_files} files){C_RESET}")
+            _write_backup_log(f"Drive storage: {size_str} across {total_files} files")
+        else:
+            print(f"  {C_YELLOW}Could not fetch Drive size: {result.stderr.strip()}{C_RESET}")
+    except Exception as e:
+        print(f"  {C_YELLOW}Could not fetch Drive size: {e}{C_RESET}")
+
+
 def backup_gdrive_now():
     """
     Backup all services' databases to Google Drive via rclone.
@@ -3639,24 +3747,35 @@ def backup_gdrive_now():
                     zf.write(os.path.join(db_dir, f), f)
             _write_backup_log(f"[{name}] Database copied to {tmp_path}")
 
+            # Encrypt the backup before upload
+            enc_path = tmp_path + ".enc"
+            if _encrypt_file(tmp_path, enc_path):
+                _write_backup_log(f"[{name}] Backup encrypted: {enc_path}")
+                upload_path = enc_path
+                backup_filename_enc = backup_filename + ".enc"
+            else:
+                _write_backup_log(f"[{name}] WARNING: Encryption failed, uploading unencrypted")
+                upload_path = tmp_path
+                backup_filename_enc = backup_filename
+
             # Step 3: Restart service immediately after copy
             subprocess.run(["systemctl", "start", name], timeout=30)
             service_restarted = True
             _write_backup_log(f"[{name}] Service restarted")
 
-            # Step 4: Upload to Google Drive (with one retry on failure)
+            # Step 4: Upload to Google Drive (with one retry on failure, bandwidth throttle)
             uploaded = False
             for attempt in range(2):
                 _write_backup_log(f"[{name}] Uploading to {remote_target} (attempt {attempt + 1}/2)...")
                 result = subprocess.run(
-                    ["rclone", "copy", tmp_path, remote_target],
+                    ["rclone", "copy", upload_path, remote_target, "--bwlimit", RCLONE_BWLIMIT],
                     capture_output=True, text=True, timeout=300
                 )
                 if result.returncode == 0:
-                    _write_backup_log(f"[{name}] Backup successful: {backup_filename}")
-                    logger.info(f"[{name}] GDrive backup uploaded: {backup_filename} -> {remote_target}")
-                    audit_log("GDRIVE_BACKUP_OK", name, {"filename": backup_filename, "target": remote_target})
-                    results.append(f"{name}: {backup_filename}")
+                    _write_backup_log(f"[{name}] Backup successful: {backup_filename_enc}")
+                    logger.info(f"[{name}] GDrive backup uploaded: {backup_filename_enc} -> {remote_target}")
+                    audit_log("GDRIVE_BACKUP_OK", name, {"filename": backup_filename_enc, "target": remote_target})
+                    results.append(f"{name}: {backup_filename_enc}")
                     uploaded = True
                     break
                 else:
@@ -3672,11 +3791,17 @@ def backup_gdrive_now():
                         all_ok = False
                         results.append(f"{name}: FAILED - {reason}")
 
-            # Step 5: Remove temporary file
-            try:
-                os.remove(tmp_path)
-            except OSError as e:
-                _write_backup_log(f"[{name}] WARNING: Could not remove temp file: {e}")
+            # Step 5: Clean up temporary files
+            for f in [tmp_path, tmp_path + ".enc"]:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except OSError as e:
+                        _write_backup_log(f"[{name}] WARNING: Could not remove temp file: {e}")
+
+            # Step 6: Retention — delete old backups on Drive
+            if uploaded:
+                _rclone_delete_old(remote_target)
 
         except subprocess.TimeoutExpired:
             reason = f"Command timed out for {name}"
@@ -3688,11 +3813,12 @@ def backup_gdrive_now():
                     subprocess.run(["systemctl", "start", name], timeout=30)
                 except Exception:
                     pass
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+            for f in [tmp_path, tmp_path + ".enc"]:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                except OSError:
+                    pass
             all_ok = False
             results.append(f"{name}: FAILED - {reason}")
 
@@ -3706,11 +3832,12 @@ def backup_gdrive_now():
                     subprocess.run(["systemctl", "start", name], timeout=30)
                 except Exception:
                     pass
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except OSError:
-                pass
+            for f in [tmp_path, tmp_path + ".enc"]:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                except OSError:
+                    pass
             all_ok = False
             results.append(f"{name}: FAILED - {reason}")
 
@@ -3732,6 +3859,10 @@ def backup_gdrive_now():
         audit_log("GDRIVE_BACKUP_END", "SYSTEM", {"services_count": len(services), "failed": failed, "status": "partial_fail"})
 
     _write_backup_log(summary)
+
+    # Show total Drive storage used
+    _rclone_show_size()
+
     return (all_ok, summary)
 
 
@@ -3866,7 +3997,7 @@ async def restore_from_drive():
     print(f"\n  {C_CYAN}Fetching backups from {remote_path}...{C_RESET}")
     try:
         result = subprocess.run(
-            ["rclone", "lsf", remote_path],
+            ["rclone", "lsf", remote_path, "--bwlimit", RCLONE_BWLIMIT],
             capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
@@ -3916,7 +4047,7 @@ async def restore_from_drive():
     print(f"\n  {C_CYAN}Downloading {selected_file}...{C_RESET}")
     try:
         result = subprocess.run(
-            ["rclone", "copy", remote_file, "/tmp"],
+            ["rclone", "copy", remote_file, "/tmp", "--bwlimit", RCLONE_BWLIMIT],
             capture_output=True, text=True, timeout=300
         )
         if result.returncode != 0:
@@ -3937,13 +4068,36 @@ async def restore_from_drive():
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
         return
 
-    await _do_restore(svc, local_tmp, selected_file)
+    # Decrypt if encrypted (.enc file)
+    restore_file = local_tmp
+    if selected_file.endswith(".enc"):
+        print(f"  {C_CYAN}Decrypting backup...{C_RESET}")
+        dec_path = local_tmp[:-4]  # Remove .enc extension
+        if _decrypt_file(local_tmp, dec_path):
+            restore_file = dec_path
+            _write_backup_log(f"[{name}] Backup decrypted: {dec_path}")
+            logger.info(f"[{name}] Backup decrypted for restore")
+        else:
+            print_status("Decryption failed — check encryption key", "error")
+            logger.error(f"[{name}] Restore decryption failed")
+            audit_log("RESTORE_DRIVE_FAIL", name, {"error": "decryption_failed"})
+            try:
+                os.remove(local_tmp)
+            except OSError:
+                pass
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
 
-    # Clean up downloaded file
-    try:
-        os.remove(local_tmp)
-    except OSError:
-        pass
+    display_name = selected_file.replace(".enc", "") if selected_file.endswith(".enc") else selected_file
+    await _do_restore(svc, restore_file, display_name)
+
+    # Clean up downloaded and decrypted files
+    for f in [local_tmp, restore_file]:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except OSError:
+            pass
 
 
 async def _do_restore(svc, backup_path, filename):
@@ -4100,7 +4254,7 @@ async def offload_backup(file_path: str, config: Dict):
             # BatchMode=yes prevents hanging on password prompts
             cmd = ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", file_path, config['target']]
         else:
-            cmd = ["rclone", "copy", file_path, config['target']]
+            cmd = ["rclone", "copy", file_path, config['target'], "--bwlimit", RCLONE_BWLIMIT]
             
         process = await asyncio.create_subprocess_exec(*cmd)
         await process.wait()
