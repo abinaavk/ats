@@ -651,6 +651,56 @@ def run_root(cmd: List[str], timeout: int = 60):
     logger.info(f"EXEC(ROOT): {' '.join(cmd)}")
     subprocess.check_call(cmd, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float = 1.0):
+    """
+    Restart cloudflared, tolerating systemd's own Restart=on-failure self-healing.
+
+    'systemctl restart cloudflared' can return a non-zero exit code if the
+    *first* start attempt inside that restart cycle exceeds TimeoutStartSec
+    (cloudflared's connectivity pre-checks / QUIC registration can take a few
+    seconds on slower hardware), even though systemd's Restart=on-failure
+    policy brings the service back up moments later on its own. Treating that
+    first non-zero exit as fatal causes false-positive deploy failures and
+    rollbacks even when the tunnel ends up healthy. Instead, poll
+    'systemctl is-active' for a short window before giving up, and only raise
+    (with real diagnostics attached) if it truly never comes up.
+    """
+    logger.info("EXEC(ROOT): systemctl restart cloudflared")
+    result = subprocess.run(
+        ["systemctl", "restart", "cloudflared"],
+        timeout=60, capture_output=True, text=True
+    )
+
+    if result.returncode == 0:
+        return
+
+    logger.warning(
+        f"systemctl restart cloudflared returned {result.returncode} "
+        f"(stderr: {result.stderr.strip()[:300]}) — polling for self-recovery via "
+        f"systemd Restart=on-failure..."
+    )
+
+    deadline = time.time() + poll_timeout
+    while time.time() < deadline:
+        if check_systemd_active("cloudflared"):
+            logger.info("cloudflared recovered on its own after the initial restart attempt timed out")
+            return
+        time.sleep(poll_interval)
+
+    try:
+        journal = subprocess.run(
+            ["journalctl", "-u", "cloudflared", "-n", "20", "--no-pager"],
+            capture_output=True, text=True, timeout=10
+        ).stdout
+    except Exception:
+        journal = "(could not read journalctl)"
+
+    raise RuntimeError(
+        f"cloudflared did not become active within {poll_timeout}s after restart.\n"
+        f"stderr: {result.stderr.strip()[:300]}\n"
+        f"Recent journal:\n{journal[-1500:]}"
+    )
+
 def get_service_path(storage: str, name: str) -> str:
     """
     Intelligently determines service path.
@@ -753,7 +803,7 @@ class CloudflareManager:
         if os.path.exists(self.backup_path):
             shutil.copy(self.backup_path, self.config_path)
             try:
-                run_root(["systemctl", "restart", "cloudflared"])
+                restart_cloudflared_resilient()
             except:
                 pass
 
@@ -790,7 +840,7 @@ class CloudflareManager:
             with open(self.config_path, 'w') as f:
                 yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
-            run_root(["systemctl", "restart", "cloudflared"])
+            restart_cloudflared_resilient()
             logger.info(f"Cloudflare route added: {domain} -> {port}")
 
         except Exception as e:
@@ -819,7 +869,7 @@ class CloudflareManager:
             with open(self.config_path, 'w') as f:
                 yaml.dump(config, f, sort_keys=False, default_flow_style=False)
 
-            run_root(["systemctl", "restart", "cloudflared"])
+            restart_cloudflared_resilient()
             logger.info(f"Cloudflare route removed: {domain}")
 
         except Exception as e:
