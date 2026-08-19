@@ -38,6 +38,18 @@ try:
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
+# --- ROOT PRIVILEGE CHECK ---
+# Must happen before any config loading below: the first-run config wizard
+# writes to /etc/ats/config.yml, and DatabaseManager (further down) opens a
+# database file under ATS_HOME. Both need root. Checking here, before either
+# runs, means a non-root user gets the clear error immediately instead of
+# being walked through the entire interactive wizard only to hit a raw
+# PermissionError crash at the very end.
+if os.geteuid() != 0:
+    print("ERROR: ATS requires root privileges.")
+    print(f"Run: sudo python3 {sys.argv[0] if len(sys.argv) else 'ats.py'}")
+    sys.exit(1)
+
 # ==============================================================================
 #   CONFIGURATION KERNEL  (universal / auto-detecting)
 # ==============================================================================
@@ -138,24 +150,32 @@ def _ats_first_run_wizard(cfg: Dict) -> Dict:
     print("=" * 70)
     print(f"{_W_RESET}")
 
-    detected_user = _ats_detect_service_user()
-    service_user = input(f"  Service user to run apps as [{detected_user}]: ").strip() or detected_user
+    try:
+        detected_user = _ats_detect_service_user()
+        service_user = input(f"  Service user to run apps as [{detected_user}]: ").strip() or detected_user
 
-    while True:
-        main_domain = input("  Primary domain for subdomain deployments (e.g. example.com): ").strip()
-        if re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", main_domain):
-            break
-        print(f"  {_W_YELLOW}Invalid domain format, try again.{_W_RESET}")
+        while True:
+            main_domain = input("  Primary domain for subdomain deployments (e.g. example.com): ").strip()
+            if re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", main_domain):
+                break
+            print(f"  {_W_YELLOW}Invalid domain format, try again.{_W_RESET}")
 
-    detected_storage = _ats_detect_default_storage()
-    default_storage = input(f"  Default storage root for deployed apps [{detected_storage}]: ").strip() or detected_storage
+        detected_storage = _ats_detect_default_storage()
+        default_storage = input(f"  Default storage root for deployed apps [{detected_storage}]: ").strip() or detected_storage
 
-    detected_cf = _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
-    cloudflare_config = input(f"  Cloudflare Tunnel config path [{detected_cf}]: ").strip() or detected_cf
+        detected_cf = _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
+        cloudflare_config = input(f"  Cloudflare Tunnel config path [{detected_cf}]: ").strip() or detected_cf
 
-    default_ats_home = f"/home/{service_user}/ats"
-    ats_home_input = input(f"  ATS home directory (db/logs) [{default_ats_home}]: ").strip()
-    ats_home = ats_home_input or default_ats_home
+        default_ats_home = f"/home/{service_user}/ats"
+        ats_home_input = input(f"  ATS home directory (db/logs) [{default_ats_home}]: ").strip()
+        ats_home = ats_home_input or default_ats_home
+    except EOFError:
+        print(
+            f"\n{_W_YELLOW}No interactive terminal available to complete first-run setup.{_W_RESET}\n"
+            f"Run 'sudo python3 {sys.argv[0] if sys.argv else 'ats.py'}' manually once, interactively, "
+            f"to create {CONFIG_FILE} -- then --daemon/systemd/cron runs will use it automatically.\n"
+        )
+        sys.exit(1)
 
     resolved = {
         "service_user": service_user,
@@ -212,6 +232,15 @@ DB_FILE = os.path.join(ATS_HOME, "ats.db")
 LOG_FILE = os.path.join(ATS_HOME, "ats.log")
 AUDIT_FILE = os.path.join(ATS_HOME, "audit.trace")
 METRICS_FILE = os.path.join(ATS_HOME, "metrics.prom")
+
+# Must exist before logging.FileHandler(LOG_FILE) and DatabaseManager(DB_FILE)
+# below try to open files inside it -- both run at import time, well before
+# __main__'s own os.makedirs(ATS_HOME) call further down in the file.
+os.makedirs(ATS_HOME, exist_ok=True)
+try:
+    os.chmod(ATS_HOME, 0o700)
+except Exception:
+    pass
 
 # --- Dynamic Locking ---
 IS_DAEMON = "--daemon" in sys.argv
@@ -449,6 +478,7 @@ class DatabaseManager:
 
     def query(self, sql: str, args=(), fetch_all=False, fetch_one=False):
         """Execute database query with error handling"""
+        conn = None
         try:
             conn = sqlite3.connect(self.db_path, timeout=30)
             conn.execute("PRAGMA journal_mode=WAL")
@@ -465,13 +495,22 @@ class DatabaseManager:
             else:
                 conn.commit()
 
-            conn.close()
             return res
         except sqlite3.Error as e:
             logger.error(f"DB Error: {e}")
             logger.error(f"SQL: {sql}")
             logger.error(f"Args: {args}")
-            return None
+            # Return a safe empty list (not None) for fetch_all so the many
+            # call sites that do `for x in db.query(..., fetch_all=True)`
+            # degrade to "no rows" on a transient DB error instead of
+            # crashing with "TypeError: NoneType is not iterable".
+            return [] if fetch_all else None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 db = DatabaseManager(DB_FILE)
 
@@ -622,34 +661,57 @@ def acquire_lock():
         sys.exit(1)
 
 def run_as_gaia(cmd: List[str], cwd: Optional[str] = None, timeout: int = 300, capture: bool = False):
-    """Execute command as gaia user"""
+    """
+    Execute command as the configured SERVICE_USER.
+
+    Output is always captured internally (previously discarded to DEVNULL
+    when capture=False), so that on failure the real stderr/stdout is
+    attached to the raised error instead of a bare "Command failed" with no
+    diagnostic info. This does not change what's printed to the terminal on
+    success — non-capture callers never streamed live output either way.
+    """
     env = os.environ.copy()
     env["HOME"] = f"/home/{SERVICE_USER}"
     full_cmd = ["sudo", "-u", SERVICE_USER] + cmd
     logger.info(f"EXEC(GAIA): {' '.join(cmd)}")
 
     try:
-        if capture:
-            result = subprocess.run(
-                full_cmd, cwd=cwd, env=env, timeout=timeout,
-                capture_output=True, text=True
-            )
-            return result.returncode, result.stdout, result.stderr
-        else:
-            subprocess.check_call(
-                full_cmd, cwd=cwd, env=env, timeout=timeout,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            return 0, "", ""
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+        result = subprocess.run(
+            full_cmd, cwd=cwd, env=env, timeout=timeout,
+            capture_output=True, text=True
+        )
+
+        if result.returncode != 0:
+            stderr_tail = (result.stderr or "").strip()[-1000:]
+            stdout_tail = (result.stdout or "").strip()[-500:]
+            detail = stderr_tail or stdout_tail or "(command produced no output)"
+            logger.error(f"Command failed: {' '.join(cmd)}\n{detail}")
+            if capture:
+                return result.returncode, result.stdout, result.stderr
+            raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{detail}")
+
+        return result.returncode, result.stdout, result.stderr
+
     except subprocess.TimeoutExpired:
         raise TimeoutError(f"Command timeout: {' '.join(cmd)}")
 
 def run_root(cmd: List[str], timeout: int = 60):
-    """Execute command as root"""
+    """
+    Execute command as root.
+
+    Like run_as_gaia, output is always captured so a failure raises with the
+    real stderr attached instead of a bare CalledProcessError with no
+    message — the class of bug that made the earlier venv-creation and
+    cloudflared-restart failures hard to diagnose from ATS's own output.
+    """
     logger.info(f"EXEC(ROOT): {' '.join(cmd)}")
-    subprocess.check_call(cmd, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or "").strip()[-1000:]
+        stdout_tail = (result.stdout or "").strip()[-500:]
+        detail = stderr_tail or stdout_tail or "(command produced no output)"
+        logger.error(f"Command failed: {' '.join(cmd)}\n{detail}")
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{detail}")
 
 def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float = 1.0,
                                    max_attempts: int = 3, backoff_seconds: Tuple[int, ...] = (10, 20, 30)):
@@ -820,7 +882,14 @@ class CloudflareManager:
         if os.path.exists(self.backup_path):
             shutil.copy(self.backup_path, self.config_path)
             try:
-                restart_cloudflared_resilient()
+                # Single fast attempt only: the caller (add_route/remove_route)
+                # already exhausted its own full retry budget before reaching
+                # here, so doubling that wait would just delay surfacing the
+                # real error. This call is best-effort (failure is swallowed
+                # below) -- if cloudflared genuinely can't come up right now,
+                # it'll pick the restored config back up on its own once
+                # connectivity returns, via Restart=on-failure.
+                restart_cloudflared_resilient(max_attempts=1, poll_timeout=15)
             except:
                 pass
 
@@ -1358,11 +1427,26 @@ async def deploy_service_async():
         time.sleep(10)
 
         print_status("CONFIGURING CLOUDFLARE TUNNEL", "info")
+        cloudflare_route_ok = True
+        cloudflare_error = None
         try:
             cloudflare.add_route(domain, port)
             print_status(f"Route added: {domain} -> localhost:{port}", "success")
         except Exception as e:
-            raise RuntimeError(f"Failed to configure Cloudflare: {e}")
+            # A tunnel/network outage here does NOT mean the deployment itself
+            # failed -- the app already passed its health check and is running.
+            # Rolling back (and deleting venv/code/systemd unit/db dir) over a
+            # transient Cloudflare problem destroys a working service to "fix"
+            # a networking issue that retrying won't solve anyway. Register the
+            # service and let the operator retry just the route once
+            # connectivity is back, without redoing the whole deploy.
+            cloudflare_route_ok = False
+            cloudflare_error = str(e)
+            logger.error(f"Cloudflare route configuration failed (deployment continuing): {cloudflare_error}")
+            print_status(f"Cloudflare route configuration FAILED: {cloudflare_error}", "error")
+            print(f"\n{C_YELLOW}Service is running locally on port {port} but not yet reachable via {domain}.{C_RESET}")
+            print(f"{C_YELLOW}Retry once connectivity is confirmed: Service Operations -> Update Configuration "
+                  f"-> Domain Swap (same domain re-adds the route without touching the app).{C_RESET}\n")
 
         # ========== DATABASE RECORD ==========
         print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
@@ -1432,23 +1516,32 @@ async def deploy_service_async():
             raise RuntimeError(f"Service deployed but database registration failed: {db_error}")
 
         if PROMETHEUS_AVAILABLE:
-            DEPLOY_COUNTER.labels(status='success').inc()
+            DEPLOY_COUNTER.labels(status='success' if cloudflare_route_ok else 'partial').inc()
             DEPLOY_DURATION.observe(duration)
 
-        audit_log("DEPLOY_SUCCESS", name, {
+        audit_log("DEPLOY_SUCCESS" if cloudflare_route_ok else "DEPLOY_PARTIAL_CLOUDFLARE_FAILED", name, {
             "domain": domain,
             "port": port,
             "duration": duration,
-            "workers": config.workers
+            "workers": config.workers,
+            "cloudflare_route_ok": cloudflare_route_ok,
+            **({"cloudflare_error": cloudflare_error} if not cloudflare_route_ok else {})
         })
 
         # ========== SUCCESS MESSAGE ==========
-        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
-        print(f"{C_GREEN}{C_BOLD}✓ DEPLOYMENT SUCCESSFUL{C_RESET}")
-        print(f"{C_GREEN}{'=' * 70}{C_RESET}")
+        if cloudflare_route_ok:
+            print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
+            print(f"{C_GREEN}{C_BOLD}✓ DEPLOYMENT SUCCESSFUL{C_RESET}")
+            print(f"{C_GREEN}{'=' * 70}{C_RESET}")
+        else:
+            print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
+            print(f"{C_YELLOW}{C_BOLD}⚠ DEPLOYMENT PARTIALLY SUCCESSFUL — Cloudflare route pending{C_RESET}")
+            print(f"{C_YELLOW}{'=' * 70}{C_RESET}")
+            print(f"{C_YELLOW}The application is running and registered, but is not yet reachable{C_RESET}")
+            print(f"{C_YELLOW}via https://{domain} until the tunnel route is retried successfully.{C_RESET}")
         print(f"\n{C_CYAN}Service Details:{C_RESET}")
         print(f"  {C_BOLD}Name:{C_RESET}       {name}")
-        print(f"  {C_BOLD}Domain:{C_RESET}     https://{domain}")
+        print(f"  {C_BOLD}Domain:{C_RESET}     https://{domain}" + ("" if cloudflare_route_ok else f"  {C_YELLOW}(route not active yet){C_RESET}"))
         print(f"  {C_BOLD}Port:{C_RESET}       {port}")
         print(f"  {C_BOLD}Workers:{C_RESET}    {config.workers}")
         print(f"  {C_BOLD}Memory:{C_RESET}     {max_memory}MB")
@@ -1458,7 +1551,12 @@ async def deploy_service_async():
         print(f"  {C_BOLD}Code:{C_RESET}       {api_dir}")
         print(f"  {C_BOLD}Database:{C_RESET}   {db_dir}")
         print(f"  {C_BOLD}Logs:{C_RESET}       {log_dir}")
-        print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
+        if cloudflare_route_ok:
+            print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
+        else:
+            print(f"\n{C_YELLOW}Retry the route: Service Operations -> Update Configuration -> Domain Swap "
+                  f"(enter the same domain: {domain}){C_RESET}")
+            print(f"{C_YELLOW}{'=' * 70}{C_RESET}\n")
 
     except Exception as e:
         logger.error(f"Deployment failed: {e}")
@@ -6225,11 +6323,6 @@ async def get_telemetry_async() -> Tuple[float, str, str, int]:
 async def auto_backup_scheduler():
     """Background task to backup all services every day at 12:00 AM"""
     if getattr(auto_backup_scheduler, "started", False):
-        logger.warning("Auto-backup scheduler already running — skipping duplicate start")
-        return
-    auto_backup_scheduler.started = True
-
-    if getattr(auto_backup_scheduler, "started", False):
         logger.warning("auto_backup_scheduler: already running — skipping duplicate start")
         return
     auto_backup_scheduler.started = True
@@ -6251,18 +6344,29 @@ async def auto_backup_scheduler():
             logger.info("Triggering scheduled midnight backup for all services...")
             audit_log("SCHEDULED_BACKUP_START", "SYSTEM")
             services = db.query("SELECT * FROM services", fetch_all=True)
-            
-            if services:
-                backup_file = create_local_backup(svc)
-                if backup_file:
-                    # Check for remote offloading
-                    config = db.query("SELECT * FROM remote_configs WHERE service_name=?", (svc['name'],),
-                                      fetch_one=True)
-                    if config and config['auto_offload']:
-                        await offload_backup(backup_file, config)
 
-                logger.info(f"Midnight backup completed for {len(services)} services.")
-                audit_log("SCHEDULED_BACKUP_END", "SYSTEM", {"services_count": len(services)})
+            if services:
+                loop = asyncio.get_running_loop()
+                backed_up = 0
+                for svc in services:
+                    try:
+                        backup_file = await loop.run_in_executor(None, create_local_backup, svc)
+                        if backup_file:
+                            backed_up += 1
+                            # Check for remote offloading
+                            config = db.query(
+                                "SELECT * FROM remote_configs WHERE service_name=?",
+                                (svc['name'],), fetch_one=True
+                            )
+                            if config and config['auto_offload']:
+                                await offload_backup(backup_file, config)
+                    except Exception as svc_err:
+                        # One bad service shouldn't abort the rest of the run
+                        logger.error(f"[{svc['name']}] Scheduled backup failed: {svc_err}")
+                        audit_log("SCHEDULED_BACKUP_SERVICE_FAILED", svc['name'], {"error": str(svc_err)})
+
+                logger.info(f"Midnight backup completed: {backed_up}/{len(services)} services backed up.")
+                audit_log("SCHEDULED_BACKUP_END", "SYSTEM", {"services_count": len(services), "backed_up": backed_up})
             else:
                 logger.info("No services found for scheduled backup.")
                 audit_log("SCHEDULED_BACKUP_SKIP", "SYSTEM", {"reason": "no_services"})
