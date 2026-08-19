@@ -651,41 +651,57 @@ def run_root(cmd: List[str], timeout: int = 60):
     logger.info(f"EXEC(ROOT): {' '.join(cmd)}")
     subprocess.check_call(cmd, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float = 1.0):
+def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float = 1.0,
+                                   max_attempts: int = 3, backoff_seconds: Tuple[int, ...] = (10, 20, 30)):
     """
-    Restart cloudflared, tolerating systemd's own Restart=on-failure self-healing.
+    Restart cloudflared, tolerating both:
 
-    'systemctl restart cloudflared' can return a non-zero exit code if the
-    *first* start attempt inside that restart cycle exceeds TimeoutStartSec
-    (cloudflared's connectivity pre-checks / QUIC registration can take a few
-    seconds on slower hardware), even though systemd's Restart=on-failure
-    policy brings the service back up moments later on its own. Treating that
-    first non-zero exit as fatal causes false-positive deploy failures and
-    rollbacks even when the tunnel ends up healthy. Instead, poll
-    'systemctl is-active' for a short window before giving up, and only raise
-    (with real diagnostics attached) if it truly never comes up.
+      (a) systemd's own Restart=on-failure self-healing after a single slow
+          start (poll 'systemctl is-active' briefly before treating a
+          non-zero restart exit as fatal), and
+
+      (b) longer transient blips (observed on resource-constrained hardware,
+          e.g. a Raspberry Pi doing heavy git/pip work right before this
+          runs) where cloudflared's connectivity precheck keeps failing for
+          up to a couple of minutes and a single restart+poll isn't enough.
+          For this, the restart itself is retried up to `max_attempts` times
+          with increasing backoff between attempts.
+
+    Only raises (with real diagnostics attached) if cloudflared still isn't
+    active after all attempts are exhausted.
     """
-    logger.info("EXEC(ROOT): systemctl restart cloudflared")
-    result = subprocess.run(
-        ["systemctl", "restart", "cloudflared"],
-        timeout=60, capture_output=True, text=True
-    )
+    last_result = None
+    for attempt in range(1, max_attempts + 1):
+        logger.info(f"EXEC(ROOT): systemctl restart cloudflared (attempt {attempt}/{max_attempts})")
+        result = subprocess.run(
+            ["systemctl", "restart", "cloudflared"],
+            timeout=60, capture_output=True, text=True
+        )
+        last_result = result
 
-    if result.returncode == 0:
-        return
-
-    logger.warning(
-        f"systemctl restart cloudflared returned {result.returncode} "
-        f"(stderr: {result.stderr.strip()[:300]}) — polling for self-recovery via "
-        f"systemd Restart=on-failure..."
-    )
-
-    deadline = time.time() + poll_timeout
-    while time.time() < deadline:
-        if check_systemd_active("cloudflared"):
-            logger.info("cloudflared recovered on its own after the initial restart attempt timed out")
+        if result.returncode == 0:
             return
-        time.sleep(poll_interval)
+
+        logger.warning(
+            f"systemctl restart cloudflared returned {result.returncode} "
+            f"(stderr: {result.stderr.strip()[:300]}) — polling for self-recovery via "
+            f"systemd Restart=on-failure..."
+        )
+
+        deadline = time.time() + poll_timeout
+        while time.time() < deadline:
+            if check_systemd_active("cloudflared"):
+                logger.info(f"cloudflared recovered on its own after restart attempt {attempt}")
+                return
+            time.sleep(poll_interval)
+
+        if attempt < max_attempts:
+            wait = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+            logger.warning(
+                f"cloudflared still not active after attempt {attempt}/{max_attempts} "
+                f"(poll_timeout={poll_timeout}s) — waiting {wait}s before retrying restart..."
+            )
+            time.sleep(wait)
 
     try:
         journal = subprocess.run(
@@ -696,8 +712,9 @@ def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float =
         journal = "(could not read journalctl)"
 
     raise RuntimeError(
-        f"cloudflared did not become active within {poll_timeout}s after restart.\n"
-        f"stderr: {result.stderr.strip()[:300]}\n"
+        f"cloudflared did not become active after {max_attempts} restart attempts "
+        f"(~{sum(backoff_seconds[:max_attempts-1]) + poll_timeout * max_attempts}s total).\n"
+        f"stderr: {last_result.stderr.strip()[:300] if last_result else 'n/a'}\n"
         f"Recent journal:\n{journal[-1500:]}"
     )
 
@@ -1330,6 +1347,16 @@ async def deploy_service_async():
             raise RuntimeError("Service failed to pass health checks")
 
         # ========== CLOUDFLARE TUNNEL ==========
+        # Brief settle pause: the git clone + dependency installs just above are a
+        # burst of CPU/network activity. On resource-constrained hosts (e.g. a
+        # Raspberry Pi) that burst can transiently interfere with cloudflared's
+        # connectivity precheck if we hit it immediately afterward. This is cheap
+        # insurance, not a fix for a real outage — restart_cloudflared_resilient()
+        # still retries with backoff and will fail loudly if the tunnel is
+        # actually down.
+        print_status("Settling before Cloudflare configuration...", "info")
+        time.sleep(10)
+
         print_status("CONFIGURING CLOUDFLARE TUNNEL", "info")
         try:
             cloudflare.add_route(domain, port)
