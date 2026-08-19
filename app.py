@@ -39,10 +39,175 @@ except ImportError:
     PROMETHEUS_AVAILABLE = False
 
 # ==============================================================================
-#   CONFIGURATION KERNEL
+#   CONFIGURATION KERNEL  (universal / auto-detecting)
 # ==============================================================================
+#
+# All server-specific values below are resolved in this priority order:
+#   1. /etc/ats/config.yml         (persisted after first run on this box)
+#   2. Environment variables       (ATS_SERVICE_USER, ATS_MAIN_DOMAIN, etc.)
+#   3. Auto-detection              (sudo user, existing cloudflared config, disk)
+#   4. Interactive first-run wizard (only for values with no safe default,
+#      e.g. the primary domain)
+#
+# This means the same script file can be copied to any server and will adapt
+# itself instead of needing constants hand-edited per-deployment.
 
-ATS_HOME = "/home/gaia/ats"
+CONFIG_FILE = "/etc/ats/config.yml"
+
+_ATS_ENV_MAP = {
+    "service_user": "ATS_SERVICE_USER",
+    "main_domain": "ATS_MAIN_DOMAIN",
+    "default_storage": "ATS_DEFAULT_STORAGE",
+    "cloudflare_config": "ATS_CLOUDFLARE_CONFIG",
+    "ats_home": "ATS_HOME",
+}
+
+# Bare ANSI codes (duplicated here, not imported from the VISUAL STYLING
+# block below) so the wizard can run before that block is defined.
+_W_RESET = "\033[0m"
+_W_BOLD = "\033[1m"
+_W_CYAN = "\033[96m"
+_W_YELLOW = "\033[93m"
+_W_GREEN = "\033[92m"
+
+
+def _ats_detect_service_user() -> str:
+    """Best-effort guess at the non-root user that should own deployed services."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        return sudo_user
+    try:
+        import pwd
+        candidates = [p.pw_name for p in pwd.getpwall() if 1000 <= p.pw_uid < 60000]
+        if candidates:
+            return sorted(candidates)[0]
+    except Exception:
+        pass
+    return "gaia"
+
+
+def _ats_detect_cloudflare_config() -> Optional[str]:
+    for candidate in ("/etc/cloudflared/config.yml", "/root/.cloudflared/config.yml"):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _ats_detect_default_storage() -> str:
+    for candidate in ("/opt", "/srv", "/data"):
+        if os.path.exists(candidate) and os.access(candidate, os.W_OK):
+            return candidate
+    return "/opt"
+
+
+def _ats_load_config_file() -> Dict:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"WARNING: Could not read {CONFIG_FILE}: {e}")
+    return {}
+
+
+def _ats_save_config_file(cfg: Dict):
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        yaml.dump(cfg, f, sort_keys=False, default_flow_style=False)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def _ats_resolve_value(key: str, cfg: Dict):
+    """config file > env var > None"""
+    if cfg.get(key):
+        return cfg[key]
+    env_key = _ATS_ENV_MAP.get(key)
+    if env_key and os.environ.get(env_key):
+        return os.environ[env_key]
+    return None
+
+
+def _ats_first_run_wizard(cfg: Dict) -> Dict:
+    """Interactively fill in anything still missing, save, and return the config."""
+    print(f"{_W_CYAN}{_W_BOLD}")
+    print("=" * 70)
+    print("  ATS FIRST-RUN SETUP -- this server has no /etc/ats/config.yml yet")
+    print("=" * 70)
+    print(f"{_W_RESET}")
+
+    detected_user = _ats_detect_service_user()
+    service_user = input(f"  Service user to run apps as [{detected_user}]: ").strip() or detected_user
+
+    while True:
+        main_domain = input("  Primary domain for subdomain deployments (e.g. example.com): ").strip()
+        if re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", main_domain):
+            break
+        print(f"  {_W_YELLOW}Invalid domain format, try again.{_W_RESET}")
+
+    detected_storage = _ats_detect_default_storage()
+    default_storage = input(f"  Default storage root for deployed apps [{detected_storage}]: ").strip() or detected_storage
+
+    detected_cf = _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
+    cloudflare_config = input(f"  Cloudflare Tunnel config path [{detected_cf}]: ").strip() or detected_cf
+
+    default_ats_home = f"/home/{service_user}/ats"
+    ats_home_input = input(f"  ATS home directory (db/logs) [{default_ats_home}]: ").strip()
+    ats_home = ats_home_input or default_ats_home
+
+    resolved = {
+        "service_user": service_user,
+        "service_group": service_user,
+        "main_domain": main_domain,
+        "default_storage": default_storage,
+        "cloudflare_config": cloudflare_config,
+        "ats_home": ats_home,
+    }
+
+    _ats_save_config_file(resolved)
+    print(f"\n{_W_GREEN}  Saved to {CONFIG_FILE} -- future runs on this server will use these automatically.{_W_RESET}\n")
+    time.sleep(1.5)
+    return resolved
+
+
+def load_ats_config() -> Dict:
+    cfg = _ats_load_config_file()
+    resolved = {}
+    needs_wizard = False
+
+    for key in ("service_user", "main_domain", "default_storage", "cloudflare_config", "ats_home"):
+        val = _ats_resolve_value(key, cfg)
+        if val:
+            resolved[key] = val
+            continue
+
+        if key == "service_user":
+            resolved[key] = _ats_detect_service_user()
+        elif key == "cloudflare_config":
+            resolved[key] = _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
+        elif key == "default_storage":
+            resolved[key] = _ats_detect_default_storage()
+        else:
+            # main_domain / ats_home have no safe auto-detected default
+            needs_wizard = True
+
+    if needs_wizard:
+        resolved = _ats_first_run_wizard(cfg)
+    else:
+        resolved.setdefault("service_group", resolved["service_user"])
+        if not resolved.get("ats_home"):
+            resolved["ats_home"] = f"/home/{resolved['service_user']}/ats"
+        if not os.path.exists(CONFIG_FILE):
+            _ats_save_config_file(resolved)
+
+    return resolved
+
+
+_ats_cfg = load_ats_config()
+
+ATS_HOME = _ats_cfg["ats_home"]
 DB_FILE = os.path.join(ATS_HOME, "ats.db")
 LOG_FILE = os.path.join(ATS_HOME, "ats.log")
 AUDIT_FILE = os.path.join(ATS_HOME, "audit.trace")
@@ -53,22 +218,24 @@ IS_DAEMON = "--daemon" in sys.argv
 LOCK_FILE = f"/tmp/ats_{'daemon' if IS_DAEMON else 'cli'}.lock"
 
 
-SERVICE_USER = "gaia"
-SERVICE_GROUP = "gaia"
-MAIN_DOMAIN = "gaiasentinel.online"
-CLOUDFLARE_CONFIG = "/etc/cloudflared/config.yml"
-DEFAULT_STORAGE = "/opt"
+SERVICE_USER = _ats_cfg["service_user"]
+SERVICE_GROUP = _ats_cfg.get("service_group", SERVICE_USER)
+MAIN_DOMAIN = _ats_cfg["main_domain"]
+CLOUDFLARE_CONFIG = _ats_cfg["cloudflare_config"]
+DEFAULT_STORAGE = _ats_cfg["default_storage"]
 BACKUP_DIR = os.path.join(DEFAULT_STORAGE, "backups")
 
 # --- Google Drive Backup (rclone) ---
-HEYGAIA_DB = "/opt/api/heygaia/gaia.db"
-GDRIVE_REMOTE = "gdrive"
-GDRIVE_FOLDER = "gdrive:backups"
-HEYGAIA_LOG_DIR = "/opt/api/heygaia/logs"
-BACKUP_LOG = os.path.join(HEYGAIA_LOG_DIR, "backup.log")
-GDRIVE_RETENTION_DAYS = 7
-RCLONE_BWLIMIT = "5M"
-ENCRYPTION_KEY_FILE = "/opt/api/heygaia/.backup_key"
+# Generalized: no longer tied to one specific deployed app. Logs and the
+# encryption key now live under ATS_HOME, which is unique per server,
+# instead of a hardcoded path under one particular app's directory.
+GDRIVE_REMOTE = os.environ.get("ATS_GDRIVE_REMOTE", "gdrive")
+GDRIVE_FOLDER = f"{GDRIVE_REMOTE}:backups"
+ATS_LOG_DIR = os.path.join(ATS_HOME, "logs")
+BACKUP_LOG = os.path.join(ATS_LOG_DIR, "backup.log")
+GDRIVE_RETENTION_DAYS = int(os.environ.get("ATS_GDRIVE_RETENTION_DAYS", "7"))
+RCLONE_BWLIMIT = os.environ.get("ATS_RCLONE_BWLIMIT", "5M")
+ENCRYPTION_KEY_FILE = os.path.join(ATS_HOME, ".backup_key")
 
 BLOCKED_PATHS = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/root", "/run", "/sys", "/usr", "/var"]
 
@@ -700,7 +867,7 @@ def generate_systemd_service(config: ServiceConfig, api_dir: str, log_dir: str, 
 Description={config.name} API [ATS v7.0 MANAGED]
 After=network-online.target
 Wants=network-online.target
-Documentation=https://gaiasentinel.online/docs/{config.name}
+Documentation=https://{MAIN_DOMAIN}/docs/{config.name}
 
 [Service]
 Type=simple
@@ -3352,7 +3519,7 @@ def update_service_config(name: str):
                 with open(svc_file, 'r') as f:
                     content = f.read()
 
-                content = content.replace(f"https://gaiasentinel.online/docs/{svc['name']}", f"https://gaiasentinel.online/docs/{new_domain}")
+                content = content.replace(f"https://{MAIN_DOMAIN}/docs/{svc['name']}", f"https://{MAIN_DOMAIN}/docs/{new_domain}")
                 # Note: The above is just a documentation line in the generated service file
 
                 with open(svc_file, 'w') as f:
@@ -3559,7 +3726,7 @@ def create_local_backup(svc):
 def _write_backup_log(msg):
     """Append a timestamped line to the backup log file"""
     try:
-        os.makedirs(HEYGAIA_LOG_DIR, exist_ok=True)
+        os.makedirs(ATS_LOG_DIR, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(BACKUP_LOG, "a") as f:
             f.write(f"[{ts}] {msg}\n")
