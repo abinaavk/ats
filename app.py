@@ -55,7 +55,8 @@ if os.geteuid() != 0:
 # ==============================================================================
 #
 # All server-specific values below are resolved in this priority order:
-#   1. /etc/ats/config.yml         (persisted after first run on this box)
+#   1. /etc/ats/config.yml         (persisted after first run on this box,
+#                                    or wherever ATS_CONFIG_FILE points)
 #   2. Environment variables       (ATS_SERVICE_USER, ATS_MAIN_DOMAIN, etc.)
 #   3. Auto-detection              (sudo user, existing cloudflared config, disk)
 #   4. Interactive first-run wizard (only for values with no safe default,
@@ -63,8 +64,33 @@ if os.geteuid() != 0:
 #
 # This means the same script file can be copied to any server and will adapt
 # itself instead of needing constants hand-edited per-deployment.
+#
+# Running multiple independent instances of ATS on the same box (e.g. one
+# clone per project) requires each to have its own config file -- otherwise
+# every clone silently shares one ATS_HOME, one database, one set of logs,
+# regardless of which copy of the code actually gets run. Two ways to select
+# which instance a given run uses, in priority order:
+#   1. ATS_CONFIG_FILE=/path/to/config.yml   (explicit full path)
+#   2. ATS_INSTANCE=btgr                     (short name -> /etc/ats/config-btgr.yml)
+# Neither set -> the default single-instance path, /etc/ats/config.yml.
+# First-run setup (below) will also offer to pick an instance name
+# interactively and create a launcher shortcut for it, so this doesn't need
+# to be known/typed in advance.
 
-CONFIG_FILE = "/etc/ats/config.yml"
+_ATS_CONFIG_DIR = "/etc/ats"
+
+def _ats_resolve_config_file() -> str:
+    explicit = os.environ.get("ATS_CONFIG_FILE")
+    if explicit:
+        return explicit
+    instance = os.environ.get("ATS_INSTANCE")
+    if instance:
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "", instance)
+        if safe:
+            return os.path.join(_ATS_CONFIG_DIR, f"config-{safe}.yml")
+    return os.path.join(_ATS_CONFIG_DIR, "config.yml")
+
+CONFIG_FILE = _ats_resolve_config_file()
 
 _ATS_ENV_MAP = {
     "service_user": "ATS_SERVICE_USER",
@@ -144,31 +170,71 @@ def _ats_resolve_value(key: str, cfg: Dict):
 
 def _ats_first_run_wizard(cfg: Dict) -> Dict:
     """Interactively fill in anything still missing, save, and return the config."""
+    global CONFIG_FILE
+
     print(f"{_W_CYAN}{_W_BOLD}")
     print("=" * 70)
     print("  ATS FIRST-RUN SETUP -- this server has no /etc/ats/config.yml yet")
     print("=" * 70)
     print(f"{_W_RESET}")
 
+    instance_name = None
+    env_instance = os.environ.get("ATS_INSTANCE")
     try:
-        detected_user = _ats_detect_service_user()
+        # Only ask if the caller hasn't already picked an instance via
+        # ATS_CONFIG_FILE or ATS_INSTANCE -- e.g. a second clone of this
+        # script on the same box (a separate ~/ats-btgr checkout) needs its
+        # own isolated config/database/logs, not the shared default one.
+        # Naming it here means future launches just need
+        # 'ATS_INSTANCE=<name> sudo python3 ats.py' -- no need to have known
+        # about that env var in advance.
+        if not os.environ.get("ATS_CONFIG_FILE") and not env_instance:
+            print(f"  {_W_CYAN}Running more than one independent ATS instance on this box?{_W_RESET}")
+            print(f"  {_W_CYAN}(e.g. one per project -- each gets its own database, logs, and config){_W_RESET}\n")
+            name_input = input("  Instance name (leave blank for a single default instance): ").strip()
+            if name_input:
+                safe_name = re.sub(r"[^a-zA-Z0-9_-]", "", name_input)
+                if safe_name:
+                    instance_name = safe_name
+                    CONFIG_FILE = os.path.join(_ATS_CONFIG_DIR, f"config-{safe_name}.yml")
+                    print(f"  {_W_GREEN}This instance will use {CONFIG_FILE}{_W_RESET}\n")
+                else:
+                    print(f"  {_W_YELLOW}No usable characters in that name -- continuing as the default instance.{_W_RESET}\n")
+        elif env_instance:
+            # Instance already chosen via env var -- don't ask again, but
+            # still offer the same relaunch reminder / shortcut convenience
+            # at the end, since this may still be this instance's first run.
+            instance_name = re.sub(r"[^a-zA-Z0-9_-]", "", env_instance) or None
+
+        detected_user = cfg.get("service_user") or _ats_detect_service_user()
         service_user = input(f"  Service user to run apps as [{detected_user}]: ").strip() or detected_user
 
+        existing_domain = cfg.get("main_domain")
         while True:
-            main_domain = input("  Primary domain for subdomain deployments (e.g. example.com): ").strip()
-            if re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", main_domain):
+            prompt = (f"  Primary domain for subdomain deployments [{existing_domain}]: "
+                      if existing_domain else
+                      "  Primary domain for subdomain deployments (e.g. example.com): ")
+            main_domain = input(prompt).strip() or existing_domain or ""
+            if main_domain and re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", main_domain):
                 break
             print(f"  {_W_YELLOW}Invalid domain format, try again.{_W_RESET}")
 
-        detected_storage = _ats_detect_default_storage()
+        detected_storage = cfg.get("default_storage") or _ats_detect_default_storage()
         default_storage = input(f"  Default storage root for deployed apps [{detected_storage}]: ").strip() or detected_storage
 
-        detected_cf = _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
+        detected_cf = cfg.get("cloudflare_config") or _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
         cloudflare_config = input(f"  Cloudflare Tunnel config path [{detected_cf}]: ").strip() or detected_cf
 
-        default_ats_home = f"/home/{service_user}/ats"
+        default_ats_home = cfg.get("ats_home") or f"/home/{service_user}/ats{('-' + instance_name) if instance_name else ''}"
         ats_home_input = input(f"  ATS home directory (db/logs) [{default_ats_home}]: ").strip()
         ats_home = ats_home_input or default_ats_home
+
+        make_wrapper = False
+        if instance_name:
+            make_wrapper_input = input(
+                f"  Create a shortcut command 'ats-{instance_name}' to launch this instance in future? (y/n): "
+            ).strip().lower()
+            make_wrapper = make_wrapper_input == 'y'
     except EOFError:
         print(
             f"\n{_W_YELLOW}No interactive terminal available to complete first-run setup.{_W_RESET}\n"
@@ -188,6 +254,22 @@ def _ats_first_run_wizard(cfg: Dict) -> Dict:
 
     _ats_save_config_file(resolved)
     print(f"\n{_W_GREEN}  Saved to {CONFIG_FILE} -- future runs on this server will use these automatically.{_W_RESET}\n")
+
+    if instance_name:
+        script_path = os.path.abspath(__file__) if '__file__' in globals() else os.path.abspath(sys.argv[0] if sys.argv else 'ats.py')
+        print(f"  {_W_CYAN}To launch this exact instance again, run:{_W_RESET}")
+        print(f"    {_W_BOLD}sudo ATS_INSTANCE={instance_name} python3 {script_path}{_W_RESET}\n")
+
+        if make_wrapper:
+            wrapper_path = f"/usr/local/bin/ats-{instance_name}"
+            try:
+                with open(wrapper_path, 'w') as f:
+                    f.write(f"#!/bin/bash\nexec env ATS_INSTANCE={instance_name} python3 {script_path} \"$@\"\n")
+                os.chmod(wrapper_path, 0o755)
+                print(f"  {_W_GREEN}Created {wrapper_path} -- from now on just run: sudo ats-{instance_name}{_W_RESET}\n")
+            except Exception as e:
+                print(f"  {_W_YELLOW}Could not create shortcut ({e}) -- use the command above instead.{_W_RESET}\n")
+
     time.sleep(1.5)
     return resolved
 
@@ -244,7 +326,10 @@ except Exception:
 
 # --- Dynamic Locking ---
 IS_DAEMON = "--daemon" in sys.argv
-LOCK_FILE = f"/tmp/ats_{'daemon' if IS_DAEMON else 'cli'}.lock"
+# Scoped under ATS_HOME (not a shared /tmp path) so independent instances --
+# e.g. multiple clones on the same box, each with its own ATS_CONFIG_FILE --
+# never contend for the same lock or delete it out from under each other.
+LOCK_FILE = os.path.join(ATS_HOME, f"{'daemon' if IS_DAEMON else 'cli'}.lock")
 
 
 SERVICE_USER = _ats_cfg["service_user"]
