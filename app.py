@@ -6447,16 +6447,19 @@ async def update_database_async():
 
 async def get_telemetry_async() -> Tuple[float, str, str, int]:
     """Get system telemetry asynchronously"""
+    # Services count comes from the database and has nothing to do with
+    # psutil -- compute it unconditionally so it's never wrong just because
+    # psutil isn't installed/importable in this process.
+    services = db.query("SELECT * FROM services WHERE status='active'", fetch_all=True)
+    active_count = len(services) if services else 0
+
     if not psutil:
-        return 0.0, "N/A", "N/A", 0
+        return 0.0, "N/A", "N/A", active_count
 
     # Non-blocking CPU check
     cpu = psutil.cpu_percent(interval=None) 
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
-
-    services = db.query("SELECT * FROM services WHERE status='active'", fetch_all=True)
-    active_count = len(services) if services else 0
 
     ram_str = f"{mem.used / 1024 ** 3:.1f}/{mem.total / 1024 ** 3:.1f}GB"
     disk_str = f"{disk.used / 1024 ** 3:.0f}/{disk.total / 1024 ** 3:.0f}GB"
