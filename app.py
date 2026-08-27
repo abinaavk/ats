@@ -98,6 +98,7 @@ _ATS_ENV_MAP = {
     "default_storage": "ATS_DEFAULT_STORAGE",
     "cloudflare_config": "ATS_CLOUDFLARE_CONFIG",
     "ats_home": "ATS_HOME",
+    "cloudflared_service": "ATS_CLOUDFLARED_SERVICE",
 }
 
 # Bare ANSI codes (duplicated here, not imported from the VISUAL STYLING
@@ -225,6 +226,22 @@ def _ats_first_run_wizard(cfg: Dict) -> Dict:
         detected_cf = cfg.get("cloudflare_config") or _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
         cloudflare_config = input(f"  Cloudflare Tunnel config path [{detected_cf}]: ").strip() or detected_cf
 
+        # Only asked for a named instance -- a single default instance has
+        # no reason to think about this and gets the safe 'cloudflared'
+        # default automatically. Only matters if this instance manages a
+        # genuinely separate Cloudflare Tunnel with its own systemd unit
+        # (not just a separate ingress config for the same tunnel).
+        default_cf_service = cfg.get("cloudflared_service") or "cloudflared"
+        if instance_name:
+            print(f"\n  {_W_CYAN}If this instance manages its own separate Cloudflare Tunnel{_W_RESET}")
+            print(f"  {_W_CYAN}(its own systemd service, not just its own config file), name it here.{_W_RESET}")
+            print(f"  {_W_CYAN}Leave blank if it shares the same tunnel/service as another instance.{_W_RESET}")
+            cloudflared_service = input(
+                f"  Cloudflared systemd service name [{default_cf_service}]: "
+            ).strip() or default_cf_service
+        else:
+            cloudflared_service = default_cf_service
+
         default_ats_home = cfg.get("ats_home") or f"/home/{service_user}/ats{('-' + instance_name) if instance_name else ''}"
         ats_home_input = input(f"  ATS home directory (db/logs) [{default_ats_home}]: ").strip()
         ats_home = ats_home_input or default_ats_home
@@ -249,6 +266,7 @@ def _ats_first_run_wizard(cfg: Dict) -> Dict:
         "main_domain": main_domain,
         "default_storage": default_storage,
         "cloudflare_config": cloudflare_config,
+        "cloudflared_service": cloudflared_service,
         "ats_home": ats_home,
     }
 
@@ -279,7 +297,8 @@ def load_ats_config() -> Dict:
     resolved = {}
     needs_wizard = False
 
-    for key in ("service_user", "main_domain", "default_storage", "cloudflare_config", "ats_home"):
+    for key in ("service_user", "main_domain", "default_storage", "cloudflare_config",
+                "ats_home", "cloudflared_service"):
         val = _ats_resolve_value(key, cfg)
         if val:
             resolved[key] = val
@@ -291,6 +310,10 @@ def load_ats_config() -> Dict:
             resolved[key] = _ats_detect_cloudflare_config() or "/etc/cloudflared/config.yml"
         elif key == "default_storage":
             resolved[key] = _ats_detect_default_storage()
+        elif key == "cloudflared_service":
+            # Safe default matching the original single-tunnel behavior --
+            # never triggers the wizard on its own.
+            resolved[key] = "cloudflared"
         else:
             # main_domain / ats_home have no safe auto-detected default
             needs_wizard = True
@@ -336,6 +359,7 @@ SERVICE_USER = _ats_cfg["service_user"]
 SERVICE_GROUP = _ats_cfg.get("service_group", SERVICE_USER)
 MAIN_DOMAIN = _ats_cfg["main_domain"]
 CLOUDFLARE_CONFIG = _ats_cfg["cloudflare_config"]
+CLOUDFLARED_SERVICE = _ats_cfg.get("cloudflared_service", "cloudflared")
 DEFAULT_STORAGE = _ats_cfg["default_storage"]
 BACKUP_DIR = os.path.join(DEFAULT_STORAGE, "backups")
 
@@ -799,9 +823,10 @@ def run_root(cmd: List[str], timeout: int = 60):
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{detail}")
 
 def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float = 1.0,
-                                   max_attempts: int = 3, backoff_seconds: Tuple[int, ...] = (10, 20, 30)):
+                                   max_attempts: int = 3, backoff_seconds: Tuple[int, ...] = (10, 20, 30),
+                                   service_name: str = None):
     """
-    Restart cloudflared, tolerating both:
+    Restart the cloudflared systemd service, tolerating both:
 
       (a) systemd's own Restart=on-failure self-healing after a single slow
           start (poll 'systemctl is-active' briefly before treating a
@@ -814,14 +839,21 @@ def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float =
           For this, the restart itself is retried up to `max_attempts` times
           with increasing backoff between attempts.
 
-    Only raises (with real diagnostics attached) if cloudflared still isn't
+    `service_name` defaults to CLOUDFLARED_SERVICE (itself defaulting to the
+    original hardcoded "cloudflared") so a per-instance setup with its own
+    genuinely separate Cloudflare Tunnel -- its own systemd unit, not just
+    its own ingress config file -- can be targeted correctly instead of
+    always restarting whatever the single global "cloudflared" service is.
+
+    Only raises (with real diagnostics attached) if the service still isn't
     active after all attempts are exhausted.
     """
+    svc = service_name or CLOUDFLARED_SERVICE
     last_result = None
     for attempt in range(1, max_attempts + 1):
-        logger.info(f"EXEC(ROOT): systemctl restart cloudflared (attempt {attempt}/{max_attempts})")
+        logger.info(f"EXEC(ROOT): systemctl restart {svc} (attempt {attempt}/{max_attempts})")
         result = subprocess.run(
-            ["systemctl", "restart", "cloudflared"],
+            ["systemctl", "restart", svc],
             timeout=60, capture_output=True, text=True
         )
         last_result = result
@@ -830,36 +862,36 @@ def restart_cloudflared_resilient(poll_timeout: int = 20, poll_interval: float =
             return
 
         logger.warning(
-            f"systemctl restart cloudflared returned {result.returncode} "
+            f"systemctl restart {svc} returned {result.returncode} "
             f"(stderr: {result.stderr.strip()[:300]}) — polling for self-recovery via "
             f"systemd Restart=on-failure..."
         )
 
         deadline = time.time() + poll_timeout
         while time.time() < deadline:
-            if check_systemd_active("cloudflared"):
-                logger.info(f"cloudflared recovered on its own after restart attempt {attempt}")
+            if check_systemd_active(svc):
+                logger.info(f"{svc} recovered on its own after restart attempt {attempt}")
                 return
             time.sleep(poll_interval)
 
         if attempt < max_attempts:
             wait = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
             logger.warning(
-                f"cloudflared still not active after attempt {attempt}/{max_attempts} "
+                f"{svc} still not active after attempt {attempt}/{max_attempts} "
                 f"(poll_timeout={poll_timeout}s) — waiting {wait}s before retrying restart..."
             )
             time.sleep(wait)
 
     try:
         journal = subprocess.run(
-            ["journalctl", "-u", "cloudflared", "-n", "20", "--no-pager"],
+            ["journalctl", "-u", svc, "-n", "20", "--no-pager"],
             capture_output=True, text=True, timeout=10
         ).stdout
     except Exception:
         journal = "(could not read journalctl)"
 
     raise RuntimeError(
-        f"cloudflared did not become active after {max_attempts} restart attempts "
+        f"{svc} did not become active after {max_attempts} restart attempts "
         f"(~{sum(backoff_seconds[:max_attempts-1]) + poll_timeout * max_attempts}s total).\n"
         f"stderr: {last_result.stderr.strip()[:300] if last_result else 'n/a'}\n"
         f"Recent journal:\n{journal[-1500:]}"
@@ -5385,12 +5417,12 @@ async def run_diagnostics():
 
     # Cloudflared tunnel
     cf_tunnel = subprocess.call(
-        ["systemctl", "is-active", "--quiet", "cloudflared"],
+        ["systemctl", "is-active", "--quiet", CLOUDFLARED_SERVICE],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     ) == 0
     checks.append(("Cloudflare Tunnel", cf_tunnel))
     check_line("Cloudflare Tunnel", "pass" if cf_tunnel else "warn",
-               "cloudflared active" if cf_tunnel else "cloudflared not running")
+               f"{CLOUDFLARED_SERVICE} active" if cf_tunnel else f"{CLOUDFLARED_SERVICE} not running")
 
     # Port conflicts — check if any non-ATS process is using a registered port
     services_for_ports = db.query("SELECT name, port FROM services", fetch_all=True)
