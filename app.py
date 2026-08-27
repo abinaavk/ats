@@ -1849,23 +1849,47 @@ async def destroy_service():
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
         return
 
-    try:
-        print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
-        print_status("STOPPING SERVICE", "info")
-        run_root(["systemctl", "stop", name])
-        run_root(["systemctl", "disable", name])
+    print(f"\n{C_YELLOW}{'=' * 70}{C_RESET}")
+    print_status("STOPPING SERVICE", "info")
 
+    # Every step below is independently fault-tolerant. Destroy's job is to
+    # guarantee the service ends up fully gone (systemd unit, files, route,
+    # DB record) regardless of what partial/inconsistent state it started
+    # in -- e.g. a unit that's already not loaded, a route that's already
+    # missing, or files that were already cleaned up manually. None of
+    # those should block the remaining cleanup steps or leave the DB record
+    # orphaned and permanently un-deletable through this menu.
+    try:
+        run_root(["systemctl", "stop", name])
+    except Exception as e:
+        logger.warning(f"[{name}] systemctl stop warning (continuing): {e}")
+        print_status(f"Service already stopped or not loaded (continuing): {e}", "warning")
+
+    try:
+        run_root(["systemctl", "disable", name])
+    except Exception as e:
+        logger.warning(f"[{name}] systemctl disable warning (continuing): {e}")
+
+    try:
         svc_file = f"/etc/systemd/system/{name}.service"
         if os.path.exists(svc_file):
             os.remove(svc_file)
         run_root(["systemctl", "daemon-reload"])
         print_status("Service stopped and disabled", "success")
+    except Exception as e:
+        logger.warning(f"[{name}] Service file cleanup warning (continuing): {e}")
+        print_status(f"Service file cleanup warning (continuing): {e}", "warning")
 
-        print_status("REMOVING CLOUDFLARE ROUTE", "info")
+    print_status("REMOVING CLOUDFLARE ROUTE", "info")
+    try:
         cloudflare.remove_route(svc['domain'])
         print_status("Route removed", "success")
+    except Exception as e:
+        logger.warning(f"[{name}] Cloudflare route removal warning (continuing): {e}")
+        print_status(f"Cloudflare route removal warning (continuing): {e}", "warning")
 
-        print_status("DELETING SERVICE DATA", "info")
+    print_status("DELETING SERVICE DATA", "info")
+    try:
         service_root = get_service_path(svc['storage_path'], name)
         if os.path.exists(service_root):
             shutil.rmtree(service_root)
@@ -1874,7 +1898,11 @@ async def destroy_service():
         if os.path.exists(db_root):
             shutil.rmtree(db_root)
         print_status("Data deleted", "success")
+    except Exception as e:
+        logger.warning(f"[{name}] Data deletion warning (continuing): {e}")
+        print_status(f"Data deletion warning (continuing): {e}", "warning")
 
+    try:
         print_status("UPDATING DATABASE", "info")
         db.query("DELETE FROM services WHERE id=?", (svc['id'],))
         print_status("Database updated", "success")
@@ -1884,10 +1912,12 @@ async def destroy_service():
         print(f"\n{C_GREEN}{'=' * 70}{C_RESET}")
         print_status(f"SERVICE '{name}' DESTROYED", "success")
         print(f"{C_GREEN}{'=' * 70}{C_RESET}\n")
-
     except Exception as e:
-        logger.error(f"Destroy failed: {e}")
-        print_status(f"Destruction failed: {e}", "error")
+        # This is the one step where failure genuinely matters -- if the DB
+        # record itself couldn't be removed, the service will still show up
+        # in listings even though everything else was cleaned up.
+        logger.error(f"[{name}] Failed to remove database record: {e}")
+        print_status(f"Cleanup done, but failed to remove database record: {e}", "error")
 
     input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}")
 
