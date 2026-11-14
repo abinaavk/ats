@@ -14,8 +14,15 @@ import asyncio
 import json
 import hashlib
 import getpass
+import hmac
+import secrets
+import tempfile
+import contextlib
+import functools
+import errno
+import zipfile
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Callable
 from dataclasses import dataclass
 import threading
 
@@ -169,6 +176,36 @@ def _ats_resolve_value(key: str, cfg: Dict):
     return None
 
 
+_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+
+
+def _check_domain_format(domain: str) -> str:
+    """
+    Pure format check for a fully-qualified domain name; returns it lowercased.
+
+    Rejects empty labels ('a..b.com'), leading/trailing dots or hyphens, labels
+    longer than 63 chars, totals longer than 253 chars, and a non-alphabetic TLD.
+    Defined this early so the first-run wizard (which runs at import time) can
+    share it with validate_domain().
+    """
+    if not domain or not isinstance(domain, str):
+        raise ValueError("Domain cannot be empty")
+    d = domain.strip().lower()
+    if not d:
+        raise ValueError("Domain cannot be empty")
+    if len(d) > 253:
+        raise ValueError("Invalid domain format (longer than 253 characters).")
+    labels = d.split(".")
+    if len(labels) < 2:
+        raise ValueError("Invalid domain format.")
+    for label in labels:
+        if not label or len(label) > 63 or not _DOMAIN_LABEL_RE.match(label):
+            raise ValueError("Invalid domain format.")
+    if not re.match(r"^[a-z]{2,}$", labels[-1]):
+        raise ValueError("Invalid domain format.")
+    return d
+
+
 def _ats_first_run_wizard(cfg: Dict) -> Dict:
     """Interactively fill in anything still missing, save, and return the config."""
     global CONFIG_FILE
@@ -216,8 +253,11 @@ def _ats_first_run_wizard(cfg: Dict) -> Dict:
                       if existing_domain else
                       "  Primary domain for subdomain deployments (e.g. example.com): ")
             main_domain = input(prompt).strip() or existing_domain or ""
-            if main_domain and re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", main_domain):
+            try:
+                main_domain = _check_domain_format(main_domain)
                 break
+            except ValueError:
+                pass
             print(f"  {_W_YELLOW}Invalid domain format, try again.{_W_RESET}")
 
         detected_storage = cfg.get("default_storage") or _ats_detect_default_storage()
@@ -375,7 +415,21 @@ GDRIVE_RETENTION_DAYS = int(os.environ.get("ATS_GDRIVE_RETENTION_DAYS", "7"))
 RCLONE_BWLIMIT = os.environ.get("ATS_RCLONE_BWLIMIT", "5M")
 ENCRYPTION_KEY_FILE = os.path.join(ATS_HOME, ".backup_key")
 
-BLOCKED_PATHS = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/root", "/run", "/sys", "/usr", "/var"]
+# Storage roots must never be (or live under) these system locations. "/" only
+# blocks the exact root (every path is technically "under" it). "/lib*" covers
+# /lib, /lib32, /lib64, /libx32.
+BLOCKED_PATHS = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32",
+                 "/proc", "/root", "/run", "/sbin", "/sys", "/usr", "/var"]
+# The only places under a blocked prefix that are acceptable storage roots.
+ALLOWED_STORAGE_EXCEPTIONS = ["/var/www", "/var/lib/ats*"]
+
+SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+BRANCH_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,100}$")
+
+# Allowed ranges for per-service resource settings.
+WORKERS_RANGE = (1, 32)
+MEMORY_RANGE_MB = (64, 65536)
+CPU_QUOTA_RANGE = (5, 800)
 
 # ==============================================================================
 #   PROMETHEUS METRICS
@@ -461,7 +515,7 @@ class SecurityLogger(logging.Handler):
                 sec_log = os.path.join(ATS_HOME, "security.log")
                 with open(sec_log, "a") as f:
                     f.write(f"{self.format(record)}\n")
-            except:
+            except Exception:
                 pass
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s', handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)])
@@ -582,7 +636,7 @@ class DatabaseManager:
 
         try:
             os.chmod(self.db_path, 0o600)
-        except:
+        except Exception:
             pass
 
     def query(self, sql: str, args=(), fetch_all=False, fetch_one=False):
@@ -623,6 +677,18 @@ class DatabaseManager:
 
 db = DatabaseManager(DB_FILE)
 
+# Identifiers cannot be bound as SQL parameters, so table names that end up in
+# a query are only ever taken from this allow-list.
+DB_COUNT_TABLES = ("services", "backups", "deployments", "metrics_history")
+
+
+def table_row_count(table: str) -> int:
+    """COUNT(*) for an allow-listed table (raises ValueError for anything else)."""
+    if table not in DB_COUNT_TABLES:
+        raise ValueError(f"Unknown table: {table!r}")
+    result = db.query(f"SELECT COUNT(*) as count FROM {table}", fetch_one=True)  # nosec: allow-listed identifier
+    return result['count'] if result else 0
+
 # ==============================================================================
 #   PORT AND SERVICE CHECKING
 # ==============================================================================
@@ -639,7 +705,7 @@ def check_port_listening(port: int, timeout: float = 1.0) -> bool:
     finally:
         try:
             sock.close()
-        except:
+        except Exception:
             pass
 
 def check_systemd_active(service_name: str) -> bool:
@@ -710,7 +776,7 @@ async def run_async_command(cmd: List[str], cwd: Optional[str] = None, timeout: 
 async def check_single_service_health_async(svc: Dict) -> Tuple[str, bool]:
     """Async wrapper for health check"""
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         is_healthy = await loop.run_in_executor(
             None,
             check_service_health,
@@ -760,7 +826,7 @@ def acquire_lock():
                 lock_fd.close()
                 if os.path.exists(LOCK_FILE):
                     os.remove(LOCK_FILE)
-            except:
+            except Exception:
                 pass
 
         atexit.register(cleanup_lock)
@@ -929,34 +995,60 @@ def calculate_file_hash(filepath: str) -> str:
 #   VALIDATION
 # ==============================================================================
 
+def _storage_path_blocked(real: str) -> bool:
+    """True if `real` (an already-realpath'ed absolute path) is blocked."""
+    if real == "/":
+        return True
+    parts = [p for p in real.split("/") if p]
+    for blocked in BLOCKED_PATHS:
+        if blocked == "/":
+            continue
+        if real == blocked or real.startswith(blocked + "/"):
+            # Explicit carve-outs under /var only.
+            if parts[:2] == ["var", "www"]:
+                return False
+            if len(parts) >= 3 and parts[:2] == ["var", "lib"] and parts[2].startswith("ats"):
+                return False
+            return True
+    return False
+
+
 def validate_storage(path: str) -> str:
-    """Validate storage path exists and is not restricted"""
+    """Validate storage path exists and is not restricted (symlinks resolved, sub-paths blocked)"""
     if not path:
         path = DEFAULT_STORAGE
     if not os.path.exists(path):
         raise ValueError(f"Path does not exist: {path}")
-    clean = os.path.abspath(path)
-    if clean in BLOCKED_PATHS:
+    clean = os.path.realpath(path)
+    if _storage_path_blocked(clean):
         raise ValueError(f"Restricted path: {clean}")
+    if not os.path.isdir(clean):
+        raise ValueError(f"Not a directory: {clean}")
     if not os.access(clean, os.W_OK):
         raise ValueError(f"Path not writable: {clean}")
     return clean
 
-def validate_domain(domain: str) -> str:
-    """Validate domain format and availability"""
-    if not domain:
-        raise ValueError("Domain cannot be empty")
-    if not re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", domain):
-        raise ValueError("Invalid domain format.")
-    if db.query("SELECT 1 FROM services WHERE domain=?", (domain,), fetch_one=True):
-        raise ValueError(f"Domain {domain} already exists.")
-    return domain.lower()
+
+def domain_in_use(domain: str, exclude_name: Optional[str] = None) -> Optional[str]:
+    """Return the name of the service already using `domain` (case-insensitive), else None."""
+    row = db.query("SELECT name FROM services WHERE lower(domain)=?", (domain.lower(),), fetch_one=True)
+    if row and row['name'] != exclude_name:
+        return row['name']
+    return None
+
+
+def validate_domain(domain: str, exclude_name: Optional[str] = None) -> str:
+    """Validate domain format and availability. Returns the lowercased domain."""
+    clean = _check_domain_format(domain)          # lowercases first
+    if domain_in_use(clean, exclude_name):
+        raise ValueError(f"Domain {clean} already exists.")
+    return clean
 
 def validate_port(port: str) -> int:
     """Validate port is numeric, in range, and available"""
     try:
         p = int(port)
-    except:
+    except (TypeError, ValueError):
         raise ValueError("Port must be numeric.")
 
     if not (1024 <= p <= 65535):
@@ -970,12 +1062,61 @@ def validate_port(port: str) -> int:
 
     return p
 
+def _validate_int_range(value, label: str, lo: int, hi: int) -> int:
+    """Parse `value` (int or numeric string) and range-check it; raises ValueError."""
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a whole number.")
+    if isinstance(value, int):
+        n = value
+    else:
+        text = str(value).strip() if value is not None else ""
+        if not re.match(r"^[+-]?\d+$", text):
+            raise ValueError(f"{label} must be a whole number.")
+        n = int(text)
+    if not (lo <= n <= hi):
+        raise ValueError(f"{label} must be between {lo} and {hi}.")
+    return n
+
+def validate_workers(value) -> int:
+    """Validate gunicorn worker count (1-32)."""
+    return _validate_int_range(value, "Workers", *WORKERS_RANGE)
+
+def validate_memory(value) -> int:
+    """Validate memory limit in MB (64-65536)."""
+    return _validate_int_range(value, "Max memory (MB)", *MEMORY_RANGE_MB)
+
+def validate_cpu(value) -> int:
+    """Validate CPU quota in percent (5-800)."""
+    return _validate_int_range(value, "CPU quota (%)", *CPU_QUOTA_RANGE)
+
+def validate_service_name(name: str) -> str:
+    """Validate a service name (^[a-zA-Z0-9_-]{1,64}$)."""
+    if not isinstance(name, str) or not SERVICE_NAME_RE.match(name):
+        raise ValueError("Invalid service name format (use letters, digits, '_' or '-', max 64 chars)")
+    return name
+
+def validate_branch(branch: str) -> str:
+    """Validate a git branch name (no leading '-', no whitespace/odd characters)."""
+    if not isinstance(branch, str) or not BRANCH_RE.match(branch) or ".." in branch:
+        raise ValueError("Invalid branch name.")
+    return branch
+
 def validate_git_url(url: str) -> str:
-    """Validate git repository URL"""
+    """Validate git repository URL (https:// or git@ only; no whitespace/control characters)"""
     if not url:
         raise ValueError("Git URL cannot be empty")
-    if not (url.startswith("http://") or url.startswith("https://") or url.startswith("git@")):
-        raise ValueError("Invalid Git URL format.")
+    if re.search(r"[\s\x00-\x1f\x7f]", url):
+        raise ValueError("Git URL must not contain whitespace or control characters.")
+    if len(url) > 2048:
+        raise ValueError("Git URL too long.")
+    if url.startswith("https://"):
+        if len(url) <= len("https://"):
+            raise ValueError("Invalid Git URL format.")
+    elif url.startswith("git@"):
+        if ":" not in url[4:]:
+            raise ValueError("Invalid Git URL format.")
+    else:
+        raise ValueError("Invalid Git URL format (only https:// and git@ URLs are accepted; plain http:// is rejected).")
     return url
 
 # ==============================================================================
@@ -1007,7 +1148,7 @@ class CloudflareManager:
                 # it'll pick the restored config back up on its own once
                 # connectivity returns, via Restart=on-failure.
                 restart_cloudflared_resilient(max_attempts=1, poll_timeout=15)
-            except:
+            except Exception:
                 pass
 
     def add_route(self, domain: str, port: int):
@@ -1233,8 +1374,7 @@ async def deploy_service_async():
     try:
         # ========== INPUT VALIDATION ==========
         name = input(f"{C_BOLD}Service Name (alphanumeric):{C_RESET} ").strip()
-        if not re.match(r"^[a-zA-Z0-9_-]+$", name):
-            raise ValueError("Invalid service name format")
+        validate_service_name(name)
         if db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
             raise ValueError(f"Service '{name}' already exists")
 
@@ -1263,7 +1403,7 @@ async def deploy_service_async():
 
         port = validate_port(input(f"{C_BOLD}Port (1024-65535):{C_RESET} ").strip())
         repo_url = validate_git_url(input(f"{C_BOLD}Git Repository URL:{C_RESET} ").strip())
-        branch = input(f"{C_BOLD}Git Branch [main]:{C_RESET} ").strip() or "main"
+        branch = validate_branch(input(f"{C_BOLD}Git Branch [main]:{C_RESET} ").strip() or "main")
 
         print(f"\n{C_CYAN}Runtime:{C_RESET}")
         print(f"  1. Python (Flask/Gunicorn) [default]")
@@ -1275,13 +1415,13 @@ async def deploy_service_async():
         print(f"\n{C_YELLOW}Advanced Settings (press Enter for defaults):{C_RESET}")
 
         workers_input = input(f"  Workers [auto]: ").strip()
-        workers = int(workers_input) if workers_input else 0
+        workers = validate_workers(workers_input) if workers_input else 0
 
         memory_input = input(f"  Max Memory MB [512]: ").strip()
-        max_memory = int(memory_input) if memory_input else 512
+        max_memory = validate_memory(memory_input) if memory_input else 512
 
         cpu_input = input(f"  CPU Quota % [50]: ").strip()
-        cpu_quota = int(cpu_input) if cpu_input else 50
+        cpu_quota = validate_cpu(cpu_input) if cpu_input else 50
 
         config = ServiceConfig(
             name=name,
@@ -1478,7 +1618,7 @@ async def deploy_service_async():
             if PROMETHEUS_AVAILABLE:
                 try:
                     run_as_gaia([pip_executable, "install", "prometheus-flask-exporter"], cwd=api_dir, timeout=60)
-                except:
+                except Exception:
                     pass
 
             print_status("Python environment ready", "success")
@@ -1527,7 +1667,7 @@ async def deploy_service_async():
                 )
                 log_output = result.stdout.decode()
                 print(f"{C_YELLOW}{log_output}{C_RESET}\n")
-            except:
+            except Exception:
                 pass
 
             raise RuntimeError("Service failed to pass health checks")
@@ -1741,7 +1881,7 @@ async def deploy_service_async():
 
         audit_log("DEPLOY_FAILED", name or "unknown", {"error": str(e)})
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to return to main menu...{C_RESET}"))
 
 # ==============================================================================
@@ -1939,7 +2079,7 @@ async def destroy_service():
     for s in services:
         print(f"  {s['id']:<6} {s['name']}")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID to Destroy (0 to cancel):{C_RESET} "))).strip()
     
     if svc_id == "0" or not svc_id: return
@@ -2054,7 +2194,7 @@ async def view_service_logs():
     for s in services:
         print(f"  {s['id']:<6} {s['name']}")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID (0 to cancel):{C_RESET} "))).strip()
     
     if svc_id == "0" or not svc_id: return
@@ -2074,7 +2214,7 @@ async def view_service_logs():
         try:
             os.makedirs(log_dir, exist_ok=True)
             shutil.chown(log_dir, user=SERVICE_USER, group=SERVICE_GROUP)
-        except:
+        except Exception:
             pass
 
     print(f"\n{C_CYAN}Available Logs:{C_RESET}")
@@ -2194,7 +2334,7 @@ async def service_operations():
     for s in services:
         print(f"  {s['id']:<6} {s['name']}")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID (0 to cancel):{C_RESET} "))).strip()
     
     if svc_id == "0" or not svc_id: return
@@ -2221,7 +2361,7 @@ async def service_operations():
         status_icon = f"{C_GREEN}●{C_RESET}" if is_active else f"{C_RED}●{C_RESET}"
         status_text = "ACTIVE" if is_active else "INACTIVE"
         print(f"Status:  {status_icon} {status_text}")
-    except:
+    except Exception:
         print(f"Status:  {C_YELLOW}UNKNOWN{C_RESET}")
         is_active = False
 
@@ -2573,7 +2713,7 @@ async def service_operations():
         print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
         try:
             subprocess.run(["systemctl", "status", name, "--no-pager"])
-        except:
+        except Exception:
             pass
         print(f"{C_CYAN}{'=' * 70}{C_RESET}")
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
@@ -2612,7 +2752,7 @@ async def service_operations():
         input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
     elif choice == "8":
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, update_service_config, name)
 
     elif choice == "9":
@@ -3080,7 +3220,7 @@ async def handle_webhook(reader, writer):
         try:
             writer.close()
             await writer.wait_closed()
-        except:
+        except Exception:
             pass
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3148,7 +3288,7 @@ async def manage_service(name: str, svc: dict):          # FIX: was floating orp
         status_icon = f"{C_GREEN}●{C_RESET}" if is_active else f"{C_RED}●{C_RESET}"
         status_text = "ACTIVE" if is_active else "INACTIVE"
         print(f"Status:  {status_icon} {status_text}")
-    except:
+    except Exception:
         print(f"Status:  {C_YELLOW}UNKNOWN{C_RESET}")
         is_active = False
 
@@ -3499,7 +3639,7 @@ async def manage_service(name: str, svc: dict):          # FIX: was floating orp
         print(f"\n{C_CYAN}{'=' * 70}{C_RESET}")
         try:
             subprocess.run(["systemctl", "status", name, "--no-pager"])
-        except:
+        except Exception:
             pass
         print(f"{C_CYAN}{'=' * 70}{C_RESET}")
         await loop.run_in_executor(
@@ -3547,7 +3687,7 @@ async def manage_service(name: str, svc: dict):          # FIX: was floating orp
 
     elif choice == "9":
         # REDEPLOY — stop service, delete code dir, clone new repo, reinstall deps, start
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         new_repo_url = (await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}New Git Repository URL:{C_RESET} "))).strip()
         if not new_repo_url:
@@ -3907,7 +4047,7 @@ async def backup_service():
         print(f"  {C_BOLD}[5]{C_RESET} Restore Backup (Local / Google Drive)")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select action:{C_RESET} "))).strip()
 
         if choice == "0":
@@ -4357,7 +4497,7 @@ def backup_gdrive_now():
 
 async def gdrive_backup_now_async():
     """Async wrapper for backup_gdrive_now()"""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, backup_gdrive_now)
 
 
@@ -4367,7 +4507,7 @@ async def gdrive_backup_now_async():
 
 async def restore_backup_menu():
     """Restore backup from local or Google Drive"""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     while True:
         print_header()
@@ -4388,7 +4528,7 @@ async def restore_backup_menu():
 
 async def restore_from_local():
     """Restore a backup from the local /opt/backups directory"""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     logger.info("Local restore initiated")
     audit_log("RESTORE_LOCAL_START", "SYSTEM")
@@ -4453,7 +4593,7 @@ async def restore_from_local():
 
 async def restore_from_drive():
     """Download and restore a backup from Google Drive"""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     logger.info("Google Drive restore initiated")
     audit_log("RESTORE_DRIVE_START", "SYSTEM")
@@ -4591,7 +4731,7 @@ async def restore_from_drive():
 
 async def _do_restore(svc, backup_path, filename):
     """Common restore logic for both local and Drive backups"""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     name = svc['name']
 
     print(f"\n{C_RED}{C_BOLD}═══ RESTORE DATABASE: {name} ═══{C_RESET}")
@@ -4665,7 +4805,7 @@ async def configure_remote_offloading():
     print_header()
     print(f"{C_CYAN}{C_BOLD}═══ REMOTE OFFLOAD CONFIG ═══{C_RESET}\n")
     
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     name = (await loop.run_in_executor(None, lambda: input("  Service Name to configure: "))).strip()
     if not name:
         print_status("Service name cannot be empty.", "error")
@@ -4765,7 +4905,7 @@ async def sync_all_backups_remote():
     print(f"{C_CYAN}{C_BOLD}═══ MANUAL REMOTE SYNC ═══{C_RESET}\n")
 
     configs = db.query("SELECT * FROM remote_configs", fetch_all=True)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     if not configs:
         print_status("No remote configurations found. Please configure Option 2 first.", "warning")
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
@@ -4822,7 +4962,7 @@ async def list_backups():
         for s in services:
             print(f"  {s['id']:<6} {s['name']}")
         
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         svc_id = (await loop.run_in_executor(None, lambda: input(f"\n  {C_BOLD}Enter Service ID to view backups (0 to back):{C_RESET} "))).strip()
         
         if svc_id == "0" or not svc_id: break
@@ -4845,7 +4985,7 @@ async def show_service_backups(name: str):
         
         if not backups:
             print_status(f"No backups found for {name}", "warning")
-            await asyncio.get_event_loop().run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            await asyncio.get_running_loop().run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
             return
 
         print(f"  {C_BOLD}{'ID':<4} {'SIZE (MB)':<12} {'DATE':<20} {'STATUS'}{C_RESET}")
@@ -4859,7 +4999,7 @@ async def show_service_backups(name: str):
 
         print(f"\n  {C_BOLD}[ID]{C_RESET} Restore  |  {C_BOLD}[D + ID]{C_RESET} Delete (ex: d1)  |  {C_BOLD}[0]{C_RESET} Back")
         
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         choice = (await loop.run_in_executor(None, lambda: input(f"\n  Selection: "))).strip().lower()
         
         if choice == "0": break
@@ -4870,7 +5010,7 @@ async def show_service_backups(name: str):
                 if 1 <= idx <= len(backups):
                     await delete_backup(backups[idx-1])
                 else: raise ValueError
-            except:
+            except Exception:
                 print_status("Invalid selection", "error")
                 await asyncio.sleep(1)
         else:
@@ -4879,7 +5019,7 @@ async def show_service_backups(name: str):
                 if 1 <= idx <= len(backups):
                     await restore_backup(backups[idx-1])
                 else: raise ValueError
-            except:
+            except Exception:
                 print_status("Invalid selection", "error")
                 await asyncio.sleep(1)
 
@@ -4889,7 +5029,7 @@ async def delete_backup(backup: Dict):
     path = os.path.join(BACKUP_DIR, filename)
     
     print(f"\n{C_RED}Delete backup {filename}? (yes/no):{C_RESET} ", end="")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     confirm = (await loop.run_in_executor(None, lambda: input())).strip().lower()
     
     if confirm == "yes":
@@ -4906,7 +5046,7 @@ async def restore_backup(backup: Dict):
     filename = backup['filename']
     backup_path = os.path.join(BACKUP_DIR, filename)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     if not os.path.exists(backup_path):
         print_status(f"Backup file missing: {filename}", "error")
         return
@@ -4972,7 +5112,7 @@ async def global_operations():
         print(f"{C_CYAN}{C_BOLD}═══ GLOBAL OPERATIONS ═══{C_RESET}\n")
         
         services = db.query("SELECT name FROM services", fetch_all=True)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if not services:
             print_status("No services deployed.", "warning")
             await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
@@ -5005,7 +5145,7 @@ async def global_operations():
                 print_status(f"{action.capitalize()}ing {name}...", "info")
                 try:
                     run_root(["systemctl", action, name])
-                except:
+                except Exception:
                     print_status(f"Failed to {action} {name}", "error")
             
             print_status(f"Mass {action} completed", "success")
@@ -5067,7 +5207,7 @@ async def dependency_audit():
                 print(f"    {C_RED}✗ Failed to run npm audit{C_RESET}")
         print()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: input(f"{C_CYAN}Press Enter to continue...{C_RESET}"))
 
 # ==============================================================================
@@ -5547,9 +5687,8 @@ async def run_diagnostics():
         pass
 
     # Table record counts
-    for table in ['services', 'backups', 'deployments', 'metrics_history']:
-        result = db.query(f"SELECT COUNT(*) as count FROM {table}", fetch_one=True)
-        count  = result['count'] if result else 0
+    for table in DB_COUNT_TABLES:
+        count  = table_row_count(table)
         flag   = "warn" if count > 500 else "pass"
         check_line(f"Table: {table}", flag, f"{count} records")
 
@@ -5599,7 +5738,7 @@ async def view_database():
         print(f"  {C_BOLD}[5]{C_RESET} All Tables Summary")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select table:{C_RESET} "))).strip()
 
         if choice == "0":
@@ -5630,7 +5769,7 @@ async def view_database():
 
                     print(f"\n  {C_CYAN}Enter service ID for full details (or Enter to skip):{C_RESET} ", end='')
                     detail_id = (await loop.run_in_executor(None, lambda: input())).strip()
-                    if detail_id.isdigit():
+                    if detail_id.isascii() and detail_id.isdigit():
                         svc = db.query("SELECT * FROM services WHERE id=?", (int(detail_id),), fetch_one=True)
                         if svc:
                             print(f"\n  {C_CYAN}{'─' * 60}{C_RESET}")
@@ -5704,14 +5843,13 @@ async def view_database():
 
             # ── ALL TABLES SUMMARY ─────────────────────────────────────────────
             elif choice == "5":
-                all_tables = ['services', 'backups', 'deployments', 'metrics_history']
+                all_tables = list(DB_COUNT_TABLES)
                 print(f"{C_CYAN}{C_BOLD}═══ DATABASE SUMMARY ═══{C_RESET}\n")
                 print(f"  {C_BOLD}{'TABLE':<28} {'RECORDS':<12} {'EST. SIZE':<12}{C_RESET}")
                 print(f"  {C_CYAN}{'─' * 55}{C_RESET}")
                 total_records = 0
                 for table in all_tables:
-                    result = db.query(f"SELECT COUNT(*) as count FROM {table}", fetch_one=True)
-                    count  = result['count'] if result else 0
+                    count  = table_row_count(table)
                     total_records += count
                     size_kb = f"{count * 0.5:.1f} KB"
                     print(f"  {table:<28} {count:<12} {size_kb:<12}")
@@ -5757,7 +5895,7 @@ async def database_cleanup():
         print(f"  {C_BOLD}[D]{C_RESET} Database health report             (stats + warnings)")
         print(f"  {C_BOLD}[0]{C_RESET} Back\n")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         choice = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Select action:{C_RESET} "))).strip().lower()
 
         if choice == "0":
@@ -5774,15 +5912,14 @@ async def database_cleanup():
             print_header()
             print(f"{C_CYAN}{C_BOLD}═══ DATABASE HEALTH REPORT ═══{C_RESET}\n")
 
-            tables = ['services', 'backups', 'deployments', 'metrics_history']
+            tables = list(DB_COUNT_TABLES)
 
             print(f"  {C_BOLD}{'TABLE':<25} {'RECORDS':<12} {'EST. SIZE':<12}{C_RESET}")
             print(f"  {C_CYAN}{'─' * 52}{C_RESET}")
 
             total_records = 0
             for table in tables:
-                result = db.query(f"SELECT COUNT(*) as count FROM {table}", fetch_one=True)
-                count  = result['count'] if result else 0
+                count  = table_row_count(table)
                 total_records += count
                 size_kb = count * 0.5
                 flag = f"  {C_YELLOW}⚠ Large{C_RESET}" if count > 500 else ""
@@ -6028,18 +6165,18 @@ async def database_cleanup():
             if choice == "9":
                 print()
                 days_str = (await loop.run_in_executor(None, lambda: input(f"  {C_BOLD}Delete backups older than how many days?{C_RESET} "))).strip()
-                if not days_str.isdigit() or int(days_str) < 1:
+                if not (days_str.isascii() and days_str.isdigit()) or not (1 <= int(days_str) <= 36500):
                     print_status("Invalid number. Enter a positive integer.", "warning")
                     await asyncio.sleep(1)
                     continue
 
                 days = int(days_str)
-                old_backups = db.query(f"""
+                old_backups = db.query("""
                     SELECT id, service_name, filename, timestamp
                     FROM backups
-                    WHERE timestamp < datetime('now', '-{days} days')
+                    WHERE timestamp < datetime('now', ?)
                     ORDER BY timestamp ASC
-                """, fetch_all=True)
+                """, (f"-{days} days",), fetch_all=True)
 
                 if not old_backups:
                     print_status(f"No backups older than {days} days found.", "info")
@@ -6523,7 +6660,7 @@ async def auto_backup_scheduler():
 
             # --- Google Drive backup at midnight ---
             logger.info("Triggering scheduled Google Drive backup...")
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             success, result = await loop.run_in_executor(None, backup_gdrive_now)
             if success:
                 logger.info(f"Google Drive backup successful: {result}")
@@ -6623,7 +6760,7 @@ async def mainmenu():
             print(f"{C_CYAN}╚{'═' * (T-2)}╝{C_RESET}")
 
             # Run input in executor to avoid blocking the event loop
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             choice = (await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}{C_BOLD}ATS ▶{C_RESET} "))).strip().lower()
 
             if choice == "1":
