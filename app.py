@@ -4133,7 +4133,6 @@ def create_local_backup(svc):
         filename = f"{name}_db_{timestamp}.zip"
         backup_path = os.path.join(BACKUP_DIR, filename)
 
-        import zipfile
         with zipfile.ZipFile(backup_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for f in db_files:
                 zf.write(os.path.join(db_path, f), f)
@@ -4196,57 +4195,109 @@ def _write_backup_log(msg):
         logger.error(f"Failed to write backup log: {e}")
 
 
-def _get_or_create_key():
-    """Get encryption key from file, or generate and save one"""
+def _read_key_file() -> Optional[str]:
+    """Return the stored key (stripped) or None if missing/empty."""
     try:
+        with open(ENCRYPTION_KEY_FILE, 'r') as f:
+            key = f.read().strip()
+    except FileNotFoundError:
+        return None
+    return key or None
+
+
+def _get_or_create_key() -> Optional[str]:
+    """
+    Get the backup encryption key from its file, or generate and save one.
+
+    Returns a non-empty key, or None if no usable key could be obtained --
+    never an empty string, so callers can never encrypt with an empty
+    password. The key file is created atomically with mode 0600
+    (O_CREAT|O_EXCL), never written world-readable and chmod'ed afterwards.
+    """
+    try:
+        key = _read_key_file()
+        if key:
+            try:
+                if os.stat(ENCRYPTION_KEY_FILE).st_mode & 0o077:
+                    os.chmod(ENCRYPTION_KEY_FILE, 0o600)
+            except OSError:
+                pass
+            return key
+
+        # An existing but empty key file is unusable; replace it.
         if os.path.exists(ENCRYPTION_KEY_FILE):
-            with open(ENCRYPTION_KEY_FILE, 'r') as f:
-                key = f.read().strip()
-            if key:
-                return key
+            os.remove(ENCRYPTION_KEY_FILE)
 
         # Generate a new 256-bit key
-        key = subprocess.run(
+        result = subprocess.run(
             ["openssl", "rand", "-hex", "32"],
             capture_output=True, text=True, timeout=10
-        ).stdout.strip()
+        )
+        key = result.stdout.strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", key):
+            logger.error("Could not generate a backup encryption key (openssl rand failed); refusing to continue without a key")
+            return None
 
-        with open(ENCRYPTION_KEY_FILE, 'w') as f:
-            f.write(key)
-        os.chmod(ENCRYPTION_KEY_FILE, 0o600)
+        fd = os.open(ENCRYPTION_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                f.write(key)
+        except Exception:
+            try:
+                os.remove(ENCRYPTION_KEY_FILE)
+            except OSError:
+                pass
+            raise
         logger.info(f"Generated new backup encryption key at {ENCRYPTION_KEY_FILE}")
         return key
+    except FileExistsError:
+        # Another process created the key between our check and our create.
+        return _read_key_file()
     except Exception as e:
         logger.error(f"Failed to get/create encryption key: {e}")
         return None
 
 
 def _encrypt_file(input_path, output_path):
-    """Encrypt a file using AES-256-CBC via OpenSSL. Returns True on success."""
+    """
+    Encrypt a file using AES-256-CBC via OpenSSL. Returns True only if openssl
+    succeeded AND produced a non-empty output file. The key is passed to
+    openssl as `-pass file:<keyfile>`, never on the command line.
+    """
     key = _get_or_create_key()
     if not key:
         return False
+    ok = False
     try:
         result = subprocess.run(
             ["openssl", "enc", "-aes-256-cbc", "-salt", "-pbkdf2",
-             "-in", input_path, "-out", output_path, "-pass", f"pass:{key}"],
+             "-in", input_path, "-out", output_path, "-pass", f"file:{ENCRYPTION_KEY_FILE}"],
             capture_output=True, text=True, timeout=120
         )
-        return result.returncode == 0
+        ok = (result.returncode == 0
+              and os.path.isfile(output_path)
+              and os.path.getsize(output_path) > 0)
     except Exception as e:
         logger.error(f"Encryption failed: {e}")
-        return False
+    if not ok and os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+    return ok
 
 
 def _decrypt_file(input_path, output_path):
     """Decrypt a file using AES-256-CBC via OpenSSL. Returns True on success."""
-    key = _get_or_create_key()
-    if not key:
+    # Decryption must never mint a fresh key: that could only ever fail (or,
+    # worse, mask a lost key), so require the existing one.
+    if not _read_key_file():
+        logger.error("Decryption failed: backup encryption key is missing")
         return False
     try:
         result = subprocess.run(
             ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2",
-             "-in", input_path, "-out", output_path, "-pass", f"pass:{key}"],
+             "-in", input_path, "-out", output_path, "-pass", f"file:{ENCRYPTION_KEY_FILE}"],
             capture_output=True, text=True, timeout=120
         )
         return result.returncode == 0
@@ -4308,10 +4359,12 @@ def backup_gdrive_now():
 
     Flow per service:
       1. Stop service
-      2. Copy DB to /tmp/<service_name>-<timestamp>.db
-      3. Start service
-      4. Upload to gdrive:backups/<service_name>/ (retry once on failure)
-      5. Remove temp file
+      2. Zip DB into a private (0700) temp dir created with mkdtemp
+      3. Encrypt it; start service again
+      4. Upload the ENCRYPTED file to gdrive:backups/<service_name>/ (retry once
+         on failure). If encryption fails the backup for that service FAILS --
+         a plaintext archive is never uploaded.
+      5. Remove the temp dir
 
     Returns: (success: bool, filename_or_reason: str)
     """
@@ -4338,11 +4391,15 @@ def backup_gdrive_now():
 
         db_dir = os.path.join(storage_base, "database", name)
         backup_filename = f"{name}-{timestamp}.zip"
-        tmp_path = os.path.join("/tmp", backup_filename)
         remote_target = f"{GDRIVE_FOLDER}/{name}"
         service_restarted = False
+        tmp_dir = None
 
         try:
+            # Private scratch dir (mode 0700): no predictable /tmp path as root.
+            tmp_dir = tempfile.mkdtemp(prefix="ats-backup-")
+            tmp_path = os.path.join(tmp_dir, backup_filename)
+
             # Step 1: Stop service
             _write_backup_log(f"[{name}] Stopping service...")
             result = subprocess.run(
@@ -4356,7 +4413,7 @@ def backup_gdrive_now():
                 results.append(f"{name}: FAILED - {reason}")
                 continue
 
-            # Step 2: Copy database files to /tmp
+            # Step 2: Zip database files into the scratch dir
             db_files = []
             if os.path.exists(db_dir):
                 db_files = [f for f in os.listdir(db_dir) if os.path.isfile(os.path.join(db_dir, f))]
@@ -4370,27 +4427,34 @@ def backup_gdrive_now():
                 continue
 
             # Zip all DB files into a single backup
-            import zipfile
             with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for f in db_files:
                     zf.write(os.path.join(db_dir, f), f)
-            _write_backup_log(f"[{name}] Database copied to {tmp_path}")
+            _write_backup_log(f"[{name}] Database zipped to {tmp_path}")
 
             # Encrypt the backup before upload
             enc_path = tmp_path + ".enc"
-            if _encrypt_file(tmp_path, enc_path):
-                _write_backup_log(f"[{name}] Backup encrypted: {enc_path}")
-                upload_path = enc_path
-                backup_filename_enc = backup_filename + ".enc"
-            else:
-                _write_backup_log(f"[{name}] WARNING: Encryption failed, uploading unencrypted")
-                upload_path = tmp_path
-                backup_filename_enc = backup_filename
+            encrypted = _encrypt_file(tmp_path, enc_path)
 
-            # Step 3: Restart service immediately after copy
+            # Step 3: Restart service immediately after the copy (whatever the
+            # encryption outcome -- downtime must not depend on openssl).
             subprocess.run(["systemctl", "start", name], timeout=30)
             service_restarted = True
             _write_backup_log(f"[{name}] Service restarted")
+
+            if not encrypted:
+                # Never fall back to uploading the plaintext archive.
+                reason = "Encryption failed; refusing to upload an unencrypted backup"
+                _write_backup_log(f"[{name}] ERROR: {reason}")
+                logger.error(f"[{name}] GDrive backup aborted: {reason}")
+                audit_log("GDRIVE_BACKUP_FAIL", name, {"error": "encryption_failed"})
+                all_ok = False
+                results.append(f"{name}: FAILED - {reason}")
+                continue
+
+            _write_backup_log(f"[{name}] Backup encrypted: {enc_path}")
+            upload_path = enc_path
+            backup_filename_enc = backup_filename + ".enc"
 
             # Step 4: Upload to Google Drive (with one retry on failure, bandwidth throttle)
             uploaded = False
@@ -4420,13 +4484,7 @@ def backup_gdrive_now():
                         all_ok = False
                         results.append(f"{name}: FAILED - {reason}")
 
-            # Step 5: Clean up temporary files
-            for f in [tmp_path, tmp_path + ".enc"]:
-                if os.path.exists(f):
-                    try:
-                        os.remove(f)
-                    except OSError as e:
-                        _write_backup_log(f"[{name}] WARNING: Could not remove temp file: {e}")
+            # Step 5 (temp dir removal) happens in the finally block below.
 
             # Step 6: Retention — delete old backups on Drive
             if uploaded:
@@ -4442,12 +4500,6 @@ def backup_gdrive_now():
                     subprocess.run(["systemctl", "start", name], timeout=30)
                 except Exception:
                     pass
-            for f in [tmp_path, tmp_path + ".enc"]:
-                try:
-                    if os.path.exists(f):
-                        os.remove(f)
-                except OSError:
-                    pass
             all_ok = False
             results.append(f"{name}: FAILED - {reason}")
 
@@ -4461,14 +4513,12 @@ def backup_gdrive_now():
                     subprocess.run(["systemctl", "start", name], timeout=30)
                 except Exception:
                     pass
-            for f in [tmp_path, tmp_path + ".enc"]:
-                try:
-                    if os.path.exists(f):
-                        os.remove(f)
-                except OSError:
-                    pass
             all_ok = False
             results.append(f"{name}: FAILED - {reason}")
+
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # Print summary
     for r in results:
@@ -4504,6 +4554,81 @@ async def gdrive_backup_now_async():
 # ==============================================================================
 #   RESTORE BACKUP MENU
 # ==============================================================================
+
+def _is_safe_backup_filename(name: str) -> bool:
+    """A bare file name only: no path separators, no '.'/'..', no control characters."""
+    return (bool(name) and name == os.path.basename(name) and name not in (".", "..")
+            and not re.search(r"[\x00-\x1f\x7f/\\]", name))
+
+
+def _plan_zip_extraction(zf: "zipfile.ZipFile", dest: str) -> List[Tuple["zipfile.ZipInfo", str, bool]]:
+    """
+    Validate every member of a backup archive against extraction into `dest`
+    and return [(ZipInfo, absolute_target, is_dir)]. Raises ValueError on:
+    absolute paths, '..' components, NUL bytes, symlinks / special files, and
+    any member whose resolved path would land outside `dest`.
+    Nothing is written; call this before touching the live database.
+    """
+    dest_real = os.path.realpath(dest)
+    plan = []
+    for info in zf.infolist():
+        name = info.filename
+        if not name or "\x00" in name:
+            raise ValueError("Unsafe entry in backup archive (empty or NUL name)")
+        norm = name.replace("\\", "/")
+        if norm.startswith("/") or re.match(r"^[A-Za-z]:", norm):
+            raise ValueError(f"Unsafe absolute path in backup archive: {name!r}")
+        parts = [p for p in norm.split("/") if p not in ("", ".")]
+        if ".." in parts:
+            raise ValueError(f"Unsafe '..' path in backup archive: {name!r}")
+        file_type = (info.external_attr >> 16) & 0o170000
+        if file_type == 0o120000:
+            raise ValueError(f"Symlink in backup archive is not allowed: {name!r}")
+        if file_type not in (0, 0o100000, 0o040000):
+            raise ValueError(f"Special file in backup archive is not allowed: {name!r}")
+        if not parts:
+            continue
+        target = os.path.join(dest_real, *parts)
+        resolved = os.path.realpath(target)
+        if os.path.commonpath([dest_real, resolved]) != dest_real:
+            raise ValueError(f"Backup entry escapes the target directory: {name!r}")
+        is_dir = name.endswith("/") or file_type == 0o040000
+        plan.append((info, target, is_dir))
+    return plan
+
+
+def _safe_extract_zip(zip_path: str, dest: str) -> int:
+    """Extract a backup zip into `dest` after validating all members. Returns the file count."""
+    count = 0
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        plan = _plan_zip_extraction(zf, dest)
+        os.makedirs(dest, exist_ok=True)
+        for info, target, is_dir in plan:
+            if is_dir:
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if os.path.islink(target):
+                raise ValueError(f"Refusing to write through symlink: {target}")
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o660)
+            with os.fdopen(fd, 'wb') as out, zf.open(info) as src:
+                shutil.copyfileobj(src, out)
+            count += 1
+    return count
+
+
+def _rollback_restore(db_path: str, archived: Optional[str]):
+    """Put the pre-restore database back after a failed extraction."""
+    if not archived or not os.path.exists(archived):
+        return
+    try:
+        if os.path.exists(db_path):
+            shutil.rmtree(db_path)
+        shutil.move(archived, db_path)
+        logger.info(f"Restore rolled back: {archived} -> {db_path}")
+    except Exception as e:
+        logger.error(f"Restore rollback failed ({archived} -> {db_path}): {e}")
+
 
 async def restore_backup_menu():
     """Restore backup from local or Google Drive"""
@@ -4635,7 +4760,8 @@ async def restore_from_drive():
             await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
             return
 
-        files = [f.strip() for f in result.stdout.strip().split('\n') if f.strip()]
+        files = [f.strip() for f in result.stdout.strip().split('\n')
+                 if f.strip() and _is_safe_backup_filename(f.strip())]
         if not files:
             print_status(f"No backups found on Google Drive for '{name}'.", "warning")
             await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
@@ -4670,63 +4796,58 @@ async def restore_from_drive():
 
     selected_file = files[sel_idx]
     remote_file = f"{remote_path}/{selected_file}"
-    local_tmp = os.path.join("/tmp", selected_file)
 
-    # Download from Google Drive
-    print(f"\n  {C_CYAN}Downloading {selected_file}...{C_RESET}")
+    # Private scratch dir (mkdtemp -> mode 0700) instead of predictable /tmp
+    # paths as root; always removed in the finally block below.
+    tmp_dir = tempfile.mkdtemp(prefix="ats-restore-")
     try:
-        result = subprocess.run(
-            ["rclone", "copy", remote_file, "/tmp", "--bwlimit", RCLONE_BWLIMIT],
-            capture_output=True, text=True, timeout=300
-        )
-        if result.returncode != 0:
-            print_status(f"Download failed: {result.stderr.strip()}", "error")
-            logger.error(f"GDrive restore download failed for {name}: {result.stderr.strip()}")
-            audit_log("RESTORE_DRIVE_FAIL", name, {"error": result.stderr.strip()})
-            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
-            return
-    except subprocess.TimeoutExpired:
-        print_status("Download timed out.", "error")
-        logger.error(f"GDrive restore download timed out for {name}")
-        audit_log("RESTORE_DRIVE_FAIL", name, {"error": "download_timeout"})
-        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
-        return
+        local_tmp = os.path.join(tmp_dir, selected_file)
 
-    if not os.path.exists(local_tmp):
-        print_status(f"Downloaded file not found at {local_tmp}", "error")
-        await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
-        return
-
-    # Decrypt if encrypted (.enc file)
-    restore_file = local_tmp
-    if selected_file.endswith(".enc"):
-        print(f"  {C_CYAN}Decrypting backup...{C_RESET}")
-        dec_path = local_tmp[:-4]  # Remove .enc extension
-        if _decrypt_file(local_tmp, dec_path):
-            restore_file = dec_path
-            _write_backup_log(f"[{name}] Backup decrypted: {dec_path}")
-            logger.info(f"[{name}] Backup decrypted for restore")
-        else:
-            print_status("Decryption failed — check encryption key", "error")
-            logger.error(f"[{name}] Restore decryption failed")
-            audit_log("RESTORE_DRIVE_FAIL", name, {"error": "decryption_failed"})
-            try:
-                os.remove(local_tmp)
-            except OSError:
-                pass
-            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
-            return
-
-    display_name = selected_file.replace(".enc", "") if selected_file.endswith(".enc") else selected_file
-    await _do_restore(svc, restore_file, display_name)
-
-    # Clean up downloaded and decrypted files
-    for f in [local_tmp, restore_file]:
+        # Download from Google Drive
+        print(f"\n  {C_CYAN}Downloading {selected_file}...{C_RESET}")
         try:
-            if os.path.exists(f):
-                os.remove(f)
-        except OSError:
-            pass
+            result = subprocess.run(
+                ["rclone", "copy", remote_file, tmp_dir, "--bwlimit", RCLONE_BWLIMIT],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                print_status(f"Download failed: {result.stderr.strip()}", "error")
+                logger.error(f"GDrive restore download failed for {name}: {result.stderr.strip()}")
+                audit_log("RESTORE_DRIVE_FAIL", name, {"error": result.stderr.strip()})
+                await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+                return
+        except subprocess.TimeoutExpired:
+            print_status("Download timed out.", "error")
+            logger.error(f"GDrive restore download timed out for {name}")
+            audit_log("RESTORE_DRIVE_FAIL", name, {"error": "download_timeout"})
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+
+        if not os.path.exists(local_tmp):
+            print_status(f"Downloaded file not found at {local_tmp}", "error")
+            await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+            return
+
+        # Decrypt if encrypted (.enc file)
+        restore_file = local_tmp
+        if selected_file.endswith(".enc"):
+            print(f"  {C_CYAN}Decrypting backup...{C_RESET}")
+            dec_path = local_tmp[:-4]  # Remove .enc extension
+            if _decrypt_file(local_tmp, dec_path):
+                restore_file = dec_path
+                _write_backup_log(f"[{name}] Backup decrypted")
+                logger.info(f"[{name}] Backup decrypted for restore")
+            else:
+                print_status("Decryption failed — check encryption key", "error")
+                logger.error(f"[{name}] Restore decryption failed")
+                audit_log("RESTORE_DRIVE_FAIL", name, {"error": "decryption_failed"})
+                await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
+                return
+
+        display_name = selected_file[:-4] if selected_file.endswith(".enc") else selected_file
+        await _do_restore(svc, restore_file, display_name)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 async def _do_restore(svc, backup_path, filename):
@@ -4745,11 +4866,17 @@ async def _do_restore(svc, backup_path, filename):
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
         return
 
+    temp_old = None
     try:
         db_path = os.path.join(svc['storage_path'], "database", name)
 
         logger.info(f"[{name}] Restore started: {filename}")
         audit_log("RESTORE_START", name, {"filename": filename})
+
+        # Reject unsafe archives (absolute paths, '..', symlinks) BEFORE the
+        # service is stopped or the live database is touched.
+        with zipfile.ZipFile(backup_path, 'r') as zf:
+            _plan_zip_extraction(zf, db_path)
 
         print_status(f"Stopping service {name}...", "info")
         run_root(["systemctl", "stop", name])
@@ -4766,9 +4893,7 @@ async def _do_restore(svc, backup_path, filename):
             os.makedirs(db_path, exist_ok=True)
 
         print_status("Extracting backup files...", "info")
-        import zipfile
-        with zipfile.ZipFile(backup_path, 'r') as zf:
-            zf.extractall(db_path)
+        _safe_extract_zip(backup_path, db_path)
         logger.info(f"[{name}] Backup extracted to {db_path}")
 
         # Set permissions
@@ -4791,6 +4916,7 @@ async def _do_restore(svc, backup_path, filename):
         logger.error(f"[{name}] Restore failed: {e}")
         print_status(f"Restore failed: {e}", "error")
         audit_log("RESTORE_FAILED", name, {"filename": filename, "error": str(e)})
+        _rollback_restore(os.path.join(svc['storage_path'], "database", name), temp_old)
         # Try to restart service anyway
         try:
             run_root(["systemctl", "start", name])
@@ -5064,9 +5190,14 @@ async def restore_backup(backup: Dict):
         print_status("Restore cancelled", "warning")
         return
 
+    temp_old = None
     try:
         db_path = os.path.join(svc['storage_path'], "database", name)
-        
+
+        # Reject unsafe archives before the service is stopped.
+        with zipfile.ZipFile(backup_path, 'r') as zf:
+            _plan_zip_extraction(zf, db_path)
+
         print_status(f"Stopping service {name}...", "info")
         run_root(["systemctl", "stop", name])
 
@@ -5080,9 +5211,7 @@ async def restore_backup(backup: Dict):
             os.makedirs(db_path, exist_ok=True)
 
         print_status("Extracting backup files...", "info")
-        import zipfile
-        with zipfile.ZipFile(backup_path, 'r') as zf:
-            zf.extractall(db_path)
+        _safe_extract_zip(backup_path, db_path)
 
         # Set permissions
         for root, dirs, files in os.walk(db_path):
@@ -5103,6 +5232,11 @@ async def restore_backup(backup: Dict):
     except Exception as e:
         logger.error(f"Restore failed: {e}")
         print_status(f"Restore failed: {e}", "error")
+        _rollback_restore(os.path.join(svc['storage_path'], "database", name), temp_old)
+        try:
+            run_root(["systemctl", "start", name])
+        except Exception:
+            pass
         await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}"))
 
 async def global_operations():
