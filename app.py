@@ -176,7 +176,7 @@ def _ats_resolve_value(key: str, cfg: Dict):
     return None
 
 
-_DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+_DOMAIN_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")   # used with fullmatch (never "$": it matches before a trailing newline)
 
 
 def _check_domain_format(domain: str) -> str:
@@ -190,18 +190,16 @@ def _check_domain_format(domain: str) -> str:
     """
     if not domain or not isinstance(domain, str):
         raise ValueError("Domain cannot be empty")
-    d = domain.strip().lower()
-    if not d:
-        raise ValueError("Domain cannot be empty")
+    d = domain.lower()
     if len(d) > 253:
         raise ValueError("Invalid domain format (longer than 253 characters).")
     labels = d.split(".")
     if len(labels) < 2:
         raise ValueError("Invalid domain format.")
     for label in labels:
-        if not label or len(label) > 63 or not _DOMAIN_LABEL_RE.match(label):
+        if not label or len(label) > 63 or not _DOMAIN_LABEL_RE.fullmatch(label):
             raise ValueError("Invalid domain format.")
-    if not re.match(r"^[a-z]{2,}$", labels[-1]):
+    if not re.fullmatch(r"[a-z]{2,}", labels[-1]):
         raise ValueError("Invalid domain format.")
     return d
 
@@ -410,6 +408,9 @@ BACKUP_DIR = os.path.join(DEFAULT_STORAGE, "backups")
 GDRIVE_REMOTE = os.environ.get("ATS_GDRIVE_REMOTE", "gdrive")
 GDRIVE_FOLDER = f"{GDRIVE_REMOTE}:backups"
 ATS_LOG_DIR = os.path.join(ATS_HOME, "logs")
+# Where generated service units are written (a module constant so tests can redirect it).
+SYSTEMD_DIR = "/etc/systemd/system"
+
 # Per-service flock files (<name>.lock): shared by the CLI, the daemon and any
 # other ATS process so only one update/restart/redeploy runs per service.
 LOCKS_DIR = os.path.join(ATS_HOME, "locks")
@@ -426,8 +427,9 @@ BLOCKED_PATHS = ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64
 # The only places under a blocked prefix that are acceptable storage roots.
 ALLOWED_STORAGE_EXCEPTIONS = ["/var/www", "/var/lib/ats*"]
 
-SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-BRANCH_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,100}$")
+# All of these are used with fullmatch(): "$" would accept a trailing newline.
+SERVICE_NAME_RE = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+BRANCH_RE = re.compile(r"(?!-)[A-Za-z0-9._/-]{1,100}")
 
 # Allowed ranges for per-service resource settings.
 WORKERS_RANGE = (1, 32)
@@ -1128,7 +1130,7 @@ def _validate_int_range(value, label: str, lo: int, hi: int) -> int:
         n = value
     else:
         text = str(value).strip() if value is not None else ""
-        if not re.match(r"^[+-]?\d+$", text):
+        if not re.fullmatch(r"[+-]?[0-9]+", text):
             raise ValueError(f"{label} must be a whole number.")
         n = int(text)
     if not (lo <= n <= hi):
@@ -1149,13 +1151,13 @@ def validate_cpu(value) -> int:
 
 def validate_service_name(name: str) -> str:
     """Validate a service name (^[a-zA-Z0-9_-]{1,64}$)."""
-    if not isinstance(name, str) or not SERVICE_NAME_RE.match(name):
+    if not isinstance(name, str) or not SERVICE_NAME_RE.fullmatch(name):
         raise ValueError("Invalid service name format (use letters, digits, '_' or '-', max 64 chars)")
     return name
 
 def validate_branch(branch: str) -> str:
     """Validate a git branch name (no leading '-', no whitespace/odd characters)."""
-    if not isinstance(branch, str) or not BRANCH_RE.match(branch) or ".." in branch:
+    if not isinstance(branch, str) or not BRANCH_RE.fullmatch(branch) or ".." in branch:
         raise ValueError("Invalid branch name.")
     return branch
 
@@ -1513,7 +1515,7 @@ async def deploy_service_async():
         api_dir = os.path.join(api_parent, name)
         db_dir = os.path.join(storage, "database", name)
         log_dir = os.path.join(api_dir, "logs")
-        svc_file = f"/etc/systemd/system/{name}.service"
+        svc_file = f"{SYSTEMD_DIR}/{name}.service"
 
         print(f"\n{C_CYAN}Deployment structure:{C_RESET}")
         print(f"  Storage:   {storage}")
@@ -2203,7 +2205,7 @@ async def destroy_service():
         logger.warning(f"[{name}] systemctl disable warning (continuing): {e}")
 
     try:
-        svc_file = f"/etc/systemd/system/{name}.service"
+        svc_file = f"{SYSTEMD_DIR}/{name}.service"
         if os.path.exists(svc_file):
             os.remove(svc_file)
         run_root(["systemctl", "daemon-reload"])
@@ -2488,7 +2490,7 @@ def acquire_service_lock(name: str) -> ServiceLockHandle:
     exclude each other. Raises ServiceBusyError immediately if it is held.
     Pair every call with release_service_lock(), or use service_lock().
     """
-    if not isinstance(name, str) or not re.match(r"^[a-zA-Z0-9_-]+$", name):
+    if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_-]+", name):
         raise ValueError("Invalid service name for lock")
     with _INPROC_GUARD:
         if name in _INPROC_LOCKS:
@@ -2586,7 +2588,7 @@ def _find_pip(venv_path: str) -> Optional[str]:
 
 
 def _unit_path(name: str) -> str:
-    return f"/etc/systemd/system/{name}.service"
+    return f"{SYSTEMD_DIR}/{name}.service"
 
 
 def _rewrite_unit(name: str, transform: Callable[[str], str]) -> None:
@@ -3425,7 +3427,7 @@ WEBHOOK_MAX_BODY = 1024 * 1024        # 1 MiB
 WEBHOOK_READ_TIMEOUT = 10             # seconds, for the whole request (line + headers + body)
 WEBHOOK_MAX_HEADERS = 100
 WEBHOOK_EVENT_RETENTION = 200         # webhook_events rows kept per service
-_WEBHOOK_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_WEBHOOK_REPO_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
 _WEBHOOK_TASKS: set = set()           # keeps background update tasks referenced until done
 
 
@@ -3703,7 +3705,7 @@ async def handle_webhook(reader, writer):
         elif segments not in ([], ["webhook"]):
             await _http_reply(writer, 404)
             return
-        if service_name is not None and not SERVICE_NAME_RE.match(service_name):
+        if service_name is not None and not SERVICE_NAME_RE.fullmatch(service_name):
             logger.warning(f"Webhook: invalid service name in URL: {sanitize_for_log(service_name, 80)!r}")
             await _http_reply(writer, 404)
             return
@@ -3720,7 +3722,7 @@ async def handle_webhook(reader, writer):
                 payload = None
             repo = payload.get("repository") if isinstance(payload, dict) else None
             candidate = repo.get("name") if isinstance(repo, dict) else None
-            if isinstance(candidate, str) and _WEBHOOK_REPO_RE.match(candidate):
+            if isinstance(candidate, str) and _WEBHOOK_REPO_RE.fullmatch(candidate):
                 service_name = candidate
             else:
                 await _http_reply(writer, 404)
@@ -6624,7 +6626,7 @@ async def update_database_async():
                 logger.info(f"[{name}] Permissions set on new directories")
 
                 # Update systemd service file
-                svc_file = f"/etc/systemd/system/{name}.service"
+                svc_file = f"{SYSTEMD_DIR}/{name}.service"
                 if os.path.exists(svc_file):
                     print_status("Updating systemd service file...", "info")
                     logger.info(f"[{name}] Updating systemd file: {svc_file}")
