@@ -626,15 +626,50 @@ class DatabaseManager:
             )
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS webhook_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_name TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                event TEXT,
+                ref TEXT,
+                commit_sha TEXT,
+                result TEXT,
+                message TEXT
+            )
+        ''')
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_webhook_events_service ON webhook_events(service_name, id)")
+
         conn.commit()
-        
-        # --- MIGRATIONS FOR EXISTING DATABASES ---
-        try:
-            cursor.execute("ALTER TABLE services ADD COLUMN branch TEXT DEFAULT 'main'")
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass # Column already exists
-            
+
+        # --- MIGRATIONS FOR EXISTING DATABASES (idempotent) ---
+        # Column names/types below are literals, never user input.
+        existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(services)")}
+        for col, ddl in (
+            ("branch", "TEXT DEFAULT 'main'"),
+            ("container_port", "INTEGER"),
+            ("auto_update", "INTEGER DEFAULT 1"),
+            ("webhook_secret", "TEXT"),
+        ):
+            if col in existing_cols:
+                continue
+            try:
+                cursor.execute(f"ALTER TABLE services ADD COLUMN {col} {ddl}")
+                conn.commit()
+            except sqlite3.OperationalError as e:
+                # Another ATS process may have added it between the check and the ALTER.
+                if "duplicate column" not in str(e).lower():
+                    raise
+
+        # Backfill: every service must have its own webhook secret.
+        for row in cursor.execute(
+                "SELECT id FROM services WHERE webhook_secret IS NULL OR webhook_secret = ''").fetchall():
+            cursor.execute(
+                "UPDATE services SET webhook_secret=? WHERE id=? AND (webhook_secret IS NULL OR webhook_secret = '')",
+                (secrets.token_hex(32), row[0]))
+        conn.commit()
+
         conn.close()
 
         try:
@@ -671,6 +706,26 @@ class DatabaseManager:
             # degrade to "no rows" on a transient DB error instead of
             # crashing with "TypeError: NoneType is not iterable".
             return [] if fetch_all else None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def insert(self, sql: str, args=()) -> Optional[int]:
+        """Execute an INSERT and return the new row id (None on a database error)."""
+        conn = None
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.execute("PRAGMA busy_timeout=5000")
+            cursor = conn.cursor()
+            cursor.execute(sql, args)
+            conn.commit()
+            return cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error(f"DB Error: {e}")
+            return None
         finally:
             if conn is not None:
                 try:
@@ -1733,10 +1788,12 @@ async def deploy_service_async():
             deployment_hash = calculate_file_hash(target_file) if os.path.exists(target_file) else "none"
 
             print_status("Inserting service record...", "info")
+            webhook_secret = generate_webhook_secret()
             db.query(
-                """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash, runtime) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash, runtime)
+                """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash, runtime, branch, webhook_secret) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash, runtime,
+                 branch, webhook_secret)
             )
 
             # Verify insertion
@@ -1750,10 +1807,10 @@ async def deploy_service_async():
                 conn = sqlite3.connect(DB_FILE)
                 cursor = conn.cursor()
                 cursor.execute(
-                    """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash, runtime) 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO services (name, port, domain, storage_path, repo_url, workers, max_memory_mb, cpu_quota, deployment_hash, runtime, branch, webhook_secret) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (name, port, domain, storage, repo_url, config.workers, max_memory, cpu_quota, deployment_hash,
-                     runtime)
+                     runtime, branch, webhook_secret)
                 )
                 conn.commit()
                 conn.close()
@@ -1822,6 +1879,7 @@ async def deploy_service_async():
         print(f"  {C_BOLD}Code:{C_RESET}       {api_dir}")
         print(f"  {C_BOLD}Database:{C_RESET}   {db_dir}")
         print(f"  {C_BOLD}Logs:{C_RESET}       {log_dir}")
+        print_webhook_setup(name)
         if cloudflare_route_ok:
             print(f"\n{C_GREEN}{'=' * 70}{C_RESET}\n")
         else:
@@ -2179,6 +2237,7 @@ async def destroy_service():
     try:
         print_status("UPDATING DATABASE", "info")
         db.query("DELETE FROM services WHERE id=?", (svc['id'],))
+        db.query("DELETE FROM webhook_events WHERE service_name=?", (name,))
         print_status("Database updated", "success")
 
         audit_log("DESTROY", name, {"domain": svc['domain'], "port": svc['port']})
@@ -3208,6 +3267,9 @@ async def _service_menu_action(choice: str, name: str, svc) -> None:
     elif choice == "8":
         await call(update_service_config, name)
 
+    elif choice == "10":
+        await call(manage_webhook_menu, name)
+
     elif choice == "9":
         # REDEPLOY — stop service, delete code dir, clone new repo, reinstall deps, start
         new_repo_url = (await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}New Git Repository URL:{C_RESET} "))).strip()
@@ -3306,6 +3368,7 @@ async def service_operations():
     print("  7. View resource usage")
     print("  8. Update configuration")
     print("  9. Redeploy service (new git)")
+    print("  10. Webhook URL / secret (view, rotate)")
     print("  0. Cancel")
 
     choice = (await loop.run_in_executor(None, lambda: input(f"\n{C_CYAN}Select operation:{C_RESET} "))).strip()
@@ -3353,8 +3416,121 @@ async def direct_update(name: str, svc: dict):           # FIX: added svc param
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-#   handle_webhook  — GitHub / GitLab push-event handler
+#   Webhook secrets, events and request helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+WEBHOOK_PORT = 9999
+WEBHOOK_DEFAULT_BIND = "127.0.0.1"
+WEBHOOK_MAX_BODY = 1024 * 1024        # 1 MiB
+WEBHOOK_READ_TIMEOUT = 10             # seconds, for the whole request (line + headers + body)
+WEBHOOK_MAX_HEADERS = 100
+WEBHOOK_EVENT_RETENTION = 200         # webhook_events rows kept per service
+_WEBHOOK_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_WEBHOOK_TASKS: set = set()           # keeps background update tasks referenced until done
+
+
+def webhook_bind_address() -> str:
+    """Address the listener binds to: 127.0.0.1 unless ATS_WEBHOOK_BIND overrides it."""
+    return os.environ.get("ATS_WEBHOOK_BIND", "").strip() or WEBHOOK_DEFAULT_BIND
+
+
+def webhook_url(name: str) -> str:
+    """Public payload URL to configure on GitHub for this service."""
+    return f"https://webhook.{MAIN_DOMAIN}/webhook/{name}"
+
+
+def generate_webhook_secret() -> str:
+    """32 random bytes, hex encoded."""
+    return secrets.token_hex(32)
+
+
+def sanitize_for_log(value, max_len: int = 200) -> str:
+    """Make attacker-controlled text safe to log/audit: control characters become spaces, truncated."""
+    text = "" if value is None else str(value)
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f  ]", " ", text)
+    return text if len(text) <= max_len else text[:max_len] + "..."
+
+
+def verify_webhook_signature(secret: str, body: bytes, header: Optional[str]) -> bool:
+    """Check an `X-Hub-Signature-256: sha256=<hex>` header (constant-time compare)."""
+    if not secret or not header:
+        return False
+    header = header.strip()
+    if not header.startswith("sha256="):
+        return False
+    try:
+        provided = header[len("sha256="):].encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest().encode("ascii")
+    return hmac.compare_digest(expected, provided)
+
+
+def get_webhook_info(name: str) -> Optional[Dict]:
+    """{"name", "url", "secret", "auto_update", "branch"} for a service, or None."""
+    row = db.query("SELECT * FROM services WHERE name=?", (name,), fetch_one=True)
+    if not row:
+        return None
+    auto = _svc_field(row, 'auto_update', 1)
+    return {
+        "name": row['name'],
+        "url": webhook_url(row['name']),
+        "secret": _svc_field(row, 'webhook_secret', "") or "",
+        "auto_update": bool(auto),
+        "branch": _svc_field(row, 'branch', 'main') or 'main',
+    }
+
+
+def rotate_webhook_secret(name: str) -> str:
+    """Replace the service's webhook secret with a fresh random one and return it."""
+    if not db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
+        raise ValueError(f"Service '{name}' not found")
+    new_secret = generate_webhook_secret()
+    db.query("UPDATE services SET webhook_secret=?, updated_at=CURRENT_TIMESTAMP WHERE name=?", (new_secret, name))
+    audit_log("WEBHOOK_SECRET_ROTATED", name)
+    return new_secret
+
+
+def set_auto_update(name: str, enabled: bool) -> None:
+    """Turn webhook-triggered updates on/off for a service."""
+    if not db.query("SELECT 1 FROM services WHERE name=?", (name,), fetch_one=True):
+        raise ValueError(f"Service '{name}' not found")
+    db.query("UPDATE services SET auto_update=? WHERE name=?", (1 if enabled else 0, name))
+    audit_log("WEBHOOK_AUTO_UPDATE", name, {"enabled": bool(enabled)})
+
+
+def record_webhook_event(service_name: str, event: Optional[str], ref: Optional[str],
+                         commit_sha: Optional[str], result: str, message: str = "") -> Optional[int]:
+    """Insert a webhook_events row (fields sanitised) and keep only the newest 200 per service."""
+    event_id = db.insert(
+        "INSERT INTO webhook_events (service_name, event, ref, commit_sha, result, message) VALUES (?, ?, ?, ?, ?, ?)",
+        (service_name, sanitize_for_log(event, 40), sanitize_for_log(ref, 200),
+         sanitize_for_log(commit_sha, 64), result, sanitize_for_log(message, 300))
+    )
+    db.query(
+        "DELETE FROM webhook_events WHERE service_name=? AND id NOT IN "
+        "(SELECT id FROM webhook_events WHERE service_name=? ORDER BY id DESC LIMIT ?)",
+        (service_name, service_name, WEBHOOK_EVENT_RETENTION)
+    )
+    return event_id
+
+
+def update_webhook_event(event_id: Optional[int], result: str, message: str = "") -> None:
+    """Set the final result/message of a previously recorded delivery."""
+    if event_id is None:
+        return
+    db.query("UPDATE webhook_events SET result=?, message=? WHERE id=?",
+             (result, sanitize_for_log(message, 300), event_id))
+
+
+def list_webhook_events(name: str, limit: int = 20) -> List[Dict]:
+    """Newest-first deliveries for a service: [{timestamp, event, ref, commit, result, message}]."""
+    rows = db.query(
+        "SELECT timestamp, event, ref, commit_sha, result, message FROM webhook_events "
+        "WHERE service_name=? ORDER BY id DESC LIMIT ?", (name, int(limit)), fetch_all=True)
+    return [{"timestamp": r['timestamp'], "event": r['event'], "ref": r['ref'], "commit": r['commit_sha'],
+             "result": r['result'], "message": r['message']} for r in rows]
+
 
 def get_service_by_name(name: str) -> Optional[dict]:
     """Look up service by name first, then fall back to repo URL match"""
@@ -3384,96 +3560,254 @@ def get_service_by_name(name: str) -> Optional[dict]:
 
     return None
 
-async def handle_webhook(reader, writer):
+# ──────────────────────────────────────────────────────────────────────────────
+#   handle_webhook  — GitHub push-event handler (authenticated)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_HTTP_REASONS = {
+    200: "OK", 202: "Accepted", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
+    404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout", 411: "Length Required",
+    413: "Payload Too Large", 431: "Request Header Fields Too Large", 500: "Internal Server Error",
+}
+
+
+class _BadWebhookRequest(Exception):
+    """Malformed/oversized request: carries the HTTP status to answer with."""
+
+    def __init__(self, status: int, detail: str = ""):
+        super().__init__(detail or _HTTP_REASONS.get(status, ""))
+        self.status = status
+
+
+async def _http_reply(writer, status: int, body: str = "") -> None:
+    """Write a minimal HTTP/1.1 response and close-delimit it. Bodies never carry detail on 4xx."""
+    reason = _HTTP_REASONS.get(status, "")
+    payload = (body or reason).encode()
+    head = (
+        f"HTTP/1.1 {status} {reason}\r\n"
+        "Content-Type: text/plain\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    writer.write(head + payload)
+    await writer.drain()
+
+
+async def _read_webhook_request(reader) -> Tuple[str, str, Dict[str, str], bytes]:
+    """Read request line, headers and (size-limited) body. Raises _BadWebhookRequest."""
     try:
-        # ── Read request line ────────────────────────────────────────────────
-        request_line = await asyncio.wait_for(reader.readline(), timeout=10)
-        request_line = request_line.decode(errors="replace").strip()
+        request_line = (await reader.readline()).decode("latin-1").strip()
+    except (ValueError, asyncio.LimitOverrunError):
+        raise _BadWebhookRequest(431)
+    parts = request_line.split(" ")
+    if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+        raise _BadWebhookRequest(400)
+    method, target = parts[0].upper(), parts[1]
 
-        # Extract service name from path:  POST /webhook/my-service HTTP/1.1
-        service_name = None
-        parts = request_line.split()
-        if len(parts) >= 2:
-            path = parts[1]                              # e.g. /webhook/my-service
-            segments = [s for s in path.split("/") if s]
-            # Path may be /webhook/<name>  or just /<name>
-            if len(segments) >= 2 and segments[0] == "webhook":
-                service_name = segments[1]
-            elif len(segments) == 1:
-                service_name = segments[0]
+    headers: Dict[str, str] = {}
+    while True:
+        try:
+            line = (await reader.readline()).decode("latin-1").strip()
+        except (ValueError, asyncio.LimitOverrunError):
+            raise _BadWebhookRequest(431)
+        if not line:
+            break                                        # blank line = end of headers
+        if len(headers) >= WEBHOOK_MAX_HEADERS:
+            raise _BadWebhookRequest(431)
+        if ":" in line:
+            key, _, val = line.partition(":")
+            key = key.strip().lower()
+            if key == "content-length" and key in headers:
+                raise _BadWebhookRequest(400, "duplicate content-length")
+            headers[key] = val.strip()
 
-        # ── Read headers ─────────────────────────────────────────────────────
-        headers = {}
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=10)
-            line = line.decode(errors="replace").strip()
-            if not line:
-                break                                    # blank line = end of headers
-            if ":" in line:
-                key, _, val = line.partition(":")
-                headers[key.strip().lower()] = val.strip()
+    if "transfer-encoding" in headers:
+        raise _BadWebhookRequest(411)
+    raw_len = headers.get("content-length", "0")
+    if not re.fullmatch(r"[0-9]{1,12}", raw_len):        # integer, >= 0 (no sign, no spaces)
+        raise _BadWebhookRequest(400, "bad content-length")
+    content_length = int(raw_len)
+    if content_length > WEBHOOK_MAX_BODY:
+        raise _BadWebhookRequest(413)
 
-        # ── Read body ────────────────────────────────────────────────────────
-        if headers.get("x-github-event") == "ping":
-            logger.info("Webhook: GitHub ping received — ignoring")
-            response = (
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: 2\r\n"
-                "Connection: close\r\n"
-                "\r\nOK"
-            )
-            writer.write(response.encode())
-            await writer.drain()
+    body = b""
+    if content_length:
+        try:
+            body = await reader.readexactly(content_length)
+        except asyncio.IncompleteReadError:
+            raise _BadWebhookRequest(400, "truncated body")
+    return method, target, headers, body
+
+
+async def _run_webhook_update(name: str, svc: dict, event_id: Optional[int]) -> None:
+    """Background: run the update under the per-service lock and record the outcome."""
+    loop = asyncio.get_running_loop()
+    started = time.time()
+    try:
+        res = await loop.run_in_executor(None, functools.partial(service_git_update, name, svc, _logger_log))
+        result, message = "updated", res.get("message", "")
+        db.query("INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
+                 (name, "success", time.time() - started))
+    except ServiceBusyError as e:
+        result, message = "busy", str(e)
+        logger.warning(f"[{name}] Webhook update skipped: {e}")
+    except Exception as e:
+        result, message = "failed", str(e)[:300]
+        logger.error(f"[{name}] Webhook update failed: {e}")
+        db.query("INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",
+                 (name, "failed", time.time() - started, str(e)[:500]))
+    update_webhook_event(event_id, result, message)
+    audit_log("WEBHOOK_UPDATE", name, {"result": result})
+
+
+async def handle_webhook(reader, writer):
+    """
+    Handle one webhook delivery (see MANAGE_SPEC 2.6):
+
+      * POST /webhook/<service> (or /<service>); the name must match
+        ^[a-zA-Z0-9_-]{1,64}$. The repo-name fallback (payload repository.name)
+        may still locate the service, but the signature is always verified
+        against THAT service's secret.
+      * X-Hub-Signature-256 = sha256 HMAC of the raw body, constant-time compared.
+        Bad/missing -> 401, service without a secret -> 403 (no detail in the body).
+      * body <= 1 MiB (413), Content-Length validated, whole read bounded by a timeout.
+      * ping -> 200; only push events for the tracked branch update; reply 202
+        immediately and update in the background under the per-service lock.
+      * every delivery for a known service is recorded in webhook_events.
+    """
+    try:
+        try:
+            method, target, headers, body = await asyncio.wait_for(
+                _read_webhook_request(reader), timeout=WEBHOOK_READ_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("Webhook: timed out reading request")
+            await _http_reply(writer, 408)
+            return
+        except _BadWebhookRequest as e:
+            logger.warning(f"Webhook: rejected malformed request ({e.status})")
+            await _http_reply(writer, e.status)
             return
 
-        payload = {}
-        content_length = int(headers.get("content-length", 0))
+        if method != "POST":
+            await _http_reply(writer, 405)
+            return
 
-        if content_length > 0:
-            raw_body = await asyncio.wait_for(
-                reader.readexactly(content_length), timeout=15
-            )
+        # ── service name from the path (validated before any use or logging) ──
+        path = target.split("?", 1)[0].split("#", 1)[0]
+        segments = [seg for seg in path.split("/") if seg]
+        service_name = None
+        if len(segments) == 2 and segments[0] == "webhook":
+            service_name = segments[1]
+        elif len(segments) == 1 and segments[0] != "webhook":
+            service_name = segments[0]
+        elif segments not in ([], ["webhook"]):
+            await _http_reply(writer, 404)
+            return
+        if service_name is not None and not SERVICE_NAME_RE.match(service_name):
+            logger.warning(f"Webhook: invalid service name in URL: {sanitize_for_log(service_name, 80)!r}")
+            await _http_reply(writer, 404)
+            return
+
+        event = sanitize_for_log(headers.get("x-github-event", ""), 40)
+        delivery = sanitize_for_log(headers.get("x-github-delivery", ""), 64)
+
+        # ── Fallback: repo name from the (not yet authenticated) payload ──────
+        payload = None
+        if service_name is None:
             try:
-                payload = json.loads(raw_body.decode(errors="replace"))
-            except json.JSONDecodeError:
-                logger.warning("Webhook: could not parse JSON body")
-
-        # ── Fallback: try to get repo/service name from payload ──────────────
-        if not service_name:
-            # GitHub sends repository.name; GitLab sends repository.name too
-            service_name = (
-                payload.get("repository", {}).get("name")
-                or payload.get("project", {}).get("name")
-            )
-
-        # ── Respond 200 OK immediately (before doing the update) ─────────────
-        response = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 2\r\n"
-            "Connection: close\r\n"
-            "\r\nOK"
-        )
-        writer.write(response.encode())
-        await writer.drain()
-
-        # ── Trigger update in background ──────────────────────────────────────
-        if service_name:
-            audit_log("WEBHOOK_RECEIVED", service_name, {"source": headers.get("x-github-event") or headers.get("x-gitlab-event") or "unknown", "delivery": headers.get("x-github-delivery") or headers.get("x-gitlab-event-uuid") or "unknown",})
-            svc = get_service_by_name(service_name)
-            if svc:
-                actual_name = svc['name']  # FIX: use DB service name, not repo name
-                logger.info(f"Webhook: repo '{service_name}' matched service '{actual_name}'")
-                asyncio.create_task(_do_git_update(actual_name, svc))
+                payload = json.loads(body.decode("utf-8", errors="replace"))
+            except ValueError:
+                payload = None
+            repo = payload.get("repository") if isinstance(payload, dict) else None
+            candidate = repo.get("name") if isinstance(repo, dict) else None
+            if isinstance(candidate, str) and _WEBHOOK_REPO_RE.match(candidate):
+                service_name = candidate
             else:
-                logger.warning(f"Webhook: unknown service '{service_name}'")
-                audit_log("WEBHOOK_UNKNOWN_SERVICE", service_name, {})
+                await _http_reply(writer, 404)
+                return
 
-    except asyncio.TimeoutError:
-        logger.error("Webhook error: timed out reading request")
+        svc = get_service_by_name(service_name)
+        if not svc:
+            logger.warning(f"Webhook: unknown service '{sanitize_for_log(service_name, 80)}'")
+            audit_log("WEBHOOK_UNKNOWN_SERVICE", sanitize_for_log(service_name, 80), {})
+            # Same answer as a bad signature so service names cannot be enumerated.
+            await _http_reply(writer, 401)
+            return
+        actual_name = svc['name']              # FIX: use DB service name, not repo name
+
+        # ── Authentication ────────────────────────────────────────────────────
+        secret = svc.get('webhook_secret') or ""
+        if not secret:
+            logger.warning(f"Webhook: service '{actual_name}' has no webhook secret configured")
+            record_webhook_event(actual_name, event, None, None, "rejected_signature", "no webhook secret configured")
+            audit_log("WEBHOOK_REJECTED", actual_name, {"reason": "no_secret"})
+            await _http_reply(writer, 403)
+            return
+        if not verify_webhook_signature(secret, body, headers.get("x-hub-signature-256")):
+            logger.warning(f"Webhook: bad or missing signature for '{actual_name}'")
+            record_webhook_event(actual_name, event, None, None, "rejected_signature", "invalid or missing signature")
+            audit_log("WEBHOOK_REJECTED", actual_name, {"reason": "bad_signature"})
+            await _http_reply(writer, 401)
+            return
+
+        audit_log("WEBHOOK_RECEIVED", actual_name, {"source": event or "unknown", "delivery": delivery or "unknown"})
+
+        # ── Authenticated from here on ────────────────────────────────────────
+        if event == "ping":
+            logger.info(f"Webhook: ping received for '{actual_name}'")
+            record_webhook_event(actual_name, event, None, None, "accepted", "ping")
+            await _http_reply(writer, 200, "OK")
+            return
+
+        if event != "push":
+            record_webhook_event(actual_name, event, None, None, "ignored_event", "event type is not push")
+            await _http_reply(writer, 200, "ignored")
+            return
+
+        if not isinstance(payload, dict):
+            try:
+                payload = json.loads(body.decode("utf-8", errors="replace"))
+            except ValueError:
+                payload = None
+        if not isinstance(payload, dict):
+            record_webhook_event(actual_name, event, None, None, "ignored_event", "payload is not valid JSON")
+            await _http_reply(writer, 400)
+            return
+
+        ref = payload.get("ref") if isinstance(payload.get("ref"), str) else ""
+        after = payload.get("after")
+        commit = after if isinstance(after, str) and re.fullmatch(r"[0-9a-fA-F]{7,64}", after) else None
+        branch = svc.get('branch') or "main"
+
+        if ref != f"refs/heads/{branch}":
+            record_webhook_event(actual_name, event, ref, commit, "ignored_branch",
+                                 f"push to {sanitize_for_log(ref, 100)} ignored (tracking {branch})")
+            await _http_reply(writer, 200, "ignored")
+            return
+
+        auto_update = svc.get('auto_update')
+        if auto_update is not None and not int(auto_update):
+            record_webhook_event(actual_name, event, ref, commit, "accepted", "auto_update is off; no update performed")
+            await _http_reply(writer, 200, "accepted")
+            return
+
+        event_id = record_webhook_event(actual_name, event, ref, commit, "accepted", "update started")
+        logger.info(f"Webhook: push to '{branch}' accepted for service '{actual_name}'")
+        await _http_reply(writer, 202)
+
+        # ── Trigger update in background (single flight per service via flock) ─
+        task = asyncio.create_task(_run_webhook_update(actual_name, svc, event_id))
+        _WEBHOOK_TASKS.add(task)
+        task.add_done_callback(_WEBHOOK_TASKS.discard)
+
+    except ConnectionError:
+        pass                                  # client went away mid-reply
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
+        logger.error(f"Webhook error: {sanitize_for_log(e, 300)}")
+        try:
+            await _http_reply(writer, 500)
+        except Exception:
+            pass
     finally:
         try:
             writer.close()
@@ -3485,17 +3819,72 @@ async def handle_webhook(reader, writer):
 #   start_webhook_server / run_webhook_listener
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def start_webhook_server():
-    """Start background webhook listener on port 9999"""
+async def start_webhook_server(bind: Optional[str] = None, port: int = WEBHOOK_PORT):
+    """Start background webhook listener (127.0.0.1:9999 unless ATS_WEBHOOK_BIND says otherwise)"""
+    bind = bind or webhook_bind_address()
     try:
-        server = await asyncio.start_server(handle_webhook, '0.0.0.0', 9999)
-        print_status("Webhook Listener active on port 9999", "success")
-        logger.info("Webhook Listener active on port 9999")
+        server = await asyncio.start_server(handle_webhook, bind, port)
+        print_status(f"Webhook Listener active on {bind}:{port}", "success")
+        logger.info(f"Webhook Listener active on {bind}:{port}")
+        if bind not in ("127.0.0.1", "::1", "localhost"):
+            logger.warning(f"Webhook listener is bound to {bind}, not loopback; "
+                           f"requests are still HMAC-authenticated per service")
         async with server:
             await server.serve_forever()
     except Exception as e:
         logger.error(f"Could not start webhook server: {e}")
         print_status(f"Webhook server failed: {e}", "error")
+
+def print_webhook_setup(name: str) -> None:
+    """Print what the owner must enter on GitHub for this service (URL + secret)."""
+    info = get_webhook_info(name)
+    if not info:
+        return
+    print(f"\n{C_CYAN}GitHub webhook (Settings -> Webhooks -> Add webhook):{C_RESET}")
+    print(f"  {C_BOLD}Payload URL:{C_RESET}   {info['url']}")
+    print(f"  {C_BOLD}Content type:{C_RESET}  application/json")
+    print(f"  {C_BOLD}Secret:{C_RESET}        {info['secret']}")
+    print(f"  {C_BOLD}Events:{C_RESET}        Just the push event (updates run for branch '{info['branch']}')")
+    print(f"  {C_YELLOW}Keep the secret private; rotate it from Service Operations -> Webhook.{C_RESET}")
+
+def manage_webhook_menu(name: str):
+    """Interactive: show this service's webhook URL + secret, rotate the secret, toggle auto-update."""
+    while True:
+        info = get_webhook_info(name)
+        if not info:
+            print_status("Service not found", "error")
+            return
+        print_header()
+        print(f"{C_CYAN}{C_BOLD}═══ WEBHOOK: {name} ═══{C_RESET}\n")
+        print(f"  {C_BOLD}Payload URL:{C_RESET}   {info['url']}")
+        print(f"  {C_BOLD}Content type:{C_RESET}  application/json")
+        print(f"  {C_BOLD}Secret:{C_RESET}        {info['secret'] or '(none - rotate to generate one)'}")
+        print(f"  {C_BOLD}Events:{C_RESET}        Just the push event (branch '{info['branch']}')")
+        print(f"  {C_BOLD}Auto-update:{C_RESET}   {'ON' if info['auto_update'] else 'OFF'}")
+        print(f"  {C_BOLD}Listener:{C_RESET}      {webhook_bind_address()}:{WEBHOOK_PORT}")
+        events = list_webhook_events(name, 5)
+        if events:
+            print(f"\n  {C_BOLD}Recent deliveries:{C_RESET}")
+            for ev in events:
+                print(f"    {str(ev['timestamp'])[:19]}  {(ev['event'] or '-'):<8} {ev['result']:<18} {ev['message'] or ''}")
+        print(f"\n  {C_BOLD}[1]{C_RESET} Rotate secret")
+        print(f"  {C_BOLD}[2]{C_RESET} Turn auto-update {'OFF' if info['auto_update'] else 'ON'}")
+        print(f"  {C_BOLD}[0]{C_RESET} Back\n")
+
+        choice = input(f"  {C_BOLD}Select:{C_RESET} ").strip()
+        if choice == "0" or not choice:
+            return
+        try:
+            if choice == "1":
+                if input(f"  {C_RED}Rotate secret? GitHub must be updated afterwards (yes/no):{C_RESET} ").strip().lower() == "yes":
+                    rotate_webhook_secret(name)
+                    print_status("Secret rotated - update it in the GitHub webhook settings.", "success")
+                    time.sleep(1)
+            elif choice == "2":
+                set_auto_update(name, not info['auto_update'])
+        except Exception as e:
+            print_status(f"Failed: {e}", "error")
+            input(f"\n{C_CYAN}Press Enter to continue...{C_RESET}")
 
 async def run_webhook_listener():
     """Menu wrapper to start listener with Cloudflare tunnel auto-config"""
@@ -3504,15 +3893,27 @@ async def run_webhook_listener():
     print_status(f"Ensuring Cloudflare route: {webhook_domain}...", "info")
 
     try:
-        cloudflare.add_route(webhook_domain, 9999)
+        cloudflare.add_route(webhook_domain, WEBHOOK_PORT)
         print_status("Cloudflare Tunnel configured for webhooks.", "success")
     except Exception as e:
         logger.warning(f"Cloudflare auto-config skipped: {e}")
-        print_status("Note: Ensure port 9999 is tunnelled manually if auto-config failed.", "warning")
+        print_status(f"Note: Ensure port {WEBHOOK_PORT} is tunnelled manually if auto-config failed.", "warning")
 
     print_status("Starting background Webhook Listener...", "info")
     print(f"  → Public URL: {C_CYAN}https://{webhook_domain}{C_RESET}")
+    print(f"  → Listening:  {C_CYAN}{webhook_bind_address()}:{WEBHOOK_PORT}{C_RESET} (local; reached through the tunnel)")
     print(f"  → Payload:    {C_CYAN}application/json{C_RESET}")
+    print(f"  → Auth:       {C_CYAN}X-Hub-Signature-256 with the per-service secret below{C_RESET}")
+
+    services = db.query("SELECT name FROM services ORDER BY name", fetch_all=True)
+    if services:
+        print(f"\n  {C_BOLD}Per-service GitHub settings (Payload URL / Secret):{C_RESET}")
+        for s in services:
+            info = get_webhook_info(s['name'])
+            if info:
+                print(f"  {C_CYAN}{info['name']}{C_RESET}")
+                print(f"    URL:    {info['url']}")
+                print(f"    Secret: {info['secret'] or '(none)'}")
     print(f"\n{C_YELLOW}Listener is now running in the background.{C_RESET}")
 
     if not hasattr(run_webhook_listener, "started"):
@@ -3543,6 +3944,7 @@ async def manage_service(name: str, svc: dict):          # FIX: was floating orp
     print("  5. Reinstall dependencies (pip install -r requirements.txt)")
     print("  6. View systemd status")
     print("  7. View resource usage")
+    print("  10. Webhook URL / secret (view, rotate)")
     print("  0. Cancel")
 
     loop = asyncio.get_running_loop()                    # FIX: needed for all input() calls
@@ -5827,6 +6229,7 @@ async def database_cleanup():
                         db.query("DELETE FROM deployments    WHERE service_name=?", (service_name,))
                         db.query("DELETE FROM backups        WHERE service_name=?", (service_name,))
                         db.query("DELETE FROM services       WHERE name=?",         (service_name,))
+                        db.query("DELETE FROM webhook_events WHERE service_name=?", (service_name,))
                         deleted_count += 1
                         print_status(f"'{service_name}' fully removed.", "success")
                     else:
@@ -6557,13 +6960,13 @@ async def run_daemon():
     # Ensure Cloudflare route is ready for webhooks
     webhook_domain = f"webhook.{MAIN_DOMAIN}"
     try:
-        cloudflare.add_route(webhook_domain, 9999)
+        cloudflare.add_route(webhook_domain, WEBHOOK_PORT)
         logger.info(f"Cloudflare route verified: {webhook_domain}")
     except Exception as e:
         logger.error(f"Cloudflare daemon config failed: {e}")
 
     print(f"{C_CYAN}→ Auto-Backup Scheduler: ACTIVE{C_RESET}")
-    print(f"{C_CYAN}→ Webhook Listener:     ACTIVE (Port 9999){C_RESET}")
+    print(f"{C_CYAN}→ Webhook Listener:     ACTIVE ({webhook_bind_address()}:{WEBHOOK_PORT}){C_RESET}")
     
     # Start tasks
     asyncio.create_task(auto_backup_scheduler())
