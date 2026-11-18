@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Headless entry must run before config, logging, database or interactive setup.
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--api":
+    from ats_headless import main as _headless_main
+    sys.exit(_headless_main(__file__))
 import subprocess
 import sqlite3
 import shutil
@@ -357,6 +362,8 @@ def load_ats_config() -> Dict:
             needs_wizard = True
 
     if needs_wizard:
+        if "--api" in sys.argv:
+            raise RuntimeError("not_configured: Run ATS interactively once to configure this instance")
         resolved = _ats_first_run_wizard(cfg)
     else:
         resolved.setdefault("service_group", resolved["service_user"])
@@ -527,6 +534,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | 
 logger = logging.getLogger()
 logger.addHandler(SecurityLogger())
 
+class _RedactCredentials(logging.Filter):
+    def filter(self, record):
+        record.msg = re.sub(r"(https?://)[^/\s@]+@", r"\1***@", record.getMessage())
+        record.args = ()
+        return True
+
+logger.addFilter(_RedactCredentials())
+
 def audit_log(action: str, target: str, metadata: Optional[Dict] = None):
     """Enhanced audit logging with structured data"""
     entry = {
@@ -663,6 +678,20 @@ class DatabaseManager:
                 # Another ATS process may have added it between the check and the ALTER.
                 if "duplicate column" not in str(e).lower():
                     raise
+
+        backup_cols = {row[1] for row in cursor.execute("PRAGMA table_info(backups)")}
+        for col, ddl in (("location", "TEXT DEFAULT 'local'"), ("encrypted", "INTEGER DEFAULT 0"), ("local_path", "TEXT")):
+            if col not in backup_cols:
+                try:
+                    cursor.execute(f"ALTER TABLE backups ADD COLUMN {col} {ddl}")
+                except sqlite3.OperationalError as error:
+                    if "duplicate column" not in str(error).lower(): raise
+        conn.commit()
+
+        for backup in cursor.execute("SELECT id, filename FROM backups WHERE location='local' AND local_path IS NULL").fetchall():
+            if os.path.basename(backup[1]) == backup[1]:
+                cursor.execute("UPDATE backups SET local_path=? WHERE id=?", (os.path.join(BACKUP_DIR, backup[1]), backup[0]))
+        conn.commit()
 
         # Backfill: every service must have its own webhook secret.
         for row in cursor.execute(
@@ -1151,7 +1180,7 @@ def validate_cpu(value) -> int:
 
 def validate_service_name(name: str) -> str:
     """Validate a service name (^[a-zA-Z0-9_-]{1,64}$)."""
-    if not isinstance(name, str) or not SERVICE_NAME_RE.fullmatch(name):
+    if not isinstance(name, str) or not SERVICE_NAME_RE.fullmatch(name) or name.startswith("-"):
         raise ValueError("Invalid service name format (use letters, digits, '_' or '-', max 64 chars)")
     return name
 
@@ -2640,62 +2669,9 @@ def service_start(name: str, svc=None, log: Callable = _print_log) -> Dict:
 # ── git pull + restart ───────────────────────────────────────────────────────
 
 def service_git_update(name: str, svc, log: Callable = _print_log) -> Dict:
-    """
-    `git pull` in the service directory and restart if new code arrived.
-    Returns {"ok": True, "updated": bool, "status", "message", "output"}.
-    Raises ServiceBusyError (lock held) or ServiceOpError (pull/restart failed).
-    """
-    try:
-        service_path = get_service_path(svc['storage_path'], name)
-    except Exception as e:
-        logger.error(f"[{name}] Could not resolve service path: {e}")
-        audit_log("UPDATE_FAILED", name, {"stage": "path_resolution", "error": str(e)})
-        raise ServiceOpError(f"Could not resolve service path: {e}")
-
-    with service_lock(name):
-        logger.info(f"[{name}] Starting git pull at {service_path}")
-        audit_log("UPDATE_STARTED", name, {"method": "git-pull", "path": service_path})
-        log("Pulling from git...")
-
-        try:
-            returncode, stdout, stderr = run_as_gaia(["git", "pull"], cwd=service_path, capture=True)
-        except Exception as e:
-            logger.error(f"[{name}] git pull raised exception: {e}")
-            audit_log("UPDATE_FAILED", name, {"stage": "git_pull", "error": str(e)})
-            raise ServiceOpError(f"Git pull failed: {e}")
-
-        if returncode != 0:
-            logger.error(f"[{name}] git pull failed (rc={returncode}): {stderr[:300]}")
-            audit_log("UPDATE_FAILED", name, {
-                "stage": "git_pull",
-                "returncode": returncode,
-                "stderr": stderr[:300]
-            })
-            raise ServiceOpError(f"Git pull failed: {(stderr or '').strip()[:200]}")
-
-        already_up_to_date = "Already up to date" in stdout or "Already up-to-date" in stdout
-        logger.info(f"[{name}] git pull OK — {'no new changes' if already_up_to_date else 'new code pulled'}")
-
-        if already_up_to_date:
-            audit_log("UPDATE_SKIPPED", name, {"reason": "already_up_to_date"})
-            log("Code is already up to date (no new changes)", "success")
-            return {"ok": True, "updated": False, "status": "active" if check_systemd_active(name) else "inactive",
-                    "message": "Already up to date", "output": stdout[:500]}
-
-        log("Code updated", "success")
-        log("Restarting service...")
-        try:
-            _systemctl_and_verify("restart", name)
-        except ServiceOpError as e:
-            logger.error(f"[{name}] restart after update failed: {e}")
-            audit_log("UPDATE_FAILED", name, {"stage": "restart", "error": str(e)})
-            raise
-
-    logger.info(f"[{name}] Service is active — update complete")
-    audit_log("UPDATE", name, {"method": "git-pull", "stdout": stdout[:500]})
-    log("Service restarted with new code", "success")
-    return {"ok": True, "updated": True, "status": "active", "message": "Service restarted with new code",
-            "output": stdout[:500]}
+    """Use the same branch-aware update path for CLI, web and signed webhooks."""
+    import ats_manage_runtime
+    return ats_manage_runtime.update(sys.modules[__name__], name, dict(svc), log=log)
 
 
 # ── reinstall dependencies ───────────────────────────────────────────────────
@@ -3648,16 +3624,12 @@ async def _run_webhook_update(name: str, svc: dict, event_id: Optional[int]) -> 
     try:
         res = await loop.run_in_executor(None, functools.partial(service_git_update, name, svc, _logger_log))
         result, message = "updated", res.get("message", "")
-        db.query("INSERT INTO deployments (service_name, status, duration_seconds) VALUES (?, ?, ?)",
-                 (name, "success", time.time() - started))
     except ServiceBusyError as e:
         result, message = "busy", str(e)
         logger.warning(f"[{name}] Webhook update skipped: {e}")
     except Exception as e:
         result, message = "failed", str(e)[:300]
         logger.error(f"[{name}] Webhook update failed: {e}")
-        db.query("INSERT INTO deployments (service_name, status, duration_seconds, error_message) VALUES (?, ?, ?, ?)",
-                 (name, "failed", time.time() - started, str(e)[:500]))
     update_webhook_event(event_id, result, message)
     audit_log("WEBHOOK_UPDATE", name, {"result": result})
 
@@ -4110,8 +4082,8 @@ def create_local_backup(svc):
         checksum = calculate_file_hash(backup_path)
 
         db.query(
-            "INSERT INTO backups (service_name, filename, size_bytes, checksum) VALUES (?, ?, ?, ?)",
-            (name, filename, file_size, checksum)
+            "INSERT INTO backups (service_name, filename, size_bytes, checksum, local_path) VALUES (?, ?, ?, ?, ?)",
+            (name, filename, file_size, checksum, backup_path)
         )
 
         logger.info(f"[{name}] Backup created: {filename} ({file_size/1024/1024:.2f} MB)")
@@ -4125,7 +4097,7 @@ def create_local_backup(svc):
 
         # --- RETENTION LOGIC (Keep max 7) ---
         backups = db.query(
-            "SELECT id, filename FROM backups WHERE service_name=? ORDER BY timestamp DESC",
+            "SELECT id, filename FROM backups WHERE service_name=? AND location='local' ORDER BY timestamp DESC",
             (name,), fetch_all=True
         )
         if len(backups) > 7:

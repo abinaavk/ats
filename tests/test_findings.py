@@ -87,6 +87,9 @@ class AppTestCase(unittest.TestCase):
         patcher = mock.patch.object(app.time, "sleep", lambda s: None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        health = mock.patch.object(app, "health_check_deployment", return_value=True)
+        health.start()
+        self.addCleanup(health.stop)
 
     # ---- helpers -----------------------------------------------------------
     def setenv(self, key, value="1"):
