@@ -20,6 +20,12 @@ def service(a,args):
     return runtime.row(a,args.get('name',''))
 
 
+def webhook_host(a):
+    from ats_cluster import Store
+    node = Store().node()
+    return node["webhook"] if node and node["role"] == "local" else ("" if node else "webhook."+a.MAIN_DOMAIN)
+
+
 def settings(a):
     cfg=a._ats_load_config_file()
     main=cfg.get('main_domain',a.MAIN_DOMAIN)
@@ -27,7 +33,7 @@ def settings(a):
     defaults.update(cfg.get('defaults') or {})
     return dict(storage_root=cfg.get('default_storage',a.DEFAULT_STORAGE),domains=cfg.get('domains') or [main],main_domain=main,
                 defaults=defaults,cloudflare_config=cfg.get('cloudflare_config',a.CLOUDFLARE_CONFIG),cloudflared_service=cfg.get('cloudflared_service',a.CLOUDFLARED_SERVICE),
-                service_user=a.SERVICE_USER,ats_home=a.ATS_HOME,webhook={'domain':'webhook.'+main,'port':a.WEBHOOK_PORT},gdrive={'remote':a.GDRIVE_REMOTE,'retention_days':a.GDRIVE_RETENTION_DAYS},limits=LIMITS)
+                service_user=a.SERVICE_USER,ats_home=a.ATS_HOME,webhook={'domain':webhook_host(a),'port':a.WEBHOOK_PORT},gdrive={'remote':a.GDRIVE_REMOTE,'retention_days':a.GDRIVE_RETENTION_DAYS},limits=LIMITS)
 
 
 def set_settings(a,args):
@@ -105,6 +111,12 @@ def detail(a,s):
 
 def webhook(a,args):
     cfg=settings(a);host=cfg['webhook']['domain'];entries=routes(a)
+    if not host:
+        result={'listener':{'url':'','port':None,'bind':'','active':False,'route_present':False,'centralized':True}}
+        if args.get('name'):
+            s=service(a,args);result['service']=dict(a.get_webhook_info(s['name']),last_events=a.list_webhook_events(s['name'],20))
+            result['service']['secret']=''
+        return result
     result={'listener':{'url':'https://'+host,'port':a.WEBHOOK_PORT,'bind':a.webhook_bind_address(),'active':a.check_port_listening(a.WEBHOOK_PORT),'route_present':any(r.get('hostname')==host for r in entries)}}
     if args.get('name'):
         s=service(a,args);result['service']=dict(a.get_webhook_info(s['name']),last_events=a.list_webhook_events(s['name'],20))

@@ -14,6 +14,8 @@ import time. This helper:
 PyYAML is needed by app.py; if it is not installed, put a directory that has
 it on PYTHONPATH (e.g. `pip install --target /tmp/ats-pydeps pyyaml`).
 """
+import contextlib
+import functools
 import grp
 import importlib.util
 import logging
@@ -222,6 +224,7 @@ def load_app(extra_env=None) -> AppEnv:
         }, f)
 
     env = {
+        "ATS_CLUSTER_DB": os.path.join(root, "cluster.sqlite3"),
         "ATS_CONFIG_FILE": cfg_path,
         "ATS_HOME": home,
         "FAKE_STATE": state,
@@ -240,7 +243,18 @@ def load_app(extra_env=None) -> AppEnv:
     old_argv = sys.argv
     sys.argv = ["app.py"]
     try:
-        spec.loader.exec_module(module)
+        # Each freshly loaded app needs its own optional metrics registry.
+        with contextlib.ExitStack() as stack:
+            try:
+                import prometheus_client as metrics
+            except ImportError:
+                pass
+            else:
+                registry = metrics.CollectorRegistry()
+                for name in ("Counter", "Histogram", "Gauge"):
+                    stack.enter_context(mock.patch.object(
+                        metrics, name, functools.partial(getattr(metrics, name), registry=registry)))
+            spec.loader.exec_module(module)
     except BaseException:
         env_patch.stop()
         euid_patch.stop()
