@@ -658,6 +658,12 @@ class DatabaseManager:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_webhook_events_service ON webhook_events(service_name, id)")
 
+        webhook_cols = {row[1] for row in cursor.execute("PRAGMA table_info(webhook_events)")}
+        for col in ('delivery', 'signature'):
+            if col not in webhook_cols:
+                try: cursor.execute('ALTER TABLE webhook_events ADD COLUMN ' + col + ' TEXT')
+                except sqlite3.OperationalError as e:
+                    if 'duplicate column' not in str(e).lower(): raise
         conn.commit()
 
         # --- MIGRATIONS FOR EXISTING DATABASES (idempotent) ---
@@ -3478,12 +3484,12 @@ def set_auto_update(name: str, enabled: bool) -> None:
 
 
 def record_webhook_event(service_name: str, event: Optional[str], ref: Optional[str],
-                         commit_sha: Optional[str], result: str, message: str = "") -> Optional[int]:
+                         commit_sha: Optional[str], result: str, message: str = "", delivery: str = "", signature: str = "manual") -> Optional[int]:
     """Insert a webhook_events row (fields sanitised) and keep only the newest 200 per service."""
     event_id = db.insert(
-        "INSERT INTO webhook_events (service_name, event, ref, commit_sha, result, message) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO webhook_events (service_name, event, ref, commit_sha, result, message, delivery, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (service_name, sanitize_for_log(event, 40), sanitize_for_log(ref, 200),
-         sanitize_for_log(commit_sha, 64), result, sanitize_for_log(message, 300))
+         sanitize_for_log(commit_sha, 64), result, sanitize_for_log(message, 300), sanitize_for_log(delivery, 100), signature)
     )
     db.query(
         "DELETE FROM webhook_events WHERE service_name=? AND id NOT IN "
@@ -3504,10 +3510,10 @@ def update_webhook_event(event_id: Optional[int], result: str, message: str = ""
 def list_webhook_events(name: str, limit: int = 20) -> List[Dict]:
     """Newest-first deliveries for a service: [{timestamp, event, ref, commit, result, message}]."""
     rows = db.query(
-        "SELECT timestamp, event, ref, commit_sha, result, message FROM webhook_events "
+        "SELECT timestamp, event, ref, commit_sha, result, message, delivery, signature FROM webhook_events "
         "WHERE service_name=? ORDER BY id DESC LIMIT ?", (name, int(limit)), fetch_all=True)
     return [{"timestamp": r['timestamp'], "event": r['event'], "ref": r['ref'], "commit": r['commit_sha'],
-             "result": r['result'], "message": r['message']} for r in rows]
+             "result": r['result'], "message": r['message'], "delivery": r['delivery'], "signature": r['signature'] or "unknown"} for r in rows]
 
 
 def get_service_by_name(name: str) -> Optional[dict]:
@@ -3709,17 +3715,21 @@ async def handle_webhook(reader, writer):
             return
         actual_name = svc['name']              # FIX: use DB service name, not repo name
 
+        def record_delivery(service_name, event, ref, commit_sha, result, message=""):
+            return record_webhook_event(service_name, event, ref, commit_sha, result, message,
+                delivery=delivery or '', signature='rejected' if result == 'rejected_signature' else 'verified')
+
         # ── Authentication ────────────────────────────────────────────────────
         secret = svc.get('webhook_secret') or ""
         if not secret:
             logger.warning(f"Webhook: service '{actual_name}' has no webhook secret configured")
-            record_webhook_event(actual_name, event, None, None, "rejected_signature", "no webhook secret configured")
+            record_delivery(actual_name, event, None, None, "rejected_signature", "no webhook secret configured")
             audit_log("WEBHOOK_REJECTED", actual_name, {"reason": "no_secret"})
             await _http_reply(writer, 403)
             return
         if not verify_webhook_signature(secret, body, headers.get("x-hub-signature-256")):
             logger.warning(f"Webhook: bad or missing signature for '{actual_name}'")
-            record_webhook_event(actual_name, event, None, None, "rejected_signature", "invalid or missing signature")
+            record_delivery(actual_name, event, None, None, "rejected_signature", "invalid or missing signature")
             audit_log("WEBHOOK_REJECTED", actual_name, {"reason": "bad_signature"})
             await _http_reply(writer, 401)
             return
@@ -3729,12 +3739,12 @@ async def handle_webhook(reader, writer):
         # ── Authenticated from here on ────────────────────────────────────────
         if event == "ping":
             logger.info(f"Webhook: ping received for '{actual_name}'")
-            record_webhook_event(actual_name, event, None, None, "accepted", "ping")
+            record_delivery(actual_name, event, None, None, "accepted", "ping")
             await _http_reply(writer, 200, "OK")
             return
 
         if event != "push":
-            record_webhook_event(actual_name, event, None, None, "ignored_event", "event type is not push")
+            record_delivery(actual_name, event, None, None, "ignored_event", "event type is not push")
             await _http_reply(writer, 200, "ignored")
             return
 
@@ -3744,7 +3754,7 @@ async def handle_webhook(reader, writer):
             except ValueError:
                 payload = None
         if not isinstance(payload, dict):
-            record_webhook_event(actual_name, event, None, None, "ignored_event", "payload is not valid JSON")
+            record_delivery(actual_name, event, None, None, "ignored_event", "payload is not valid JSON")
             await _http_reply(writer, 400)
             return
 
@@ -3754,18 +3764,18 @@ async def handle_webhook(reader, writer):
         branch = svc.get('branch') or "main"
 
         if ref != f"refs/heads/{branch}":
-            record_webhook_event(actual_name, event, ref, commit, "ignored_branch",
+            record_delivery(actual_name, event, ref, commit, "ignored_branch",
                                  f"push to {sanitize_for_log(ref, 100)} ignored (tracking {branch})")
             await _http_reply(writer, 200, "ignored")
             return
 
         auto_update = svc.get('auto_update')
         if auto_update is not None and not int(auto_update):
-            record_webhook_event(actual_name, event, ref, commit, "accepted", "auto_update is off; no update performed")
+            record_delivery(actual_name, event, ref, commit, "accepted", "auto_update is off; no update performed")
             await _http_reply(writer, 200, "accepted")
             return
 
-        event_id = record_webhook_event(actual_name, event, ref, commit, "accepted", "update started")
+        event_id = record_delivery(actual_name, event, ref, commit, "accepted", "update started")
         logger.info(f"Webhook: push to '{branch}' accepted for service '{actual_name}'")
         await _http_reply(writer, 202)
 
@@ -4043,7 +4053,7 @@ async def backup_service():
         elif choice == "5":
             await restore_backup_menu()
 
-def create_local_backup(svc):
+def create_local_backup(svc, retain_legacy=True):
     """Internal logic to create a zip of the database"""
     name = svc['name']
     try:
@@ -4070,7 +4080,7 @@ def create_local_backup(svc):
         if not os.path.exists(BACKUP_DIR):
             os.makedirs(BACKUP_DIR, exist_ok=True)
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{name}_db_{timestamp}.zip"
         backup_path = os.path.join(BACKUP_DIR, filename)
 
@@ -4095,12 +4105,14 @@ def create_local_backup(svc):
             "path": db_path
         })
 
-        # --- RETENTION LOGIC (Keep max 7) ---
+        # Legacy/manual retention must never remove a scheduled backup.
+        import ats_operations
+        ats_operations.init(sys.modules[__name__])
         backups = db.query(
-            "SELECT id, filename FROM backups WHERE service_name=? AND location='local' ORDER BY timestamp DESC",
+            "SELECT id, filename FROM backups WHERE service_name=? AND location='local' AND id NOT IN (SELECT backup_id FROM ops_backups) ORDER BY id DESC",
             (name,), fetch_all=True
         )
-        if len(backups) > 7:
+        if retain_legacy and len(backups) > 7:
             for oldest in backups[7:]:
                 old_path = os.path.join(BACKUP_DIR, oldest['filename'])
                 if os.path.exists(old_path):
@@ -6748,6 +6760,13 @@ async def auto_backup_scheduler():
                 backed_up = 0
                 for svc in services:
                     try:
+                        # An explicit per-service schedule overrides the legacy midnight job,
+                        # including when that schedule has been disabled by the administrator.
+                        import ats_operations
+                        ats_operations.init(sys.modules[__name__])
+                        with ats_operations.connection(sys.modules[__name__]) as conn:
+                            if conn.execute('SELECT name FROM ops_config WHERE name=?', (svc['name'],)).fetchone():
+                                continue
                         backup_file = await loop.run_in_executor(None, create_local_backup, svc)
                         if backup_file:
                             backed_up += 1
@@ -6784,6 +6803,8 @@ async def auto_backup_scheduler():
 
 async def mainmenu():
     # Start the scheduler as a background task within the same event loop
+    import ats_operations
+    asyncio.create_task(ats_operations.worker(sys.modules[__name__]))
     asyncio.create_task(auto_backup_scheduler())
     
     while True:
@@ -6943,6 +6964,8 @@ async def run_daemon():
     print(f"{C_CYAN}→ Webhook Listener:     ACTIVE ({webhook_bind_address()}:{WEBHOOK_PORT}){C_RESET}")
     
     # Start tasks
+    import ats_operations
+    asyncio.create_task(ats_operations.worker(sys.modules[__name__]))
     asyncio.create_task(auto_backup_scheduler())
     await start_webhook_server() # This runs forever
 
