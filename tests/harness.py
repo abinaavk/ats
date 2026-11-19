@@ -222,6 +222,7 @@ def load_app(extra_env=None) -> AppEnv:
         }, f)
 
     env = {
+        "ATS_CLUSTER_DB": os.path.join(root, "cluster.sqlite3"),
         "ATS_CONFIG_FILE": cfg_path,
         "ATS_HOME": home,
         "FAKE_STATE": state,

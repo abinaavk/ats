@@ -1,0 +1,181 @@
+# Primary Local and Global servers
+
+The primary Local runs Monitor and the only GitHub webhook receiver. Every Global
+has a stable random identity and an independent 256-bit management key. Requests
+bind the HTTP method, path, exact body hash, destination identity, timestamp and
+nonce. Nonces persist across workers/restarts. HTTPS certificate verification is
+mandatory; redirects are never followed.
+
+## Operator preparation
+
+Review and approve the ATS and Monitor PRs before installation. This document is
+setup guidance, not authorization to deploy, restart services, provision storage,
+change Cloudflare or configure GitHub. Back up the existing ATS configuration and
+database privately. Configure storage, repository access, sudo policy and TLS as
+operator tasks. Keep the primary Local available as the control point.
+
+Install both repositories on each Global: ATS supplies deployment operations;
+Monitor supplies its existing host/Docker/database/log/metrics route adapters.
+Only Local needs a browser-facing Monitor process. Global does **not** need to run
+a public Monitor login server. Install Monitor's Python requirements in the Python
+interpreter used by ATS. Set `ATS_MODULE_DIR` to the installed ATS repository and
+`ATS_MONITOR_ADAPTER` to the absolute `ats-monitor/remote_host.py` path.
+`ATS_CLI` must identify that server's existing ATS CLI, and its existing
+`ATS_CONFIG_FILE`/`ATS_INSTANCE`, service identity, storage and backup settings must
+be correct. Never point multiple physical servers at the same jobs directory.
+
+`ATS_CLUSTER_DB` defaults to `/etc/ats/cluster.sqlite3`. It contains private keys
+and deduplication state and is always mode 0600. On Local, provision its directory
+and file so the Monitor service identity owns them; the root ATS CLI can also
+access the same file. Set the **same absolute path** in Local Monitor and ATS's
+service environments. On Global, only its ATS service identity needs access.
+Keep the containing directory private (0700), outside static files, repositories
+and public backups. Do not relax it to world-readable. Use an OS/encrypted disk
+or private encrypted backup for the registry; keys are not application-encrypted.
+An operator with access to the service account or root can read them.
+
+## Configure Local
+
+```sh
+python3 app.py server configure --role local --name 'Primary Local' \
+  --webhook-host hooks.example.com --cloudflare-config /path/to/cloudflared.yml
+python3 app.py server show
+```
+
+Omit options in a TTY for role/name/hostname guidance. Headless setup fails when
+required inputs are missing. The command reads the actual tunnel ingress and
+checks the chosen hostname against existing ATS service domains. Duplicate
+hostname entries are rejected. An existing exact or covering wildcard route
+requires inspection and `--confirm-existing-route`. **No command here rewrites
+tunnel configuration.** The operator must verify ingress ordering, the route's
+actual destination, DNS and port use, then configure the hostname to reach the
+Local listener (default loopback port 9999). Inspect other ATS instances and
+separate Cloudflare configurations on the host as well.
+
+The existing `--daemon` runs the existing operations/backup workers and the Local
+receiver. Receiver startup requires a configured Local identity. ATS does not
+modify Cloudflare routes during listener or daemon startup.
+
+## Configure Global and pair
+
+```sh
+python3 app.py server configure --role global --name 'Build server' \
+  --api-domain https://api.build.example.com --pairing-file /private/build-pair.json
+```
+
+The private, exclusively created 0600 file contains identity, API origin and
+pairing key. Transfer it to the Local operator through a secure channel. It is
+never printed. Do not put it in a repository, issue, shell history, chat or public
+artifact. The key is a management credential, not a human account password.
+
+The operator must configure a TLS reverse proxy to forward only `/v1/request`
+to `127.0.0.1:9997`, without redirects. Set proxy request/header/body/idle limits
+and protect the origin against general network abuse. The ATS management
+listener binds loopback, has bounded reads, concurrent connections, operations,
+output and timeouts, and verifies HMAC before dispatch. Never expose the loopback
+listener directly or bypass HTTPS verification. `ATS_REMOTE_PORT` can select a
+different loopback port for `--daemon`.
+
+After an applicable restart approval, use `server serve` (or the existing
+`--daemon` with the Global configuration). Both reuse ATS scheduled operations
+and backup workers, and Global starts **no webhook receiver**, creates no public
+webhook URL, and changes no webhook tunnel route. Global API TLS routing is a
+separate operator-managed API route, not another GitHub webhook endpoint.
+
+On Local:
+
+```sh
+python3 app.py server pair --pairing-file /private/build-pair.json
+```
+
+Alternatively, open Monitor → Settings → Servers and enter the private file's
+name, ID, HTTPS origin and key. Pairing performs a signed HTTPS health exchange
+and verifies the destination identity before saving. Names, domains and identities
+are unique in the primary registry. Pairing again with the same identity updates
+its name/domain/credentials after validation. The browser retains only an active
+server ID; credentials stay on the server and in the transient password input.
+Remove transferred pairing files securely under your private-file retention
+policy after setup.
+
+## Repository mappings and GitHub
+
+Create a separate random GitHub webhook secret in a private file, for example by
+using an operator secret manager. It must contain a 64-character random hex key.
+Register each destination **explicitly** on Local:
+
+```sh
+python3 app.py server map --repository owner/repository \
+  --server-id GLOBAL_OR_LOCAL_ID --service service-name --branch main \
+  --secret-file /private/repository-webhook-secret
+```
+
+On GitHub, manually configure the repository's push webhook to the primary
+`https://hooks.example.com/webhook` (or `/webhook/service-name`), JSON content,
+and that mapping's secret. Only authenticated `ping` and matching-branch `push`
+events are accepted. The payload needs `repository.full_name`, the exact tracked
+ref, a commit identity and a delivery identity. Deleted refs are rejected.
+There is no repository-name guessing or implicit Local fallback. Duplicate
+repository mappings and multiple repositories targeting one server/service are
+rejected. API requests carry an explicit selected server; Global additionally
+checks the destination service's current repository, branch and auto-update flag
+before starting the existing update job. Local uses `service_git_update` and its
+existing service lock. Local service repository and branch must match too.
+
+The mapping secret is authoritative for the central receiver. Existing
+per-service secrets are not automatically imported. Legacy webhook deployments
+must create explicit mappings before enabling this change. To change a mapping, stop deliveries, inspect the destination and run `server map`
+with all destination fields plus `--replace-mapping`. The flag requires an existing
+repository mapping and still enforces unique destinations and secrets. Remove a
+mapping using `server unmap --repository owner/repository`. Reconfigure GitHub
+secrets together with the corresponding registry entry. Do not assume an
+old per-service secret rotation changes the central mapping.
+
+## Selection and long operations
+
+Monitor uses one target identity per page lifetime. Selection is saved across
+navigation. Switching reloads the document, aborts requests and destroys old
+data, panels, confirmations, polling and sockets. The previous server's detached
+jobs keep running there and can be viewed by switching back. A disconnected,
+revoked, missing or unknown target produces an error with no Local fallback.
+Account/Devices/Themes remain primary browser administration; host settings and
+all host data/operations target the selected server. Current Global capability
+does not include interactive terminal or Docker exec shell transport; those UIs
+report unavailable and reject local-shell connections for remote selections.
+Use the operator's authenticated SSH session if interactive access is needed.
+
+## Disconnect, reconnect and revoke
+
+Use Settings → Servers, or `server disconnect|reconnect|revoke --server-id ID` on
+Local. Disconnect prevents dispatch but keeps the key. Reconnect validates the
+same HTTPS destination and identity. Revoke first removes the key on the reachable
+Global, then removes the Local copy. Offline revocation cannot claim success:
+rotate the key on the Global operator console and leave Local disconnected.
+
+```sh
+python3 app.py server rotate --pairing-file /private/fresh-pair.json
+```
+
+Rotation invalidates the old key immediately; pair the fresh file on Local.
+The primary Local cannot be disconnected, revoked or silently replaced.
+
+## Delivery recovery and limits
+
+GitHub delivery IDs **and exact signed payload hashes** persist indefinitely for
+replay protection. Concurrent duplicate deliveries claim one record atomically.
+Pending Local deliveries survive process restart and the Local daemon recovers
+them before accepting new events. Global deployment delivery IDs are independently
+deduplicated, returning the original job result/ID when available.
+
+Never blindly retry a mutation after a timeout. A crash during a running delivery
+or ambiguous network outcome requires checking the destination's job and deployment
+history. Such records are marked interrupted/failed rather than deploying twice.
+A failed dispatch is visible in Local webhook event history; Global job IDs and
+logs are viewed on that Global through Monitor. `dispatched` means the Global
+accepted a job, not that deployment succeeded. Job polling reports its final
+status and logs. Exact repeated pushes remain deduplicated; after inspection use
+Monitor's explicit Update action to retry. Registry replay rows need operator
+storage monitoring; they are deliberately not pruned automatically.
+
+Validation uses temporary TLS certificates, host fixtures and fake system tools.
+Production hosts, Cloudflare routes, public TLS termination and real GitHub
+webhook delivery remain unverified until an authorized operator tests them.

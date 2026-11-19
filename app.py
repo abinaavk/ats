@@ -5,6 +5,11 @@ import sys
 if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "--api":
     from ats_headless import main as _headless_main
     sys.exit(_headless_main(__file__))
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "server":
+    from ats_server_cli import main as _server_main
+    del sys.argv[1]
+    _server_main()
+    sys.exit(0)
 import subprocess
 import sqlite3
 import shutil
@@ -3420,7 +3425,12 @@ def webhook_bind_address() -> str:
 
 def webhook_url(name: str) -> str:
     """Public payload URL to configure on GitHub for this service."""
-    return f"https://webhook.{MAIN_DOMAIN}/webhook/{name}"
+    import ats_cluster
+    node = ats_cluster.Store().node()
+    if node and node["role"] == "global":
+        return ""
+    host = node["webhook"] if node else f"webhook.{MAIN_DOMAIN}"
+    return f"https://{host}/webhook/{name}"
 
 
 def generate_webhook_secret() -> str:
@@ -3601,7 +3611,7 @@ async def _read_webhook_request(reader) -> Tuple[str, str, Dict[str, str], bytes
         if ":" in line:
             key, _, val = line.partition(":")
             key = key.strip().lower()
-            if key == "content-length" and key in headers:
+            if key in headers:
                 raise _BadWebhookRequest(400, "duplicate content-length")
             headers[key] = val.strip()
 
@@ -3672,117 +3682,9 @@ async def handle_webhook(reader, writer):
             await _http_reply(writer, 405)
             return
 
-        # ── service name from the path (validated before any use or logging) ──
-        path = target.split("?", 1)[0].split("#", 1)[0]
-        segments = [seg for seg in path.split("/") if seg]
-        service_name = None
-        if len(segments) == 2 and segments[0] == "webhook":
-            service_name = segments[1]
-        elif len(segments) == 1 and segments[0] != "webhook":
-            service_name = segments[0]
-        elif segments not in ([], ["webhook"]):
-            await _http_reply(writer, 404)
-            return
-        if service_name is not None and not SERVICE_NAME_RE.fullmatch(service_name):
-            logger.warning(f"Webhook: invalid service name in URL: {sanitize_for_log(service_name, 80)!r}")
-            await _http_reply(writer, 404)
-            return
-
-        event = sanitize_for_log(headers.get("x-github-event", ""), 40)
-        delivery = sanitize_for_log(headers.get("x-github-delivery", ""), 64)
-
-        # ── Fallback: repo name from the (not yet authenticated) payload ──────
-        payload = None
-        if service_name is None:
-            try:
-                payload = json.loads(body.decode("utf-8", errors="replace"))
-            except ValueError:
-                payload = None
-            repo = payload.get("repository") if isinstance(payload, dict) else None
-            candidate = repo.get("name") if isinstance(repo, dict) else None
-            if isinstance(candidate, str) and _WEBHOOK_REPO_RE.fullmatch(candidate):
-                service_name = candidate
-            else:
-                await _http_reply(writer, 404)
-                return
-
-        svc = get_service_by_name(service_name)
-        if not svc:
-            logger.warning(f"Webhook: unknown service '{sanitize_for_log(service_name, 80)}'")
-            audit_log("WEBHOOK_UNKNOWN_SERVICE", sanitize_for_log(service_name, 80), {})
-            # Same answer as a bad signature so service names cannot be enumerated.
-            await _http_reply(writer, 401)
-            return
-        actual_name = svc['name']              # FIX: use DB service name, not repo name
-
-        def record_delivery(service_name, event, ref, commit_sha, result, message=""):
-            return record_webhook_event(service_name, event, ref, commit_sha, result, message,
-                delivery=delivery or '', signature='rejected' if result == 'rejected_signature' else 'verified')
-
-        # ── Authentication ────────────────────────────────────────────────────
-        secret = svc.get('webhook_secret') or ""
-        if not secret:
-            logger.warning(f"Webhook: service '{actual_name}' has no webhook secret configured")
-            record_delivery(actual_name, event, None, None, "rejected_signature", "no webhook secret configured")
-            audit_log("WEBHOOK_REJECTED", actual_name, {"reason": "no_secret"})
-            await _http_reply(writer, 403)
-            return
-        if not verify_webhook_signature(secret, body, headers.get("x-hub-signature-256")):
-            logger.warning(f"Webhook: bad or missing signature for '{actual_name}'")
-            record_delivery(actual_name, event, None, None, "rejected_signature", "invalid or missing signature")
-            audit_log("WEBHOOK_REJECTED", actual_name, {"reason": "bad_signature"})
-            await _http_reply(writer, 401)
-            return
-
-        audit_log("WEBHOOK_RECEIVED", actual_name, {"source": event or "unknown", "delivery": delivery or "unknown"})
-
-        # ── Authenticated from here on ────────────────────────────────────────
-        if event == "ping":
-            logger.info(f"Webhook: ping received for '{actual_name}'")
-            record_delivery(actual_name, event, None, None, "accepted", "ping")
-            await _http_reply(writer, 200, "OK")
-            return
-
-        if event != "push":
-            record_delivery(actual_name, event, None, None, "ignored_event", "event type is not push")
-            await _http_reply(writer, 200, "ignored")
-            return
-
-        if not isinstance(payload, dict):
-            try:
-                payload = json.loads(body.decode("utf-8", errors="replace"))
-            except ValueError:
-                payload = None
-        if not isinstance(payload, dict):
-            record_delivery(actual_name, event, None, None, "ignored_event", "payload is not valid JSON")
-            await _http_reply(writer, 400)
-            return
-
-        ref = payload.get("ref") if isinstance(payload.get("ref"), str) else ""
-        after = payload.get("after")
-        commit = after if isinstance(after, str) and re.fullmatch(r"[0-9a-fA-F]{7,64}", after) else None
-        branch = svc.get('branch') or "main"
-
-        if ref != f"refs/heads/{branch}":
-            record_delivery(actual_name, event, ref, commit, "ignored_branch",
-                                 f"push to {sanitize_for_log(ref, 100)} ignored (tracking {branch})")
-            await _http_reply(writer, 200, "ignored")
-            return
-
-        auto_update = svc.get('auto_update')
-        if auto_update is not None and not int(auto_update):
-            record_delivery(actual_name, event, ref, commit, "accepted", "auto_update is off; no update performed")
-            await _http_reply(writer, 200, "accepted")
-            return
-
-        event_id = record_delivery(actual_name, event, ref, commit, "accepted", "update started")
-        logger.info(f"Webhook: push to '{branch}' accepted for service '{actual_name}'")
-        await _http_reply(writer, 202)
-
-        # ── Trigger update in background (single flight per service via flock) ─
-        task = asyncio.create_task(_run_webhook_update(actual_name, svc, event_id))
-        _WEBHOOK_TASKS.add(task)
-        task.add_done_callback(_WEBHOOK_TASKS.discard)
+        import ats_routing
+        status, message = await ats_routing.receive(sys.modules[__name__], target, headers, body)
+        await _http_reply(writer, status, message)
 
     except ConnectionError:
         pass                                  # client went away mid-reply
@@ -3805,6 +3707,10 @@ async def handle_webhook(reader, writer):
 
 async def start_webhook_server(bind: Optional[str] = None, port: int = WEBHOOK_PORT):
     """Start background webhook listener (127.0.0.1:9999 unless ATS_WEBHOOK_BIND says otherwise)"""
+    import ats_cluster
+    node = ats_cluster.Store().node()
+    if not node or node["role"] != "local":
+        raise ValueError("Only a configured primary Local can start a webhook receiver")
     bind = bind or webhook_bind_address()
     try:
         server = await asyncio.start_server(handle_webhook, bind, port)
@@ -3821,6 +3727,11 @@ async def start_webhook_server(bind: Optional[str] = None, port: int = WEBHOOK_P
 
 def print_webhook_setup(name: str) -> None:
     """Print what the owner must enter on GitHub for this service (URL + secret)."""
+    import ats_cluster
+    node = ats_cluster.Store().node()
+    if node and node["role"] == "global":
+        print("Configure the repository mapping and GitHub webhook on the primary Local; Global has no webhook endpoint.")
+        return
     info = get_webhook_info(name)
     if not info:
         return
@@ -3873,17 +3784,12 @@ def manage_webhook_menu(name: str):
 async def run_webhook_listener():
     """Menu wrapper to start listener with Cloudflare tunnel auto-config"""
     print_header()
-    webhook_domain = f"webhook.{MAIN_DOMAIN}"
-    print_status(f"Ensuring Cloudflare route: {webhook_domain}...", "info")
-
-    try:
-        cloudflare.add_route(webhook_domain, WEBHOOK_PORT)
-        print_status("Cloudflare Tunnel configured for webhooks.", "success")
-    except Exception as e:
-        logger.warning(f"Cloudflare auto-config skipped: {e}")
-        print_status(f"Note: Ensure port {WEBHOOK_PORT} is tunnelled manually if auto-config failed.", "warning")
-
-    print_status("Starting background Webhook Listener...", "info")
+    import ats_cluster
+    node = ats_cluster.Store().node()
+    if node and node['role'] == 'global':
+        raise ValueError('Global servers do not host a webhook receiver')
+    webhook_domain = node['webhook'] if node else f"webhook.{MAIN_DOMAIN}"
+    print_status('Configure and validate the Cloudflare route manually; ATS will not overwrite it.', 'info')
     print(f"  → Public URL: {C_CYAN}https://{webhook_domain}{C_RESET}")
     print(f"  → Listening:  {C_CYAN}{webhook_bind_address()}:{WEBHOOK_PORT}{C_RESET} (local; reached through the tunnel)")
     print(f"  → Payload:    {C_CYAN}application/json{C_RESET}")
@@ -6952,17 +6858,21 @@ async def run_daemon():
     print_header()
     print(f"{C_GREEN}Starting ATS Daemon v7.0...{C_RESET}")
     
-    # Ensure Cloudflare route is ready for webhooks
-    webhook_domain = f"webhook.{MAIN_DOMAIN}"
-    try:
-        cloudflare.add_route(webhook_domain, WEBHOOK_PORT)
-        logger.info(f"Cloudflare route verified: {webhook_domain}")
-    except Exception as e:
-        logger.error(f"Cloudflare daemon config failed: {e}")
-
+    import ats_cluster
+    node = ats_cluster.Store().node()
+    if node and node['role'] == 'global':
+        import ats_operations
+        import ats_remote
+        asyncio.create_task(ats_operations.worker(sys.modules[__name__]))
+        asyncio.create_task(auto_backup_scheduler())
+        await asyncio.to_thread(ats_remote.serve, ats_cluster.Store(), int(os.environ.get('ATS_REMOTE_PORT', '9997')))
+        return
+    # Tunnel configuration is an explicit operator task, never a daemon side effect.
     print(f"{C_CYAN}→ Auto-Backup Scheduler: ACTIVE{C_RESET}")
     print(f"{C_CYAN}→ Webhook Listener:     ACTIVE ({webhook_bind_address()}:{WEBHOOK_PORT}){C_RESET}")
     
+    import ats_routing
+    await ats_routing.recover(sys.modules[__name__])
     # Start tasks
     import ats_operations
     asyncio.create_task(ats_operations.worker(sys.modules[__name__]))
