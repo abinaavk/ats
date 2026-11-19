@@ -217,11 +217,11 @@ def backup_list(a,args):
     return {'backups':values}
 
 
-def backup_create(a,args):
+def backup_create(a,args,scheduled=False):
     s=service(a,args);gd=args.get('gdrive',False)
     if not isinstance(gd,bool):raise ValueError('gdrive must be boolean')
     with a.service_lock(s['name']):
-        output=a.create_local_backup(s)
+        output=a.create_local_backup(s,retain_legacy=False) if scheduled else a.create_local_backup(s)
         if not output:raise a.ServiceOpError('No database files were backed up')
         path=backup_path(a,Path(output).name)
         if not gd:return {'filename':path.name,'size_bytes':path.stat().st_size,'location':'local'}
@@ -302,6 +302,9 @@ def backup_delete(a,args):
 
 
 def run(a,op,args):
+    if op in ('operations.get','operations.set','operations.collect','deployments.rollback','backups.verify','alerts.ack'):
+        import ats_operations
+        return ats_operations.run(a,op,args)
     if op=='settings.get':return settings(a)
     if op=='settings.set':return set_settings(a,args)
     if op=='services.list':return {'services':[summary(a,dict(s)) for s in a.db.query('SELECT * FROM services ORDER BY name',fetch_all=True)]}

@@ -513,7 +513,7 @@ class SchemaMigrationTests(unittest.TestCase):
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertIn("webhook_events", tables)
         ev_cols = [r[1] for r in conn.execute("PRAGMA table_info(webhook_events)")]
-        self.assertEqual(ev_cols, ["id", "service_name", "timestamp", "event", "ref", "commit_sha", "result", "message"])
+        self.assertEqual(ev_cols, ["id", "service_name", "timestamp", "event", "ref", "commit_sha", "result", "message", "delivery", "signature"])
         conn.close()
 
         app.DatabaseManager(path)                                       # second run: no change, no error

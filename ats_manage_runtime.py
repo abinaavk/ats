@@ -232,6 +232,8 @@ def deploy(a, args):
         if any(os.path.lexists(path) for path in locations):
             raise a.ServiceOpError('A service path already exists; resolve it before deploying', 'conflict')
         route_created = False
+        import ats_operations as ops
+        record = ops.begin(a, s, 'deploy')
         a.audit_log('DEPLOY_START', name, {'runtime': s['runtime']})
         try:
             for parent in (os.path.dirname(directory), os.path.dirname(database)):
@@ -267,9 +269,11 @@ def deploy(a, args):
             sql(a, '''INSERT INTO services(name,port,domain,storage_path,repo_url,workers,max_memory_mb,cpu_quota,branch,runtime,container_port,auto_update,webhook_secret)
                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''', tuple(s[k] for k in ('name','port','domain','storage_path','repo_url','workers','max_memory_mb','cpu_quota','branch','runtime','container_port')) + (int(s.get('auto_update', True)), secret))
             sql(a, 'INSERT INTO deployments(service_name,status,duration_seconds) VALUES (?,?,?)', (name, 'success', time.time()-started))
+            ops.finish(a, record, 'success', ops.commit(a,s))
             a.audit_log('DEPLOY_SUCCESS', name)
             return {'name': name, 'url': 'https://' + s['domain'], 'port': s['port'], 'runtime': s['runtime'], 'webhook': {'url': a.webhook_url(name), 'secret': secret}}
         except Exception as error:
+            ops.finish(a, record, 'failed', ops.commit(a,s), error)
             for command in (['systemctl','stop',name], ['systemctl','disable',name]):
                 try: a.run_root(command)
                 except Exception: pass
@@ -292,29 +296,43 @@ def update(a, name, s, log=None, rebuild=False, reinstall=False):
     started = time.time()
     directory, _ = paths(a, s)
     with a.service_lock(name):
+        import ats_operations as ops
+        if user(a, ['git','status','--porcelain','--untracked-files=no'], directory):
+            raise a.ServiceOpError('Preserve tracked local changes before updating','conflict')
         before = user(a, ['git', 'rev-parse', 'HEAD'], directory)
+        ops.init(a)
+        with ops.connection(a) as conn:
+            known = conn.execute("SELECT id FROM ops_deployments WHERE name=? AND repository=? AND commit_sha=? AND status='success'",(name,ops.repo_key(a,s),before)).fetchone()
+        if not known:
+            baseline=ops.begin(a,s,'baseline');ops.finish(a,baseline,'success',before)
+        record = ops.begin(a,s,'rebuild' if rebuild else 'dependencies' if reinstall else 'update',before)
         current_branch = user(a, ['git','branch','--show-current'],directory)
         a.audit_log('UPDATE_STARTED', name)
         try:
             # Fetch/reset is the same branch policy used by the webhook and manual updates.
             branch = s.get('branch') or 'main'
-            if current_branch and current_branch != branch:
+            if current_branch != branch:
                 user(a,['git','fetch','origin',branch],directory)
                 user(a,['git','checkout','-B',branch,'FETCH_HEAD'],directory)
             output = step(a, 'clone', lambda: user(a, ['git', 'pull', '--ff-only', 'origin', s.get('branch') or 'main'], directory))
             unchanged = 'Already up to date' in output or 'Already up-to-date' in output
             if unchanged and not rebuild and not reinstall and s.get('runtime') != 'docker':
+                ops.finish(a,record,'success',ops.commit(a,s))
                 return {'ok': True, 'status': 'active' if a.check_systemd_active(name) else 'inactive', 'message': 'Already up to date', 'updated': False}
             changed = user(a, ['git','diff','--name-only',before,'HEAD','--','requirements.txt','package.json','package-lock.json'], directory) if before else ''
             if s.get('runtime') == 'docker' or changed or reinstall or rebuild:
                 step(a, 'build' if s.get('runtime') == 'docker' else 'deps', lambda: dependencies(a, s, recreate=reinstall))
             step(a, 'start', lambda: a._systemctl_and_verify('restart', name))
-            if not a.health_check_deployment(name, s['port']):
-                raise a.ServiceOpError('Service failed health checks after update')
+            def health():
+                if not a.health_check_deployment(name, s['port']):
+                    raise a.ServiceOpError('Service failed health checks after update')
+            step(a,'health',health)
+            ops.finish(a,record,'success',ops.commit(a,s))
             sql(a, 'INSERT INTO deployments(service_name,status,duration_seconds) VALUES (?,?,?)', (name,'success',time.time()-started))
             a.audit_log('UPDATE', name)
             return {'ok': True, 'status': 'active', 'message': 'Service restarted with new code', 'updated': True}
         except Exception as error:
+            ops.finish(a,record,'failed',ops.commit(a,s),error)
             sql(a, 'INSERT INTO deployments(service_name,status,duration_seconds,error_message) VALUES (?,?,?,?)', (name,'failed',time.time()-started,a.redact_repo_url(str(error))))
             a.audit_log('UPDATE_FAILED', name, {'error': a.redact_repo_url(str(error))})
             raise
@@ -474,6 +492,9 @@ def run(a, op, args):
             staging=tempfile.mkdtemp(prefix='.ats-redeploy-',dir=os.path.dirname(directory))
             saved=staging+'-previous'
             moved=False
+            import ats_operations as ops
+            replacement=dict(s,repo_url=repo,branch=branch)
+            record=ops.begin(a,replacement,'redeploy',ops.commit(a,s))
             try:
                 shutil.chown(staging,user=a.SERVICE_USER,group=a.SERVICE_GROUP)
                 user(a,['git','clone','--branch',branch,'--single-branch','--',repo,staging],os.path.dirname(directory))
@@ -498,8 +519,10 @@ def run(a, op, args):
                 previous_logs = os.path.join(saved, 'logs')
                 if os.path.isdir(previous_logs): shutil.copytree(previous_logs, logs, dirs_exist_ok=True)
                 shutil.rmtree(saved); moved=False
+                ops.finish(a,record,'success',ops.commit(a,replacement))
                 a.audit_log('REDEPLOY',name)
-            except Exception:
+            except Exception as error:
+                ops.finish(a,record,'failed',ops.commit(a,replacement),error)
                 if moved:
                     if os.path.isdir(directory): shutil.rmtree(directory)
                     os.rename(saved,directory)
