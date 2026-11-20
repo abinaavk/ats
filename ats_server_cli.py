@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import sys
 from urllib.parse import urlsplit
 import yaml
@@ -14,7 +15,7 @@ from ats_cluster import Store
 
 def main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (operator-managed TLS, storage and GitHub)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
@@ -23,6 +24,8 @@ def main():
     parser.add_argument('--confirm-existing-route', action='store_true')
     parser.add_argument('--port', type=int, default=int(os.environ.get('ATS_REMOTE_PORT', '9997')))
     parser.add_argument('--pairing-file')
+    parser.add_argument('--monitor-adapter', help='Installed Monitor remote_host.py (preview only)')
+    parser.add_argument('--adapter-state-dir', help='Private absolute directory for adapter security/job state')
     parser.add_argument('--server-id')
     parser.add_argument('--repository')
     parser.add_argument('--service')
@@ -30,14 +33,23 @@ def main():
     parser.add_argument('--secret-file')
     parser.add_argument('--replace-mapping', action='store_true')
     args = parser.parse_args()
+    if (args.monitor_adapter or args.adapter_state_dir) and args.action not in ('service', 'adapter'):
+        parser.error('Adapter options require server service or server adapter')
     store = Store()
     if args.action == 'configure':
         try:
             configure(store, args, sys.stdin.isatty())
         except (ValueError, OSError, yaml.YAMLError, EOFError) as exc:
             parser.error('Server setup failed: ' + str(exc))
-    elif args.action == 'service':
-        print(service_unit(store, args.port))
+    elif args.action in ('service', 'adapter'):
+        try:
+            if args.action == 'adapter':
+                print(adapter_drop_in(store, args.monitor_adapter, args.adapter_state_dir))
+            else:
+                print(service_unit(store, args.port, monitor_adapter=args.monitor_adapter,
+                                   adapter_state_dir=args.adapter_state_dir))
+        except (ValueError, OSError, yaml.YAMLError) as exc:
+            parser.error('Service preview failed: ' + str(exc))
     elif args.action == 'tunnel':
         try:
             tunnel_guidance(store, args.cloudflare_config, args.port)
@@ -354,7 +366,89 @@ def rotate_pairing(store, path=None):
     print('Credentials rotated. Re-pair this Global on Local using the private file.')
 
 
-def service_unit(store, port=None):
+def unit_quote(value):
+    """Quote a systemd value, including literal specifiers; never shell-evaluate."""
+    value = str(value)
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError('Invalid service path or environment')
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+
+
+def adapter_environment(store, monitor_adapter=None, state_dir=None):
+    """Prepare an explicit Global adapter without importing it or changing state."""
+    node = store.node()
+    if configuration_issues(node) or node['role'] != 'global':
+        raise ValueError('Adapter setup requires a configured Global server')
+
+    def absolute(value, label):
+        if not isinstance(value, str) or not value or not Path(value).is_absolute():
+            raise ValueError(label + ' must be an absolute path')
+        unit_quote(value)
+        return str(Path(value).resolve())
+
+    adapter = absolute(monitor_adapter or os.environ.get('ATS_MONITOR_ADAPTER'),
+                       '--monitor-adapter')
+    if not Path(adapter).is_file():
+        raise ValueError('Install the reviewed Monitor remote_host.py before previewing the adapter')
+    checkout = Path(__file__).resolve().parent
+    instance = os.environ.get('ATS_INSTANCE', '')
+    if instance and not all(c.isalnum() or c in '_-' for c in instance):
+        raise ValueError('Invalid ATS_INSTANCE')
+    config = absolute(os.environ.get('ATS_CONFIG_FILE') or
+                      ('/etc/ats/config-'+instance+'.yml' if instance else '/etc/ats/config.yml'),
+                      'ATS_CONFIG_FILE')
+    with open(config) as f:
+        settings = yaml.safe_load(f)
+    if not isinstance(settings, dict):
+        raise ValueError('ATS config must contain a settings mapping')
+    home = absolute(os.environ.get('ATS_HOME') or settings.get('ats_home'), 'ATS_HOME / ats_home')
+    if not (Path(home) / 'ats.db').is_file():
+        raise ValueError('ATS_HOME must contain the existing ats.db')
+    if state_dir is not None:
+        state = Path(absolute(state_dir, '--adapter-state-dir'))
+        if state == Path('/'):
+            raise ValueError('--adapter-state-dir must be a private directory below /')
+        security_db, jobs = str(state / 'security.sqlite3'), str(state / 'jobs')
+    else:
+        security_db = absolute(os.environ.get('ATS_SECURITY_DB'),
+                               'ATS_SECURITY_DB (or supply --adapter-state-dir)')
+        jobs = absolute(os.environ.get('ATS_MONITOR_JOBS_DIR'),
+                        'ATS_MONITOR_JOBS_DIR (or supply --adapter-state-dir)')
+    # Root runs the adapter with the same interpreter and intended ATS instance.
+    # Explicit operator launchers are retained rather than silently replaced.
+    cli = os.environ.get('ATS_CLI') or shlex.join([sys.executable, str(checkout / 'app.py')])
+    if not shlex.split(cli):
+        raise ValueError('ATS_CLI must contain a command')
+    unit_quote(cli)
+    module_dir = absolute(os.environ.get('ATS_MODULE_DIR') or str(checkout), 'ATS_MODULE_DIR')
+    if not (Path(module_dir) / 'ats_cluster.py').is_file():
+        raise ValueError('ATS_MODULE_DIR must contain ats_cluster.py')
+    return {'ATS_MONITOR_ADAPTER': adapter, 'ATS_MODULE_DIR': module_dir,
+            'ATS_CLI': cli, 'ATS_HOME': home, 'ATS_SECURITY_DB': security_db,
+            'ATS_MONITOR_JOBS_DIR': jobs}
+
+
+def adapter_preflight(env):
+    # Creation/ownership is an explicit installation step. Importing Monitor in
+    # a preview would initialize its private security database.
+    checks = [('-f', env['ATS_MONITOR_ADAPTER']),
+              ('-f', Path(env['ATS_MODULE_DIR']) / 'ats_cluster.py'),
+              ('-f', Path(env['ATS_HOME']) / 'ats.db'),
+              ('-d', Path(env['ATS_SECURITY_DB']).parent),
+              ('-d', env['ATS_MONITOR_JOBS_DIR'])]
+    return ['ExecStartPre=/usr/bin/test '+flag+' '+unit_quote(path).replace('$', '$$')
+            for flag, path in checks]
+
+
+def adapter_drop_in(store, monitor_adapter=None, state_dir=None):
+    """Print a drop-in for an existing Global daemon; preserve its unit and keys."""
+    env = adapter_environment(store, monitor_adapter, state_dir)
+    return '\n'.join(['[Service]', 'UMask=0077'] +
+                     ['Environment='+unit_quote(k+'='+v) for k, v in env.items()] +
+                     adapter_preflight(env))
+
+
+def service_unit(store, port=None, *, monitor_adapter=None, adapter_state_dir=None):
     """Print a reviewable unit for the current installation; never apply it."""
     node = store.node()
     if configuration_issues(node):
@@ -362,11 +456,6 @@ def service_unit(store, port=None):
     port = int(port if port is not None else os.environ.get('ATS_REMOTE_PORT', '9997'))
     if not 1 <= port <= 65535:
         raise ValueError('API port must be between 1 and 65535')
-    def quote(value):
-        value = str(value)
-        if any(c in value for c in '\n\r\x00'):
-            raise ValueError('Invalid service path or environment')
-        return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
     checkout = Path(__file__).resolve().parent
     instance = os.environ.get('ATS_INSTANCE', '')
     if instance and not all(c.isalnum() or c in '_-' for c in instance):
@@ -374,16 +463,25 @@ def service_unit(store, port=None):
     config = os.environ.get('ATS_CONFIG_FILE') or ('/etc/ats/config-'+instance+'.yml' if instance else '/etc/ats/config.yml')
     env = {'PYTHONUNBUFFERED': '1', 'ATS_CONFIG_FILE': str(Path(config).resolve()),
            'ATS_CLUSTER_DB': str(Path(store.path).resolve()), 'ATS_REMOTE_PORT': str(port)}
-    for key in ('ATS_INSTANCE', 'ATS_HOME', 'ATS_MONITOR_ADAPTER', 'ATS_CLI', 'ATS_MODULE_DIR'):
+    for key in ('ATS_INSTANCE', 'ATS_HOME', 'ATS_MONITOR_ADAPTER', 'ATS_CLI', 'ATS_MODULE_DIR',
+                'ATS_SECURITY_DB', 'ATS_MONITOR_JOBS_DIR'):
         if key in os.environ:
             env[key] = os.environ[key]
+    explicit_adapter = monitor_adapter is not None or adapter_state_dir is not None
+    if explicit_adapter:
+        env.update(adapter_environment(store, monitor_adapter, adapter_state_dir))
     lines = ['[Unit]', 'Description=ATS persistent '+node['role'].title()+' daemon',
              'Wants=network-online.target', 'After=network-online.target', 'StartLimitIntervalSec=0',
-             '', '[Service]', 'Type=simple', 'User=root', 'WorkingDirectory='+quote(checkout)]
-    lines += ['Environment='+quote(k+'='+v) for k, v in env.items()]
-    lines += ['ExecStartPre=/usr/bin/test -f '+quote(env['ATS_CONFIG_FILE']),
-              'ExecStartPre=/usr/bin/test -f '+quote(env['ATS_CLUSTER_DB']),
-              'ExecStart='+quote(sys.executable).replace('$', '$$')+' '+quote(checkout / 'app.py').replace('$', '$$')+' --daemon',
+             '', '[Service]', 'Type=simple', 'User=root', 'WorkingDirectory='+unit_quote(checkout)]
+    if node['role'] == 'global' and not Path(env.get('ATS_MONITOR_ADAPTER', '')).is_file():
+        lines += ['# Global management adapter is not configured; health alone can still pass.',
+                  '# Preview its settings with server adapter --monitor-adapter /absolute/path/to/remote_host.py --adapter-state-dir /private/state/path']
+    lines += ['Environment='+unit_quote(k+'='+v) for k, v in env.items()]
+    if explicit_adapter:
+        lines += ['UMask=0077'] + adapter_preflight(env)
+    lines += ['ExecStartPre=/usr/bin/test -f '+unit_quote(env['ATS_CONFIG_FILE']).replace('$', '$$'),
+              'ExecStartPre=/usr/bin/test -f '+unit_quote(env['ATS_CLUSTER_DB']).replace('$', '$$'),
+              'ExecStart='+unit_quote(sys.executable).replace('$', '$$')+' '+unit_quote(checkout / 'app.py').replace('$', '$$')+' --daemon',
               'Restart=always', 'RestartSec=10', '', '[Install]', 'WantedBy=multi-user.target']
     return '\n'.join(lines)
 

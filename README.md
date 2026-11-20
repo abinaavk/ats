@@ -37,6 +37,12 @@ root-owned launcher for this instance and set up narrowly scoped sudo access if
 needed. Keep the launcher, ATS code and their parent directories unwritable by
 the monitor service account. See the monitor's `docs/manage.md` for deployment.
 
+For Global management on port 9997, install the companion Monitor adapter and
+preview its complete service environment with `server adapter`. See
+[Global Monitor adapter setup](docs/global-monitor-adapter.md) and
+[persistent startup](docs/persistent-startup.md). A passing signed health check
+does not verify management reads or writes.
+
 ## Upgrade notes
 
 - Existing unsigned GitHub webhooks need the per-service secret shown in Manage
