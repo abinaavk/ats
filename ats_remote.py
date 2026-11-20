@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import socket
+import secrets
 import tempfile
 import threading
 import time
@@ -46,10 +47,11 @@ def dispatch(store, data):
         raise ValueError('JSON object required')
     kind = data.get('kind')
     if kind == 'health':
-        return {'server_id': store.node()['id'], 'role': 'global', 'terminal': False}
+        return {'server_id': store.node()['id'], 'role': 'global', 'terminal': False,
+                'management_ready': Path(os.environ.get('ATS_MONITOR_ADAPTER', '')).is_file()}
     if kind == 'revoke':
         with store.db() as db:
-            db.execute('UPDATE node SET secret=NULL')
+            db.execute('UPDATE node SET secret=?', (secrets.token_hex(32),))
         return {'revoked': True}
     if kind == 'http':
         adapter = os.environ.get('ATS_MONITOR_ADAPTER')

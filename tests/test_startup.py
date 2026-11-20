@@ -121,6 +121,33 @@ class StartupTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'incomplete'):
                         asyncio.run(entry())
 
+    def test_service_preview_preserves_runtime_paths_and_starts_daemon(self):
+        from ats_server_cli import service_unit
+        self.store.configure('global','Remote','https://remote.example.com')
+        with patch.dict(os.environ, {'ATS_MONITOR_ADAPTER':'/opt/monitor/remote_host.py','ATS_REMOTE_PORT':'9997'}):
+            unit=service_unit(self.store)
+        self.assertIn(' --daemon', unit)
+        self.assertIn('Restart=always', unit)
+        self.assertIn('ATS_CLUSTER_DB='+str(self.root / 'cluster.db'), unit)
+        self.assertIn('ATS_MONITOR_ADAPTER=/opt/monitor/remote_host.py', unit)
+        self.assertIn('ATS_REMOTE_PORT=9997', unit)
+        self.assertIn('ATS_CONFIG_FILE='+str(self.root / 'config.yml'), unit)
+        self.assertNotIn(self.store.node()['secret'], unit)
+
+    def test_role_specific_menu(self):
+        from ats_server_cli import menu
+        from contextlib import redirect_stdout
+        import io
+        for role in ('local','global'):
+            store=Store(self.root / (role+'.db'))
+            store.configure(role,role,api_domain='https://remote.example.com' if role=='global' else None,
+                            webhook='hooks.example.com' if role=='local' else None)
+            output=io.StringIO()
+            with patch('builtins.input',return_value='0'),redirect_stdout(output):
+                menu(store)
+            self.assertEqual('Export pairing file' in output.getvalue(), role=='global')
+            self.assertEqual('Disconnect Global' in output.getvalue(), role=='local')
+
     def test_global_webhook_menu_returns_without_task(self):
         from harness import load_app
         node = self.store.configure('global', 'Remote', 'https://remote.example.com')

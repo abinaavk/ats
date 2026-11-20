@@ -57,7 +57,7 @@ class PairingFileTests(unittest.TestCase):
         self.addCleanup(env.close)
         app = env.app
         prompts = []
-        answers = iter(['4', '', 'invalid', '', '2', '', '0'])
+        answers = iter(['10', '', 'invalid', '', '2', '', '0'])
         def answer(prompt):
             prompts.append(prompt)
             return next(answers)
@@ -69,7 +69,8 @@ class PairingFileTests(unittest.TestCase):
         self.assertEqual(header.call_count, 4)
         self.assertIn(app.C_CYAN + app.C_BOLD + '═══ SERVER CONFIGURATION ═══', text)
         self.assertIn(app.C_BOLD + '[0]' + app.C_RESET + ' Back', text)
-        self.assertIn('No servers configured', text)
+        self.assertIn('Restart=always', text)
+        self.assertNotIn('Disconnect Global', text)
         self.assertIn(app.C_YELLOW, text)
         self.assertEqual(sum('Press Enter to continue' in p for p in prompts), 3)
         self.assertEqual(json.loads(self.path.read_text()), self.node)

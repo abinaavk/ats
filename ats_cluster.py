@@ -110,7 +110,7 @@ class Store:
 
     def servers(self):
         with self.db() as db:
-            return [dict(r) for r in db.execute('SELECT id,name,domain,connected,local FROM servers ORDER BY local DESC,name')]
+            return [dict(r) for r in db.execute('SELECT id,name,domain,connected,local,(secret IS NOT NULL) AS paired FROM servers ORDER BY local DESC,name')]
 
     def server(self, sid):
         if not isinstance(sid, str) or not ID.fullmatch(sid):
@@ -149,12 +149,30 @@ class Store:
         if action == 'reconnect':
             remote(dict(s, connected=1), {'kind': 'health'})
         elif action == 'revoke':
+            # Fail closed even if the Global rotates its key but its reply is lost.
+            # Retain the private key until confirmation so the operator can retry.
+            with self.db() as db:
+                db.execute('UPDATE servers SET connected=0 WHERE id=?', (sid,))
             remote(dict(s, connected=1), {'kind': 'revoke'})
         elif action != 'disconnect':
             raise ValueError('Invalid connection action')
         with self.db() as db:
             db.execute('UPDATE servers SET connected=?,secret=? WHERE id=?',
                        (int(action == 'reconnect'), None if action == 'revoke' else s['secret'], sid))
+
+    def update_server(self, sid, label, origin):
+        server = self.server(sid)
+        if server['local']:
+            raise ValueError('Configure the primary Local from its ATS CLI')
+        name(label); origin = domain(origin)
+        if not server['secret']:
+            raise ValueError('Pair this server again before editing its endpoint')
+        candidate = dict(server, name=label, domain=origin, connected=1)
+        health = remote(candidate, {'kind': 'health'})
+        if health.get('server_id') != sid:
+            raise ValueError('Server identity mismatch')
+        with self.db() as db:
+            db.execute('UPDATE servers SET name=?,domain=? WHERE id=?', (label, origin, sid))
 
     def mapping(self, repository, sid, service, branch, secret, replace=False):
         if not isinstance(repository, str) or not REPO.fullmatch(repository):
@@ -207,14 +225,14 @@ def authenticate(store, method, path, body, headers):
         raise ValueError('Unauthorized')
 
 
-def remote(server, payload):
+def remote(server, payload, *, timeout=None):
     if server['local'] or not server['connected'] or not server['secret']:
         raise ValueError('Selected Global server is disconnected or revoked')
     u = urlsplit(domain(server['domain']))
     body = json.dumps(payload, separators=(',', ':')).encode()
     if len(body) > MAX_BODY:
         raise ValueError('Request too large')
-    conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=65)
+    conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout or (5 if payload.get('kind') == 'health' else 10 if payload.get('kind') == 'revoke' else 65))
     try:
         conn.request('POST', '/v1/request', body, signed_headers(server['secret'], server['id'], body))
         r = conn.getresponse()
