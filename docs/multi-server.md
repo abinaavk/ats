@@ -96,14 +96,19 @@ Global configuration, normal interactive startup and daemon startup create a
 missing default export automatically without rotating the saved identity or key.
 Reconfiguring the name/API origin updates the export while preserving credentials.
 An existing default file must be private and belong to this same identity;
-foreign-owned directories, symlinks, malformed files and foreign identities are rejected
-without overwriting them. Different ATS instances with different cluster databases
-must use separate checkouts. ATS automatically sets an existing `files/` directory owned by its runtime user to
-0700 before exporting, including when the directory was created with normal 0755
-permissions. It uses the opened directory descriptor and does not change ownership
-or recursively change other files. Existing pairing-file safety checks still apply.
-A foreign-owned directory or a read-only checkout requires operator correction;
-the error identifies the path and runtime UID for ownership problems. Use the same
+symlinks, malformed files and foreign identities are rejected
+without overwriting the file. Separate configured Global instances
+must use separate checkouts. ATS secures the opened `files/` directory to
+0700 before exporting. Because app.py requires root, root startup also takes
+ownership of this managed directory when the checkout belongs to the login user
+(for example `/home/abi/ats/files` owned by UID 1000). An existing private export
+may belong to root or that directory's original owner and must match the registry
+identity. Validation happens before ownership changes. Root takes ownership of the validated
+existing export before the directory so interrupted repairs can be retried; the
+refreshed atomic 0600 export also belongs to root. Other files, including old private exports, keep their
+contents and ownership. There is no recursive chown/chmod and no ownership change
+to the checkout itself. Non-root exports still reject foreign-owned directories.
+Read-only filesystems or failed permission repairs require operator correction. Use the same
 runtime user as the existing installation. Preserve the registry and pairing files;
 do not delete them or rotate credentials to fix a permissions error.
 

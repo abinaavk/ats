@@ -227,21 +227,12 @@ def pairing_destination(path, node):
     temporary = '.pairing-' + secrets.token_hex(16)
     try:
         info = os.fstat(directory)
-        if info.st_uid != os.geteuid():
-            raise ValueError(f'Pairing directory {target.parent} is owned by UID {info.st_uid}, '
-                             f'but ATS runs as UID {os.geteuid()}. Have the operator correct '
+        runtime_uid = os.geteuid()
+        directory_uid = info.st_uid
+        if directory_uid != runtime_uid and runtime_uid != 0:
+            raise ValueError(f'Pairing directory {target.parent} is owned by UID {directory_uid}, '
+                             f'but ATS runs as UID {runtime_uid}. Have the operator correct '
                              'ownership for the ATS runtime user; existing credentials are preserved')
-        # Existing checkouts commonly have files/ created with the default 0755.
-        # Tighten only our own opened directory, never follow a replacement path.
-        if stat.S_IMODE(info.st_mode) != 0o700:
-            try:
-                os.fchmod(directory, 0o700)
-            except OSError as exc:
-                raise ValueError(f'Cannot secure pairing directory {target.parent} to mode 0700; '
-                                 'have the operator correct permissions for the ATS runtime user') from exc
-            info = os.fstat(directory)
-            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-                raise ValueError('Pairing directory could not be secured; existing credentials are preserved')
         try:
             fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         except FileNotFoundError:
@@ -249,7 +240,7 @@ def pairing_destination(path, node):
         else:
             with os.fdopen(fd) as existing:
                 info = os.fstat(existing.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+                if not stat.S_ISREG(info.st_mode) or info.st_uid not in {runtime_uid, directory_uid} or info.st_mode & 0o077 or info.st_nlink != 1:
                     raise ValueError('Existing pairing file must be private, owned, regular and unlinked elsewhere')
                 try:
                     previous = json.load(existing)
@@ -257,6 +248,27 @@ def pairing_destination(path, node):
                     raise ValueError('Existing pairing file is invalid; preserve it privately before exporting') from None
                 if not isinstance(previous, dict) or not node or previous.get('id') != node['id']:
                     raise ValueError('Existing pairing file belongs to another identity; use a separate ATS checkout')
+                if info.st_uid != runtime_uid:
+                    # Transfer the validated export first so interrupted directory
+                    # adoption remains retryable with the existing credential.
+                    try:
+                        os.fchown(existing.fileno(), runtime_uid, -1)
+                    except OSError as exc:
+                        raise ValueError('Cannot secure pairing directory export ownership; existing credentials are preserved') from exc
+        # ATS app.py requires root, even in a checkout owned by the sudo user.
+        # Validate the old export first, then secure only the opened managed
+        # directory. Atomic replacement gives the refreshed file to the runtime.
+        try:
+            if stat.S_IMODE(os.fstat(directory).st_mode) != 0o700:
+                os.fchmod(directory, 0o700)
+            if directory_uid != runtime_uid:
+                os.fchown(directory, runtime_uid, -1)
+        except OSError as exc:
+            raise ValueError(f'Cannot secure pairing directory {target.parent} to runtime ownership and mode 0700; '
+                             'have the operator correct permissions; existing credentials are preserved') from exc
+        secured = os.fstat(directory)
+        if secured.st_uid != runtime_uid or stat.S_IMODE(secured.st_mode) != 0o700:
+            raise ValueError('Pairing directory could not be secured; existing credentials are preserved')
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
         try:
             with os.fdopen(fd, 'w') as f:

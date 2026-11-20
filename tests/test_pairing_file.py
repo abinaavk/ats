@@ -152,6 +152,112 @@ class PairingFileTests(unittest.TestCase):
         self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o755)
         self.assertEqual(self.store.node(), self.node)
 
+    @contextlib.contextmanager
+    def root_runtime(self, *, fail_chown=False):
+        """Model root fchown on real temporary directory/file I/O."""
+        original_fstat = os.fstat
+        original_replace = os.replace
+        root_files = set()
+        def replace(*args, **kwargs):
+            original_replace(*args, **kwargs)
+            root_files.add(self.path.stat().st_ino)
+        directory_uid = self.path.parent.stat().st_uid
+        def fstat(fd):
+            info = original_fstat(fd)
+            if info.st_ino in root_files:
+                fields = list(info)
+                fields[4] = 0
+                return os.stat_result(fields)
+            if info.st_ino == self.path.parent.stat().st_ino:
+                fields = list(info)
+                fields[4] = directory_uid
+                return os.stat_result(fields)
+            return info
+        def fchown(fd, uid, gid):
+            nonlocal directory_uid
+            inode = original_fstat(fd).st_ino
+            self.assertIn(inode, {self.path.parent.stat().st_ino, self.path.stat().st_ino} if self.path.exists() else {self.path.parent.stat().st_ino})
+            self.assertEqual((uid, gid), (0, -1))
+            if fail_chown:
+                raise PermissionError('ownership repair denied')
+            if inode == self.path.parent.stat().st_ino:
+                directory_uid = uid
+            else:
+                root_files.add(inode)
+        with patch.object(cli.os, 'geteuid', return_value=0), \
+                patch.object(cli.os, 'replace', side_effect=replace), \
+                patch.object(cli.os, 'fstat', side_effect=fstat), \
+                patch.object(cli.os, 'fchown', side_effect=fchown) as chown:
+            yield chown
+
+    def test_root_startup_adopts_user_directory_and_preserves_credentials(self):
+        self.path.parent.mkdir(mode=0o755)
+        old = self.path.parent / '.json'
+        old.write_text('old private export')
+        old.chmod(0o600)
+        before = old.stat()
+        for existing in (False, True):
+            with self.subTest(existing=existing), self.root_runtime() as chown:
+                cli.ensure_startup_configuration(interactive=False, store=self.store)
+                cli.ensure_startup_configuration(interactive=False, store=self.store)
+                self.assertEqual(chown.call_count, 2 if existing else 1)
+            self.assertEqual(json.loads(self.path.read_text()), self.node)
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(self.store.node(), self.node)
+            self.assertEqual(old.read_text(), 'old private export')
+            self.assertEqual(old.stat().st_uid, before.st_uid)
+
+    def test_root_repair_failure_preserves_export_and_registry(self):
+        cli.save_pairing(self.store)
+        previous = self.path.read_bytes()
+        with self.root_runtime(fail_chown=True):
+            with self.assertRaisesRegex(ValueError, 'Cannot secure pairing directory'):
+                cli.ensure_startup_configuration(interactive=False, store=self.store)
+        self.assertEqual(self.path.read_bytes(), previous)
+        self.assertEqual(self.store.node(), self.node)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
+    def test_root_validates_existing_export_before_taking_ownership(self):
+        cli.save_pairing(self.store)
+        for data in ('{broken', json.dumps(dict(self.node, id='f'*32))):
+            self.path.write_text(data)
+            with self.root_runtime() as chown:
+                with self.assertRaises(ValueError):
+                    cli.save_pairing(self.store)
+                chown.assert_not_called()
+            self.assertEqual(self.path.read_text(), data)
+        self.path.write_text(json.dumps(self.node))
+        self.path.chmod(0o644)
+        with self.root_runtime() as chown:
+            with self.assertRaises(ValueError):
+                cli.save_pairing(self.store)
+            chown.assert_not_called()
+
+    def test_root_rejects_unrelated_file_owner_and_hardlinks(self):
+        cli.save_pairing(self.store)
+        original_fstat = os.fstat
+        def unrelated_owner(fd):
+            info = original_fstat(fd)
+            if info.st_ino == self.path.stat().st_ino:
+                fields = list(info)
+                fields[4] = self.root.stat().st_uid + 42
+                return os.stat_result(fields)
+            return info
+        with patch.object(cli.os, 'geteuid', return_value=0), \
+                patch.object(cli.os, 'fstat', side_effect=unrelated_owner), \
+                patch.object(cli.os, 'fchown') as chown:
+            with self.assertRaisesRegex(ValueError, 'private, owned'):
+                cli.save_pairing(self.store)
+            chown.assert_not_called()
+        backup = self.root / 'linked.json'
+        os.link(self.path, backup)
+        with self.root_runtime() as chown:
+            with self.assertRaisesRegex(ValueError, 'private, owned'):
+                cli.save_pairing(self.store)
+            chown.assert_not_called()
+        self.assertEqual(json.loads(backup.read_text()), self.node)
+
     def test_permission_repair_failure_preserves_existing_export_and_registry(self):
         cli.save_pairing(self.store)
         previous = self.path.read_bytes()
