@@ -84,8 +84,8 @@ python3 app.py server configure --role global --name 'Build server' \
   --api-domain https://api.build.example.com
 ```
 
-The default pairing file is `files/.json` inside the installed ATS checkout:
-for `/ats/app.py`, it is `/ats/files/.json`. The path is independent of your
+The default pairing file is `files/pairing.json` inside the installed ATS checkout:
+for `/ats/app.py`, it is `/ats/files/pairing.json`. The path is independent of your
 current working directory.
 The directory is private (0700), the JSON is private (0600), and `files/` is ignored
 by Git. Keep it outside any web server's static roots and public backup archives.
@@ -101,11 +101,11 @@ without overwriting them. Different ATS instances with different cluster databas
 must use separate checkouts. A read-only checkout or an unsafe existing `files/`
 directory must be corrected by the operator before startup can export the file.
 
-Upgrades from the previous `root/.json` location export the existing registry
-identity and key to `files/.json` on the next Global startup or `server export`.
+Upgrades from the previous `files/.json` or `root/.json` locations export the existing registry
+identity and key to `files/pairing.json` on the next Global startup or `server export`.
 No credential rotation or re-pairing is needed. The registry stays authoritative;
-the old private `root/.json` is retained for operator-controlled recovery and
-remains ignored by Git. ATS never imports credentials from that old export.
+the old private files are retained for operator-controlled recovery and
+remain ignored by Git. ATS never imports credentials from those old exports.
 
 Choose **12 — Server Configuration** in the ATS CLI to configure name/endpoint,
 export the pairing file, explicitly rotate a Global key, list/pair Global servers,

@@ -19,7 +19,7 @@ class StartupTests(unittest.TestCase):
         self.cf = self.root / 'tunnel.yml'
         self.cf.write_text('ingress: []\n')
         self.env = patch.dict(os.environ, {'ATS_CONFIG_FILE': str(self.root / 'config.yml')})
-        self.export = patch('ats_server_cli.default_pairing_path', return_value=self.root / 'files' / '.json')
+        self.export = patch('ats_server_cli.default_pairing_path', return_value=self.root / 'files' / 'pairing.json')
         self.export.start()
         self.addCleanup(self.export.stop)
         self.env.start()
@@ -87,7 +87,7 @@ class StartupTests(unittest.TestCase):
         self.assertIsNone(self.store.node())
 
     def test_global_automatically_exports_without_webhook(self):
-        path = self.root / 'files' / '.json'
+        path = self.root / 'files' / 'pairing.json'
         node = self.launch(['global', 'Remote', 'https://remote.example.com'])
         self.assertIsNone(node['webhook'])
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
