@@ -158,7 +158,48 @@ class TLSIntegrationTests(unittest.TestCase):
         local.connection(self.node['id'],'reconnect');self.assertEqual(c.remote(local.server(self.node['id']),{'kind':'health'})['role'],'global')
         local.connection(self.node['id'],'revoke')
         with self.assertRaises(ValueError):c.remote(self.server,{'kind':'health'})
-        self.assertIsNone(self.global_store.node()['secret'])
+        self.assertNotEqual(self.global_store.node()['secret'], self.node['secret'])
+        from ats_server_cli import configuration_issues
+        self.assertEqual(configuration_issues(self.global_store.node()), [])
+        fresh = self.global_store.node()
+        local.pair(fresh['id'], 'Remote', self.origin, fresh['secret'])
+        self.assertEqual(c.remote(local.server(fresh['id']), {'kind':'health'})['role'], 'global')
+
+    def test_verified_settings_preserve_disconnect_and_reject_wrong_endpoint(self):
+        local=c.Store(Path(self.temp.name)/'local.db');local.configure('local','Local',webhook='hooks.example.com')
+        local.pair(self.node['id'],'Remote',self.origin,self.node['secret'])
+        local.connection(self.node['id'],'disconnect')
+        local.update_server(self.node['id'], 'Renamed', self.origin)
+        updated=local.server(self.node['id'])
+        self.assertEqual(updated['name'], 'Renamed')
+        self.assertFalse(updated['connected'])
+        with self.assertRaises(ValueError):
+            local.update_server(self.node['id'], 'Wrong', 'http://localhost')
+        self.assertEqual(local.server(self.node['id']), updated)
+
+    def test_health_reports_missing_management_adapter(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'ATS_MONITOR_ADAPTER':'/missing/remote_host.py'}):
+            self.assertFalse(c.remote(self.server, {'kind':'health'})['management_ready'])
+
+    def test_unconfirmed_revoke_disables_requests_without_claiming_success(self):
+        from unittest.mock import patch
+        local=c.Store(Path(self.temp.name)/'local.db');local.configure('local','Local',webhook='hooks.example.com')
+        local.pair(self.node['id'],'Remote',self.origin,self.node['secret'])
+        with patch('ats_cluster.remote', side_effect=OSError('offline')):
+            with self.assertRaises(OSError):local.connection(self.node['id'],'revoke')
+        self.assertFalse(local.server(self.node['id'])['connected'])
+        self.assertEqual(local.server(self.node['id'])['secret'], self.node['secret'])
+
+    def test_health_and_revoke_have_shorter_timeouts_than_operations(self):
+        from unittest.mock import patch
+        for kind, seconds in [('health',5),('revoke',10),('http',65)]:
+            with patch('ats_cluster.http.client.HTTPSConnection') as conn:
+                conn.return_value.getresponse.return_value.status=503
+                conn.return_value.getresponse.return_value.read.return_value=b'{}'
+                with self.assertRaises(ValueError):
+                    c.remote(self.server, {'kind':kind})
+                self.assertEqual(conn.call_args.kwargs['timeout'], seconds)
 
     def test_tampering_replay_timestamp_and_wrong_server(self):
         body=b'{"kind":"health"}';headers=c.signed_headers(self.node['secret'],self.node['id'],body)

@@ -14,7 +14,7 @@ from ats_cluster import Store
 
 def main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (operator-managed TLS, storage and GitHub)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
@@ -36,6 +36,8 @@ def main():
             configure(store, args, sys.stdin.isatty())
         except (ValueError, OSError, yaml.YAMLError, EOFError) as exc:
             parser.error('Server setup failed: ' + str(exc))
+    elif args.action == 'service':
+        print(service_unit(store, args.port))
     elif args.action == 'tunnel':
         try:
             tunnel_guidance(store, args.cloudflare_config, args.port)
@@ -343,13 +345,47 @@ def rotate_pairing(store, path=None):
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT * FROM node').fetchone()
         node = dict(row) if row else None
-        if not node or node['role'] != 'global' or configuration_issues(node):
+        if not node or node['role'] != 'global' or configuration_issues(dict(node, secret=node['secret'] or '0'*64)):
             raise ValueError('Rotate pairing credentials on a valid Global server')
         with pairing_destination(path, node) as f:
             node['secret'] = secrets.token_hex(32)
             json.dump(node, f)
         db.execute('UPDATE node SET secret=?', (node['secret'],))
     print('Credentials rotated. Re-pair this Global on Local using the private file.')
+
+
+def service_unit(store, port=None):
+    """Print a reviewable unit for the current installation; never apply it."""
+    node = store.node()
+    if configuration_issues(node):
+        raise ValueError('Complete server configuration before preparing a service')
+    port = int(port if port is not None else os.environ.get('ATS_REMOTE_PORT', '9997'))
+    if not 1 <= port <= 65535:
+        raise ValueError('API port must be between 1 and 65535')
+    def quote(value):
+        value = str(value)
+        if any(c in value for c in '\n\r\x00'):
+            raise ValueError('Invalid service path or environment')
+        return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
+    checkout = Path(__file__).resolve().parent
+    instance = os.environ.get('ATS_INSTANCE', '')
+    if instance and not all(c.isalnum() or c in '_-' for c in instance):
+        raise ValueError('Invalid ATS_INSTANCE')
+    config = os.environ.get('ATS_CONFIG_FILE') or ('/etc/ats/config-'+instance+'.yml' if instance else '/etc/ats/config.yml')
+    env = {'PYTHONUNBUFFERED': '1', 'ATS_CONFIG_FILE': str(Path(config).resolve()),
+           'ATS_CLUSTER_DB': str(Path(store.path).resolve()), 'ATS_REMOTE_PORT': str(port)}
+    for key in ('ATS_INSTANCE', 'ATS_HOME', 'ATS_MONITOR_ADAPTER', 'ATS_CLI', 'ATS_MODULE_DIR'):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    lines = ['[Unit]', 'Description=ATS persistent '+node['role'].title()+' daemon',
+             'Wants=network-online.target', 'After=network-online.target', 'StartLimitIntervalSec=0',
+             '', '[Service]', 'Type=simple', 'User=root', 'WorkingDirectory='+quote(checkout)]
+    lines += ['Environment='+quote(k+'='+v) for k, v in env.items()]
+    lines += ['ExecStartPre=/usr/bin/test -f '+quote(env['ATS_CONFIG_FILE']),
+              'ExecStartPre=/usr/bin/test -f '+quote(env['ATS_CLUSTER_DB']),
+              'ExecStart='+quote(sys.executable).replace('$', '$$')+' '+quote(checkout / 'app.py').replace('$', '$$')+' --daemon',
+              'Restart=always', 'RestartSec=10', '', '[Install]', 'WantedBy=multi-user.target']
+    return '\n'.join(lines)
 
 
 def menu(store=None, ui=None):
@@ -378,19 +414,27 @@ def menu(store=None, ui=None):
         if node.get('role') == 'global':
             print(f'  {bold}{"Pairing file:":<15}{reset} {default_pairing_path()}')
         print()
-        for number, label in (
+        options = (
                 ('1', 'Configure name / endpoint'), ('2', 'Export pairing file'),
                 ('3', 'Rotate Global credentials'), ('4', 'List servers'),
                 ('5', 'Pair Global from private file'), ('6', 'Disconnect Global'),
                 ('7', 'Reconnect Global'), ('8', 'Revoke Global'),
-                ('9', 'Check Global API tunnel route'), ('0', 'Back')):
+                ('9', 'Check Global API tunnel route'), ('10', 'Preview automatic startup service'), ('0', 'Back'))
+        allowed = {'1', '10', '0'} | ({'2', '3', '9'} if node.get('role') == 'global' else {'4', '5', '6', '7', '8'})
+        for number, label in options:
+            if number not in allowed:
+                continue
             print(f'  {bold}[{number}]{reset} {label}')
         print()
         try:
             choice = input(f'  {bold}Select:{reset} ').strip()
             if choice == '0' or not choice:
                 return
-            if choice == '1':
+            if choice not in allowed:
+                status('This action is unavailable for this server role', 'warning')
+            elif choice == '10':
+                print(service_unit(store))
+            elif choice == '1':
                 args = argparse.Namespace(role=node.get('role'), name=None,
                     api_domain=None, webhook_host=None, cloudflare_config=None,
                     confirm_existing_route=False, pairing_file=None)
