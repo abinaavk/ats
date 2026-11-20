@@ -4,3 +4,4 @@ __pycache__/
 
 # Private server pairing credentials
 /root/
+/files/

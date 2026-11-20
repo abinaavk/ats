@@ -19,7 +19,7 @@ class StartupTests(unittest.TestCase):
         self.cf = self.root / 'tunnel.yml'
         self.cf.write_text('ingress: []\n')
         self.env = patch.dict(os.environ, {'ATS_CONFIG_FILE': str(self.root / 'config.yml')})
-        self.export = patch('ats_server_cli.default_pairing_path', return_value=self.root / 'root' / '.json')
+        self.export = patch('ats_server_cli.default_pairing_path', return_value=self.root / 'files' / '.json')
         self.export.start()
         self.addCleanup(self.export.stop)
         self.env.start()
@@ -87,7 +87,7 @@ class StartupTests(unittest.TestCase):
         self.assertIsNone(self.store.node())
 
     def test_global_automatically_exports_without_webhook(self):
-        path = self.root / 'root' / '.json'
+        path = self.root / 'files' / '.json'
         node = self.launch(['global', 'Remote', 'https://remote.example.com'])
         self.assertIsNone(node['webhook'])
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -95,7 +95,7 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), node)
 
     def test_unsafe_pairing_directory_does_not_persist_global(self):
-        (self.root / 'root').mkdir(mode=0o755)
+        (self.root / 'files').mkdir(mode=0o755)
         with self.assertRaisesRegex(ValueError, 'cancelled'):
             self.launch(['global', 'Remote', 'https://remote.example.com', EOFError])
         self.assertIsNone(self.store.node())

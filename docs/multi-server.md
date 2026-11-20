@@ -84,10 +84,10 @@ python3 app.py server configure --role global --name 'Build server' \
   --api-domain https://api.build.example.com
 ```
 
-The default pairing file is `root/.json` inside the installed ATS checkout:
-for `/ats/app.py`, it is `/ats/root/.json`. It is **not** the absolute filesystem
-path `/root/.json`. The path is independent of your current working directory.
-The directory is private (0700), the JSON is private (0600), and `root/` is ignored
+The default pairing file is `files/.json` inside the installed ATS checkout:
+for `/ats/app.py`, it is `/ats/files/.json`. The path is independent of your
+current working directory.
+The directory is private (0700), the JSON is private (0600), and `files/` is ignored
 by Git. Keep it outside any web server's static roots and public backup archives.
 The cluster database remains the source of identity and credentials; the JSON is
 a private export for pairing, not a replacement configuration database.
@@ -98,8 +98,14 @@ Reconfiguring the name/API origin updates the export while preserving credential
 An existing default file must be private and belong to this same identity;
 unsafe directories, symlinks, malformed files and foreign identities are rejected
 without overwriting them. Different ATS instances with different cluster databases
-must use separate checkouts. A read-only checkout or an unsafe existing `root/`
+must use separate checkouts. A read-only checkout or an unsafe existing `files/`
 directory must be corrected by the operator before startup can export the file.
+
+Upgrades from the previous `root/.json` location export the existing registry
+identity and key to `files/.json` on the next Global startup or `server export`.
+No credential rotation or re-pairing is needed. The registry stays authoritative;
+the old private `root/.json` is retained for operator-controlled recovery and
+remains ignored by Git. ATS never imports credentials from that old export.
 
 Choose **12 — Server Configuration** in the ATS CLI to configure name/endpoint,
 export the pairing file, explicitly rotate a Global key, list/pair Global servers,
