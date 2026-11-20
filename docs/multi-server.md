@@ -96,10 +96,16 @@ Global configuration, normal interactive startup and daemon startup create a
 missing default export automatically without rotating the saved identity or key.
 Reconfiguring the name/API origin updates the export while preserving credentials.
 An existing default file must be private and belong to this same identity;
-unsafe directories, symlinks, malformed files and foreign identities are rejected
+foreign-owned directories, symlinks, malformed files and foreign identities are rejected
 without overwriting them. Different ATS instances with different cluster databases
-must use separate checkouts. A read-only checkout or an unsafe existing `files/`
-directory must be corrected by the operator before startup can export the file.
+must use separate checkouts. ATS automatically sets an existing `files/` directory owned by its runtime user to
+0700 before exporting, including when the directory was created with normal 0755
+permissions. It uses the opened directory descriptor and does not change ownership
+or recursively change other files. Existing pairing-file safety checks still apply.
+A foreign-owned directory or a read-only checkout requires operator correction;
+the error identifies the path and runtime UID for ownership problems. Use the same
+runtime user as the existing installation. Preserve the registry and pairing files;
+do not delete them or rotate credentials to fix a permissions error.
 
 Upgrades from the previous `files/.json` or `root/.json` locations export the existing registry
 identity and key to `files/pairing.json` on the next Global startup or `server export`.
