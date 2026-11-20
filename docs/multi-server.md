@@ -140,6 +140,39 @@ The JSON contains identity, API origin and pairing key. Transfer it to the Local
 never printed. Do not put it in a repository, issue, shell history, chat or public
 artifact. The key is a management credential, not a human account password.
 
+### Missing Global hostname in Cloudflare config.yml
+
+`server configure` saves the API origin in the private cluster registry, not in
+`/etc/ats/config.yml` or the Cloudflare tunnel YAML. Global setup now displays the
+required API-only ingress rule. It intentionally does not edit tunnel files or
+restart Cloudflare. Inspect the active tunnel configuration using option **12 →
+9 — Check Global API tunnel route**, or run:
+
+```sh
+python3 app.py server tunnel --cloudflare-config /path/to/active/config.yml
+```
+
+For an origin of `https://server2.gaiasentinel.online` and default API port, the
+operator-managed rule is:
+
+```yaml
+- hostname: server2.gaiasentinel.online
+  path: ^/v1/request$
+  service: http://127.0.0.1:9997
+```
+
+Place it before any covering hostname, wildcard or catch-all rule in `ingress`;
+retain existing tunnel credentials, application routes and the final catch-all.
+Use `--port` or `ATS_REMOTE_PORT` if the management listener uses another port.
+The check reports missing/conflicting/shadowed routes; a matching rule only
+confirms the inspected YAML, not the active service's chosen file or connectivity.
+It never prints credentials or rewrites YAML. Other paths on this hostname must
+remain denied, and the operator must inspect later wildcard rules too. Configure
+DNS and validate ingress/TLS manually using the [Cloudflare configuration guide](https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/configuration-file/), then apply/restart only with the applicable
+operator authorization. This route reaches Global's authenticated management API;
+it does not create a GitHub webhook receiver. Pair/reconnect from Local only after
+HTTPS reaches the correct Global identity.
+
 The operator must configure a TLS reverse proxy to forward only `/v1/request`
 to `127.0.0.1:9997`, without redirects. Set proxy request/header/body/idle limits
 and protect the origin against general network abuse. The ATS management

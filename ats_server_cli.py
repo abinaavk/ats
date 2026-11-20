@@ -7,20 +7,21 @@ import os
 from pathlib import Path
 import secrets
 import sys
+from urllib.parse import urlsplit
 import yaml
 from ats_cluster import Store
 
 
 def main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (operator-managed TLS, storage and GitHub)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
     parser.add_argument('--webhook-host')
     parser.add_argument('--cloudflare-config')
     parser.add_argument('--confirm-existing-route', action='store_true')
-    parser.add_argument('--port', type=int, default=9997)
+    parser.add_argument('--port', type=int, default=int(os.environ.get('ATS_REMOTE_PORT', '9997')))
     parser.add_argument('--pairing-file')
     parser.add_argument('--server-id')
     parser.add_argument('--repository')
@@ -34,6 +35,11 @@ def main():
         try:
             configure(store, args, sys.stdin.isatty())
         except (ValueError, OSError, yaml.YAMLError, EOFError) as exc:
+            parser.error('Server setup failed: ' + str(exc))
+    elif args.action == 'tunnel':
+        try:
+            tunnel_guidance(store, args.cloudflare_config, args.port)
+        except (ValueError, OSError, yaml.YAMLError) as exc:
             parser.error('Server setup failed: ' + str(exc))
     elif args.action == 'show':
         n = store.node()
@@ -122,9 +128,46 @@ def configure(store, args, interactive):
             node = store.configure(role, label, origin, host)
             json.dump(node, f)
         print('Pairing file saved privately at ' + str(args.pairing_file or default_pairing_path()))
+        tunnel_guidance(store)
     else:
         store.configure(role, label, origin, host)
     print('Configuration saved. Configure/validate TLS proxy, storage and GitHub manually; no services or tunnel routes were changed.')
+
+
+def tunnel_guidance(store, config_path=None, port=None):
+    """Preview the operator-managed API route without modifying/restarting anything."""
+    from ats_cluster import domain
+    node = store.node()
+    if not node or node['role'] != 'global':
+        raise ValueError('API tunnel guidance requires a configured Global server')
+    hostname = urlsplit(domain(node['domain'])).hostname
+    port = int(port if port is not None else os.environ.get('ATS_REMOTE_PORT', '9997'))
+    if not 1 <= port <= 65535:
+        raise ValueError('API port must be between 1 and 65535')
+    route = {'hostname': hostname, 'path': '^/v1/request$',
+             'service': f'http://127.0.0.1:{port}'}
+    print('API domain is saved in the private cluster registry, not Cloudflare config.yml.')
+    if config_path:
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        if not isinstance(config, dict) or not isinstance(config.get('ingress'), list) or any(
+                not isinstance(item, dict) for item in config['ingress']):
+            raise ValueError('Cloudflare config must contain an ingress list of routes')
+        routes = config['ingress']
+        # A preceding catch-all, wildcard or same-host rule can shadow this one.
+        relevant = [item for item in routes if not item.get('hostname') or
+                    str(item.get('hostname', '')).lower() == hostname or
+                    (str(item.get('hostname', '')).startswith('*.') and
+                     hostname.endswith(str(item['hostname'])[1:].lower()))]
+        if relevant and relevant[0] == route and sum(item.get('hostname') == hostname for item in routes) == 1:
+            print('API route matches the configured endpoint; DNS/TLS and live connectivity remain unverified.')
+        else:
+            print('API route is missing, conflicting or potentially shadowed. Inspect ingress order before editing.')
+    print('Operator: place this rule before covering hostname/wildcard/catch-all rules in the active tunnel config:')
+    print(yaml.safe_dump([route], sort_keys=False).rstrip())
+    print('Keep the existing tunnel credentials, service routes and final catch-all. Forward only /v1/request; this is not a webhook route.')
+    print('Configure tunnel DNS/TLS and validate ingress manually. Apply/restart only with operator authorization. No configuration was changed.')
+    return route
 
 
 def configuration_issues(node):
@@ -339,7 +382,8 @@ def menu(store=None, ui=None):
                 ('1', 'Configure name / endpoint'), ('2', 'Export pairing file'),
                 ('3', 'Rotate Global credentials'), ('4', 'List servers'),
                 ('5', 'Pair Global from private file'), ('6', 'Disconnect Global'),
-                ('7', 'Reconnect Global'), ('8', 'Revoke Global'), ('0', 'Back')):
+                ('7', 'Reconnect Global'), ('8', 'Revoke Global'),
+                ('9', 'Check Global API tunnel route'), ('0', 'Back')):
             print(f'  {bold}[{number}]{reset} {label}')
         print()
         try:
@@ -356,6 +400,9 @@ def menu(store=None, ui=None):
             elif choice == '3':
                 if input('Invalidate the current key and require re-pairing? [yes/NO] ') == 'yes':
                     rotate_pairing(store)
+            elif choice == '9':
+                path = input('Active Cloudflare Tunnel config path (blank for example only): ').strip()
+                tunnel_guidance(store, path or None)
             elif choice == '4':
                 servers = store.servers()
                 if not servers:
