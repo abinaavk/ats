@@ -204,7 +204,7 @@ def ensure_startup_configuration(*, interactive, cloudflare_config=None, store=N
 
 def default_pairing_path():
     """Relative to the installed app.py, never to the current working directory."""
-    return Path(__file__).resolve().parent / 'root' / '.json'
+    return Path(__file__).resolve().parent / 'files' / '.json'
 
 
 @contextlib.contextmanager
@@ -284,22 +284,42 @@ def rotate_pairing(store, path=None):
     print('Credentials rotated. Re-pair this Global on Local using the private file.')
 
 
-def menu(store=None):
+def menu(store=None, ui=None):
     """Option 12 uses the same setup, pairing and credential operations as headless CLI."""
     store = store or Store()
+    # Receive the running CLI so its header and palette stay consistent, without
+    # importing app.py again (which would initialize another runtime/database).
+    cyan = ui.C_CYAN if ui else ''
+    bold = ui.C_BOLD if ui else ''
+    reset = ui.C_RESET if ui else ''
+    def status(message, level='info'):
+        if ui:
+            ui.print_status(message, level)
+        else:
+            print(message)
     while True:
         node = store.node() or {}
-        print('\nServer Configuration — ' + node.get('name', 'Not configured'))
-        print('Role: ' + node.get('role', 'Not configured'))
-        print('Endpoint: ' + str(node.get('domain') or node.get('webhook') or 'Not configured'))
+        if ui:
+            ui.print_header()
+        print(f'{cyan}{bold}═══ SERVER CONFIGURATION ═══{reset}\n')
+        for label, value in (
+                ('Server', node.get('name', 'Not configured')),
+                ('Role', node.get('role', 'Not configured').title()),
+                ('Endpoint', node.get('domain') or node.get('webhook') or 'Not configured')):
+            print(f'  {bold}{label + ":":<15}{reset} {value}')
         if node.get('role') == 'global':
-            print('Private pairing file: ' + str(default_pairing_path()))
-        print('1 Configure name / endpoint   2 Export pairing file   3 Rotate Global credentials')
-        print('4 List servers   5 Pair Global from private file')
-        print('6 Disconnect Global   7 Reconnect Global   8 Revoke Global   0 Back')
+            print(f'  {bold}{"Pairing file:":<15}{reset} {default_pairing_path()}')
+        print()
+        for number, label in (
+                ('1', 'Configure name / endpoint'), ('2', 'Export pairing file'),
+                ('3', 'Rotate Global credentials'), ('4', 'List servers'),
+                ('5', 'Pair Global from private file'), ('6', 'Disconnect Global'),
+                ('7', 'Reconnect Global'), ('8', 'Revoke Global'), ('0', 'Back')):
+            print(f'  {bold}[{number}]{reset} {label}')
+        print()
         try:
-            choice = input('Server Configuration ▶ ').strip()
-            if choice == '0':
+            choice = input(f'  {bold}Select:{reset} ').strip()
+            if choice == '0' or not choice:
                 return
             if choice == '1':
                 args = argparse.Namespace(role=node.get('role'), name=None,
@@ -312,24 +332,37 @@ def menu(store=None):
                 if input('Invalidate the current key and require re-pairing? [yes/NO] ') == 'yes':
                     rotate_pairing(store)
             elif choice == '4':
-                print(json.dumps(store.servers(), indent=2))
+                servers = store.servers()
+                if not servers:
+                    status('No servers configured')
+                for server in servers:
+                    role = 'Local' if server['local'] else 'Global'
+                    state = 'Connected' if server['connected'] else 'Disconnected'
+                    print(f"\n  {bold}{server['name']}{reset} — {role} | {state}")
+                    print(f"    ID: {server['id']}")
+                    print(f"    Endpoint: {server['domain'] or 'Local'}")
             elif choice == '5':
                 with open(input('Private pairing file path: ').strip()) as f:
                     bundle = json.load(f)
                 store.pair(bundle['id'], bundle['name'], bundle['domain'], bundle['secret'])
-                print('Global paired and verified')
+                status('Global paired and verified', 'success')
             elif choice in ('6', '7', '8'):
                 action = {'6': 'disconnect', '7': 'reconnect', '8': 'revoke'}[choice]
                 sid = input('Global server ID: ').strip()
                 if action != 'revoke' or input('Revoke this Global credential? [yes/NO] ') == 'yes':
                     store.connection(sid, action)
-                    print('Server ' + action + ' completed')
+                    status('Server ' + action + ' completed', 'success')
             else:
-                print('Invalid choice')
+                status('Invalid choice', 'warning')
         except (EOFError, KeyboardInterrupt):
             return
         except (ValueError, OSError, KeyError, yaml.YAMLError) as exc:
-            print('Server setup failed: ' + str(exc))
+            status('Server setup failed: ' + str(exc), 'error')
+        if ui:
+            try:
+                input(f'\n{cyan}Press Enter to continue...{reset}')
+            except (EOFError, KeyboardInterrupt):
+                return
 
 
 if __name__ == '__main__':

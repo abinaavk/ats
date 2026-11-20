@@ -6829,7 +6829,7 @@ async def mainmenu():
                 await update_database_async()
             elif choice == "12":
                 from ats_server_cli import menu as server_menu
-                await asyncio.to_thread(server_menu)
+                await asyncio.to_thread(server_menu, ui=sys.modules[__name__])
             elif choice == "d":
                 await run_diagnostics()
             elif choice == "g":

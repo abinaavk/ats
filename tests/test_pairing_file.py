@@ -19,7 +19,7 @@ class PairingFileTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.path = self.root / 'root' / '.json'
+        self.path = self.root / 'files' / '.json'
         self.store = Store(self.root / 'cluster.db')
         self.node = self.store.configure('global', 'Remote', 'https://remote.example.com')
         self.actual_default = cli.default_pairing_path
@@ -37,6 +37,41 @@ class PairingFileTests(unittest.TestCase):
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
         self.assertNotIn(self.node['secret'], output.getvalue())
+
+    def test_upgrade_reexports_registry_and_preserves_old_private_file(self):
+        old = self.root / 'root' / '.json'
+        old.parent.mkdir(mode=0o700)
+        old.write_text(json.dumps(dict(self.node, name='Previous name')))
+        old.chmod(0o600)
+        previous = old.read_bytes()
+        cli.ensure_startup_configuration(interactive=False, store=self.store)
+        self.assertEqual(json.loads(self.path.read_text()), self.node)
+        self.assertEqual(self.store.node(), self.node)
+        self.assertEqual(old.read_bytes(), previous)
+
+    def test_styled_menu_uses_runtime_header_and_keeps_results_until_continue(self):
+        from harness import load_app
+        env = load_app()
+        self.addCleanup(env.close)
+        app = env.app
+        prompts = []
+        answers = iter(['4', '', 'invalid', '', '2', '', '0'])
+        def answer(prompt):
+            prompts.append(prompt)
+            return next(answers)
+        with patch.object(app, 'print_header') as header, patch('builtins.input', side_effect=answer), \
+                patch('os.geteuid', return_value=self.root.stat().st_uid):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                cli.menu(self.store, ui=app)
+        text = output.getvalue()
+        self.assertEqual(header.call_count, 4)
+        self.assertIn(app.C_CYAN + app.C_BOLD + '═══ SERVER CONFIGURATION ═══', text)
+        self.assertIn(app.C_BOLD + '[0]' + app.C_RESET + ' Back', text)
+        self.assertIn('No servers configured', text)
+        self.assertIn(app.C_YELLOW, text)
+        self.assertEqual(sum('Press Enter to continue' in p for p in prompts), 3)
+        self.assertEqual(json.loads(self.path.read_text()), self.node)
+        self.assertNotIn(self.node['secret'], text)
 
     def test_reconfiguration_updates_export_preserving_credentials(self):
         cli.save_pairing(self.store)
@@ -137,8 +172,8 @@ class PairingFileTests(unittest.TestCase):
                 with patch.object(app.db, 'query', return_value=[]), patch('asyncio.create_task', side_effect=discard_worker):
                     with patch('builtins.input', side_effect=['12', EOFError]), contextlib.redirect_stdout(io.StringIO()) as output:
                         asyncio.run(app.mainmenu())
-        menu.assert_called_once_with()
+        menu.assert_called_once_with(ui=app)
         self.assertIn('Server Configuration', output.getvalue())
 
     def test_default_path_is_anchored_to_installation(self):
-        self.assertEqual(self.actual_default(), Path(cli.__file__).resolve().parent / 'root' / '.json')
+        self.assertEqual(self.actual_default(), Path(cli.__file__).resolve().parent / 'files' / '.json')
