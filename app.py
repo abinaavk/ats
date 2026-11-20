@@ -3784,11 +3784,12 @@ def manage_webhook_menu(name: str):
 async def run_webhook_listener():
     """Menu wrapper to start listener with Cloudflare tunnel auto-config"""
     print_header()
-    import ats_cluster
-    node = ats_cluster.Store().node()
-    if node and node['role'] == 'global':
-        raise ValueError('Global servers do not host a webhook receiver')
-    webhook_domain = node['webhook'] if node else f"webhook.{MAIN_DOMAIN}"
+    from ats_server_cli import ensure_startup_configuration
+    node = ensure_startup_configuration(interactive=sys.stdin.isatty(), cloudflare_config=CLOUDFLARE_CONFIG)
+    if node['role'] == 'global':
+        print_status('Global servers use the primary Local webhook receiver; no local listener is started.', 'info')
+        return
+    webhook_domain = node['webhook']
     print_status('Configure and validate the Cloudflare route manually; ATS will not overwrite it.', 'info')
     print(f"  → Public URL: {C_CYAN}https://{webhook_domain}{C_RESET}")
     print(f"  → Listening:  {C_CYAN}{webhook_bind_address()}:{WEBHOOK_PORT}{C_RESET} (local; reached through the tunnel)")
@@ -6708,6 +6709,8 @@ async def auto_backup_scheduler():
             await asyncio.sleep(60) # Sleep 1 minute before retrying
 
 async def mainmenu():
+    from ats_server_cli import ensure_startup_configuration
+    ensure_startup_configuration(interactive=sys.stdin.isatty(), cloudflare_config=CLOUDFLARE_CONFIG)
     # Start the scheduler as a background task within the same event loop
     import ats_operations
     asyncio.create_task(ats_operations.worker(sys.modules[__name__]))
@@ -6855,6 +6858,8 @@ async def mainmenu():
 
 async def run_daemon():
     """Run ATS in background mode (Scheduler + Webhook Listener)"""
+    from ats_server_cli import ensure_startup_configuration
+    ensure_startup_configuration(interactive=False)
     print_header()
     print(f"{C_GREEN}Starting ATS Daemon v7.0...{C_RESET}")
     
@@ -6931,6 +6936,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
         try:
             asyncio.run(run_daemon())
+        except ValueError as exc:
+            print_status(str(exc), "error")
+            sys.exit(1)
         except KeyboardInterrupt:
             pass
         sys.exit(0)

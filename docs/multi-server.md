@@ -34,6 +34,27 @@ and public backups. Do not relax it to world-readable. Use an OS/encrypted disk
 or private encrypted backup for the registry; keys are not application-encrypted.
 An operator with access to the service account or root can read them.
 
+## Launch-time setup for existing installations
+
+Launching `sudo python3 app.py` interactively now checks Local/Global settings
+before entering the menu or starting workers, including when the older ATS
+configuration already exists. It asks for missing mode, server name and the
+role-specific endpoint. Local setup uses the configured Cloudflare file to check
+hostname conflicts and requires explicit confirmation to reuse an existing route.
+Global setup asks for an HTTPS API origin and a new private pairing-file path;
+it never starts a webhook receiver. Invalid input can be corrected immediately.
+Cancelling setup exits before workers start. Existing valid settings, identities
+and credentials are reused on later launches.
+
+Use the same `ATS_CONFIG_FILE`, `ATS_INSTANCE` and `ATS_CLUSTER_DB` environment
+as the service when completing setup. Daemon launches never prompt for these new
+settings: incomplete setup fails before background work with an actionable
+message. Explicit `server configure` remains available for unattended provisioning.
+The setup check validates stored configuration, not public DNS/TLS or remote
+connectivity. Cloudflare routes, storage, GitHub setup and service restarts remain
+operator actions. A damaged identity/credential must be restored from the private
+registry rather than silently replaced.
+
 ## Configure Local
 
 ```sh
