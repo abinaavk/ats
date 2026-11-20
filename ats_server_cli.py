@@ -204,7 +204,7 @@ def ensure_startup_configuration(*, interactive, cloudflare_config=None, store=N
 
 def default_pairing_path():
     """Relative to the installed app.py, never to the current working directory."""
-    return Path(__file__).resolve().parent / 'files' / '.json'
+    return Path(__file__).resolve().parent / 'files' / 'pairing.json'
 
 
 @contextlib.contextmanager

@@ -19,7 +19,7 @@ class PairingFileTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.path = self.root / 'files' / '.json'
+        self.path = self.root / 'files' / 'pairing.json'
         self.store = Store(self.root / 'cluster.db')
         self.node = self.store.configure('global', 'Remote', 'https://remote.example.com')
         self.actual_default = cli.default_pairing_path
@@ -38,16 +38,18 @@ class PairingFileTests(unittest.TestCase):
         self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o700)
         self.assertNotIn(self.node['secret'], output.getvalue())
 
-    def test_upgrade_reexports_registry_and_preserves_old_private_file(self):
-        old = self.root / 'root' / '.json'
+    def test_upgrade_reexports_registry_and_preserves_unnamed_private_file(self):
+        old = self.root / 'files' / '.json'
         old.parent.mkdir(mode=0o700)
         old.write_text(json.dumps(dict(self.node, name='Previous name')))
         old.chmod(0o600)
         previous = old.read_bytes()
         cli.ensure_startup_configuration(interactive=False, store=self.store)
+        cli.save_pairing(self.store)
         self.assertEqual(json.loads(self.path.read_text()), self.node)
         self.assertEqual(self.store.node(), self.node)
         self.assertEqual(old.read_bytes(), previous)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     def test_styled_menu_uses_runtime_header_and_keeps_results_until_continue(self):
         from harness import load_app
@@ -114,7 +116,7 @@ class PairingFileTests(unittest.TestCase):
         self.path.parent.symlink_to(other, target_is_directory=True)
         with self.assertRaises(OSError):
             cli.save_pairing(self.store)
-        self.assertFalse((other / '.json').exists())
+        self.assertFalse((other / 'pairing.json').exists())
         self.path.parent.unlink()
         self.path.parent.mkdir(mode=0o700)
         victim = self.root / 'victim'
@@ -176,4 +178,4 @@ class PairingFileTests(unittest.TestCase):
         self.assertIn('Server Configuration', output.getvalue())
 
     def test_default_path_is_anchored_to_installation(self):
-        self.assertEqual(self.actual_default(), Path(cli.__file__).resolve().parent / 'files' / '.json')
+        self.assertEqual(self.actual_default(), Path(cli.__file__).resolve().parent / 'files' / 'pairing.json')
