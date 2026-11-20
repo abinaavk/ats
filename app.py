@@ -6794,7 +6794,8 @@ async def mainmenu():
             print(menu_row("4", "View Logs", "8", "Export Metrics"))
             print(f"{C_CYAN}╠{'═' * W}╬{'═' * W}╣{C_RESET}")
             print(menu_row("9", "View Database", "10", "Database Cleanup"))
-            print(menu_row("11", "Update Database", "D", "System Diagnostics"))
+            print(menu_row("11", "Update Database", "", ""))
+            print(menu_row("12", "Server Configuration", "D", "System Diagnostics"))
             print(menu_row("G", "Global Operations", "W", "Webhook Listener"))
             print(f"{C_CYAN}╠{'═' * W}╩{'═' * W}╣{C_RESET}")
             print(menu_single_row("[ 0 ]", "Exit ATS"))
@@ -6826,6 +6827,9 @@ async def mainmenu():
                 await database_cleanup()
             elif choice == "11":
                 await update_database_async()
+            elif choice == "12":
+                from ats_server_cli import menu as server_menu
+                await asyncio.to_thread(server_menu)
             elif choice == "d":
                 await run_diagnostics()
             elif choice == "g":

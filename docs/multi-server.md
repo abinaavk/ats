@@ -41,7 +41,7 @@ before entering the menu or starting workers, including when the older ATS
 configuration already exists. It asks for missing mode, server name and the
 role-specific endpoint. Local setup uses the configured Cloudflare file to check
 hostname conflicts and requires explicit confirmation to reuse an existing route.
-Global setup asks for an HTTPS API origin and a new private pairing-file path;
+Global setup asks for an HTTPS API origin and automatically exports its private pairing file;
 it never starts a webhook receiver. Invalid input can be corrected immediately.
 Cancelling setup exits before workers start. Existing valid settings, identities
 and credentials are reused on later launches.
@@ -81,11 +81,45 @@ modify Cloudflare routes during listener or daemon startup.
 
 ```sh
 python3 app.py server configure --role global --name 'Build server' \
-  --api-domain https://api.build.example.com --pairing-file /private/build-pair.json
+  --api-domain https://api.build.example.com
 ```
 
-The private, exclusively created 0600 file contains identity, API origin and
-pairing key. Transfer it to the Local operator through a secure channel. It is
+The default pairing file is `root/.json` inside the installed ATS checkout:
+for `/ats/app.py`, it is `/ats/root/.json`. It is **not** the absolute filesystem
+path `/root/.json`. The path is independent of your current working directory.
+The directory is private (0700), the JSON is private (0600), and `root/` is ignored
+by Git. Keep it outside any web server's static roots and public backup archives.
+The cluster database remains the source of identity and credentials; the JSON is
+a private export for pairing, not a replacement configuration database.
+
+Global configuration, normal interactive startup and daemon startup create a
+missing default export automatically without rotating the saved identity or key.
+Reconfiguring the name/API origin updates the export while preserving credentials.
+An existing default file must be private and belong to this same identity;
+unsafe directories, symlinks, malformed files and foreign identities are rejected
+without overwriting them. Different ATS instances with different cluster databases
+must use separate checkouts. A read-only checkout or an unsafe existing `root/`
+directory must be corrected by the operator before startup can export the file.
+
+Choose **12 — Server Configuration** in the ATS CLI to configure name/endpoint,
+export the pairing file, explicitly rotate a Global key, list/pair Global servers,
+or disconnect/reconnect/revoke them from Local. Rotation/revocation requires an
+explicit confirmation. The screen shows the file path and never prints the key.
+Roles remain fixed after initial configuration. Re-pair in Local after rotation.
+
+Headless recovery of a missing export preserves credentials:
+
+```sh
+python3 app.py server export
+```
+
+`--pairing-file /private/build-pair.json` remains available for an explicit export
+or configuration. Explicit paths are created exclusively and must not exist;
+the default managed path is refreshed atomically. `server rotate` without that
+option refreshes the default file. Rotation changes the key only when export
+succeeds; it is never required merely to recreate a missing file.
+
+The JSON contains identity, API origin and pairing key. Transfer it to the Local operator through a secure channel. It is
 never printed. Do not put it in a repository, issue, shell history, chat or public
 artifact. The key is a management credential, not a human account password.
 
