@@ -1,5 +1,7 @@
 """Interactive and headless server setup; never changes production tunnel routes."""
 import argparse
+import contextlib
+import stat
 import json
 import os
 from pathlib import Path
@@ -11,7 +13,7 @@ from ats_cluster import Store
 
 def main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (operator-managed TLS, storage and GitHub)')
-    parser.add_argument('action', choices=['configure', 'show', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
@@ -36,12 +38,10 @@ def main():
     elif args.action == 'show':
         n = store.node()
         print(json.dumps({k: v for k, v in (n or {}).items() if k != 'secret'}))
-    elif args.action == 'rotate':
-        if not store.node() or store.node()['role'] != 'global':
-            parser.error('Rotate pairing credentials on a Global server')
-        with store.db() as db:
-            db.execute('UPDATE node SET secret=?', (secrets.token_hex(32),))
+    elif args.action == 'export':
         save_pairing(store, args.pairing_file)
+    elif args.action == 'rotate':
+        rotate_pairing(store, args.pairing_file)
     elif args.action == 'serve':
         try:
             ensure_startup_configuration(interactive=False, store=store)
@@ -116,21 +116,12 @@ def configure(store, args, interactive):
                 with sqlite3.connect(dbpath) as db:
                     if db.execute('SELECT 1 FROM services WHERE domain=?', (host,)).fetchone():
                         raise ValueError('Webhook hostname is already used by a service')
-    if role == 'global' and not args.pairing_file and interactive:
-        args.pairing_file = input('New private pairing file path (must not exist): ').strip()
-    if role == 'global' and not args.pairing_file:
-        raise ValueError('--pairing-file is required for Global setup')
     if role == 'global':
-        # Reserve the private destination before persisting a new identity.
-        fd = os.open(args.pairing_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        try:
-            with os.fdopen(fd, 'w') as f:
-                store.configure(role, label, origin, host)
-                json.dump(store.node(), f)
-        except Exception:
-            os.unlink(args.pairing_file)
-            raise
-        print('Pairing file saved privately. Transfer it securely to the Local operator.')
+        # Check/reserve the export destination before changing configuration.
+        with pairing_destination(args.pairing_file, store.node()) as f:
+            node = store.configure(role, label, origin, host)
+            json.dump(node, f)
+        print('Pairing file saved privately at ' + str(args.pairing_file or default_pairing_path()))
     else:
         store.configure(role, label, origin, host)
     print('Configuration saved. Configure/validate TLS proxy, storage and GitHub manually; no services or tunnel routes were changed.')
@@ -173,6 +164,8 @@ def ensure_startup_configuration(*, interactive, cloudflare_config=None, store=N
         node = store.node()
         issues = configuration_issues(node)
         if not issues:
+            if node['role'] == 'global':
+                save_pairing(store)
             return node
         detail = 'ATS setup incomplete: ' + ', '.join(issues)
         if not interactive:
@@ -204,18 +197,139 @@ def ensure_startup_configuration(*, interactive, cloudflare_config=None, store=N
             raise ValueError('ATS setup cancelled; no background services were started') from None
         except (ValueError, OSError, yaml.YAMLError) as exc:
             if not configuration_issues(store.node()):
-                raise ValueError('Configuration saved, but pairing export failed; use server rotate --pairing-file with a new private path') from exc
+                raise ValueError('Configuration saved, but pairing export failed; fix private file permissions and use server export; existing credentials are preserved') from exc
             print('Setup could not be completed: ' + str(exc))
             if isinstance(exc, (OSError, yaml.YAMLError)):
                 cloudflare_config = None
 
-def save_pairing(store, path):
-    if not path:
-        raise ValueError('--pairing-file is required; transfer this private file to the Local operator securely')
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        json.dump(store.node(), f)
-    print('Pairing file saved privately. Do not paste it into logs or public artifacts.')
+def default_pairing_path():
+    """Relative to the installed app.py, never to the current working directory."""
+    return Path(__file__).resolve().parent / 'root' / '.json'
+
+
+@contextlib.contextmanager
+def pairing_destination(path, node):
+    """Explicit exports are exclusive; the managed file is privately replaced."""
+    if path:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                yield f
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            os.unlink(path)
+            raise
+        return
+    target = default_pairing_path()
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = '.pairing-' + secrets.token_hex(16)
+    try:
+        info = os.fstat(directory)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError('Pairing directory must be owned by the current user and mode 0700')
+        try:
+            fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        else:
+            with os.fdopen(fd) as existing:
+                info = os.fstat(existing.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
+                    raise ValueError('Existing pairing file must be private, owned, regular and unlinked elsewhere')
+                try:
+                    previous = json.load(existing)
+                except (ValueError, UnicodeError):
+                    raise ValueError('Existing pairing file is invalid; preserve it privately before exporting') from None
+                if not isinstance(previous, dict) or not node or previous.get('id') != node['id']:
+                    raise ValueError('Existing pairing file belongs to another identity; use a separate ATS checkout')
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:
+            with os.fdopen(fd, 'w') as f:
+                yield f
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, target.name, src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(directory)
+
+
+def save_pairing(store, path=None):
+    node = store.node()
+    if not node or node['role'] != 'global' or configuration_issues(node):
+        raise ValueError('Configure a valid Global server before exporting pairing credentials')
+    with pairing_destination(path, node) as f:
+        json.dump(node, f)
+    print('Pairing file saved privately at ' + str(path or default_pairing_path()))
+
+
+def rotate_pairing(store, path=None):
+    with store.db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT * FROM node').fetchone()
+        node = dict(row) if row else None
+        if not node or node['role'] != 'global' or configuration_issues(node):
+            raise ValueError('Rotate pairing credentials on a valid Global server')
+        with pairing_destination(path, node) as f:
+            node['secret'] = secrets.token_hex(32)
+            json.dump(node, f)
+        db.execute('UPDATE node SET secret=?', (node['secret'],))
+    print('Credentials rotated. Re-pair this Global on Local using the private file.')
+
+
+def menu(store=None):
+    """Option 12 uses the same setup, pairing and credential operations as headless CLI."""
+    store = store or Store()
+    while True:
+        node = store.node() or {}
+        print('\nServer Configuration — ' + node.get('name', 'Not configured'))
+        print('Role: ' + node.get('role', 'Not configured'))
+        print('Endpoint: ' + str(node.get('domain') or node.get('webhook') or 'Not configured'))
+        if node.get('role') == 'global':
+            print('Private pairing file: ' + str(default_pairing_path()))
+        print('1 Configure name / endpoint   2 Export pairing file   3 Rotate Global credentials')
+        print('4 List servers   5 Pair Global from private file')
+        print('6 Disconnect Global   7 Reconnect Global   8 Revoke Global   0 Back')
+        try:
+            choice = input('Server Configuration ▶ ').strip()
+            if choice == '0':
+                return
+            if choice == '1':
+                args = argparse.Namespace(role=node.get('role'), name=None,
+                    api_domain=None, webhook_host=None, cloudflare_config=None,
+                    confirm_existing_route=False, pairing_file=None)
+                configure(store, args, True)
+            elif choice == '2':
+                save_pairing(store)
+            elif choice == '3':
+                if input('Invalidate the current key and require re-pairing? [yes/NO] ') == 'yes':
+                    rotate_pairing(store)
+            elif choice == '4':
+                print(json.dumps(store.servers(), indent=2))
+            elif choice == '5':
+                with open(input('Private pairing file path: ').strip()) as f:
+                    bundle = json.load(f)
+                store.pair(bundle['id'], bundle['name'], bundle['domain'], bundle['secret'])
+                print('Global paired and verified')
+            elif choice in ('6', '7', '8'):
+                action = {'6': 'disconnect', '7': 'reconnect', '8': 'revoke'}[choice]
+                sid = input('Global server ID: ').strip()
+                if action != 'revoke' or input('Revoke this Global credential? [yes/NO] ') == 'yes':
+                    store.connection(sid, action)
+                    print('Server ' + action + ' completed')
+            else:
+                print('Invalid choice')
+        except (EOFError, KeyboardInterrupt):
+            return
+        except (ValueError, OSError, KeyError, yaml.YAMLError) as exc:
+            print('Server setup failed: ' + str(exc))
 
 
 if __name__ == '__main__':
