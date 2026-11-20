@@ -126,6 +126,43 @@ class PairingFileTests(unittest.TestCase):
             cli.save_pairing(self.store)
         self.assertEqual(victim.read_text(), 'unchanged')
 
+    def test_startup_secures_owned_directory_and_preserves_credentials_and_old_files(self):
+        for mode in (0o755, 0o775, 0o777, 0o750, 0o1700):
+            with self.subTest(mode=oct(mode)):
+                self.path.parent.mkdir(exist_ok=True)
+                self.path.parent.chmod(mode)
+                old = self.path.parent / '.json'
+                old.write_text('old private export')
+                old.chmod(0o600)
+                cli.ensure_startup_configuration(interactive=False, store=self.store)
+                self.assertEqual(self.path.parent.stat().st_mode & 0o7777, 0o700)
+                self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(json.loads(self.path.read_text()), self.node)
+                self.assertEqual(self.store.node(), self.node)
+                self.assertEqual(old.read_text(), 'old private export')
+
+    def test_foreign_directory_is_not_chmodded_or_exported(self):
+        self.path.parent.mkdir(mode=0o755)
+        with patch.object(cli.os, 'geteuid', return_value=self.root.stat().st_uid + 1), \
+                patch.object(cli.os, 'fchmod') as chmod:
+            with self.assertRaisesRegex(ValueError, 'correct ownership'):
+                cli.save_pairing(self.store)
+        chmod.assert_not_called()
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.path.parent.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.store.node(), self.node)
+
+    def test_permission_repair_failure_preserves_existing_export_and_registry(self):
+        cli.save_pairing(self.store)
+        previous = self.path.read_bytes()
+        self.path.parent.chmod(0o755)
+        with patch.object(cli.os, 'fchmod', side_effect=PermissionError('read only')):
+            with self.assertRaisesRegex(ValueError, 'Cannot secure pairing directory'):
+                cli.ensure_startup_configuration(interactive=False, store=self.store)
+        self.assertEqual(self.path.read_bytes(), previous)
+        self.assertEqual(self.store.node(), self.node)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
     def test_explicit_exports_remain_exclusive(self):
         target = self.root / 'custom.json'
         cli.save_pairing(self.store, target)

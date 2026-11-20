@@ -227,8 +227,21 @@ def pairing_destination(path, node):
     temporary = '.pairing-' + secrets.token_hex(16)
     try:
         info = os.fstat(directory)
-        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            raise ValueError('Pairing directory must be owned by the current user and mode 0700')
+        if info.st_uid != os.geteuid():
+            raise ValueError(f'Pairing directory {target.parent} is owned by UID {info.st_uid}, '
+                             f'but ATS runs as UID {os.geteuid()}. Have the operator correct '
+                             'ownership for the ATS runtime user; existing credentials are preserved')
+        # Existing checkouts commonly have files/ created with the default 0755.
+        # Tighten only our own opened directory, never follow a replacement path.
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            try:
+                os.fchmod(directory, 0o700)
+            except OSError as exc:
+                raise ValueError(f'Cannot secure pairing directory {target.parent} to mode 0700; '
+                                 'have the operator correct permissions for the ATS runtime user') from exc
+            info = os.fstat(directory)
+            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError('Pairing directory could not be secured; existing credentials are preserved')
         try:
             fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         except FileNotFoundError:

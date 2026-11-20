@@ -94,11 +94,13 @@ class StartupTests(unittest.TestCase):
         import json
         self.assertEqual(json.loads(path.read_text()), node)
 
-    def test_unsafe_pairing_directory_does_not_persist_global(self):
-        (self.root / 'files').mkdir(mode=0o755)
-        with self.assertRaisesRegex(ValueError, 'cancelled'):
-            self.launch(['global', 'Remote', 'https://remote.example.com', EOFError])
-        self.assertIsNone(self.store.node())
+    def test_owned_public_directory_is_secured_during_global_setup(self):
+        directory = self.root / 'files'
+        directory.mkdir(mode=0o755)
+        node = self.launch(['global', 'Remote', 'https://remote.example.com'])
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.store.node(), node)
+        self.assertTrue((directory / 'pairing.json').exists())
 
     def test_corrupt_credentials_are_not_silently_regenerated(self):
         self.store.configure('local', 'Primary', webhook='hooks.example.com')
