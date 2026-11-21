@@ -64,7 +64,9 @@ def dispatch(store, data, authenticated=None):
         raise ValueError('JSON object required')
     kind = data.get('kind')
     if kind == 'health':
-        return {'server_id': store.node()['id'], 'role': 'global', 'terminal': False,
+        import ats_terminal
+        terminal, reason = ats_terminal.available()
+        return {'server_id': store.node()['id'], 'role': 'global', 'terminal': terminal, 'terminal_reason': reason,
                 'management_ready': Path(os.environ.get('ATS_MONITOR_ADAPTER', '')).is_file()}
     if kind == 'revoke':
         with store.db() as db:
@@ -85,6 +87,12 @@ def dispatch(store, data, authenticated=None):
             raise PublicError('Monitor host adapter is not configured on this Global server; '
                               'run "server setup --apply" on it')
         return execute([sys.executable, adapter], data)
+    if isinstance(kind, str) and kind.startswith('term.'):
+        import ats_terminal
+        try:
+            return ats_terminal.handle(kind, data)
+        except ats_terminal.TerminalError as exc:
+            raise PublicError(str(exc)) from None
     raise ValueError('Unsupported request kind')
 
 
