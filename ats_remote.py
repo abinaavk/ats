@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import socket
@@ -13,6 +14,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ats_cluster as cluster
 
 SLOTS = threading.BoundedSemaphore(8)
+MISSING_MODULE = re.compile(r"No module named '([A-Za-z0-9_.]+)'")
+
+
+class PublicError(ValueError):
+    """A failure whose message is written here and safe to return to the signed caller."""
+
+
+def adapter_failure(stderr_text):
+    """Explain an adapter exit without relaying its stderr (which could hold secrets)."""
+    match = MISSING_MODULE.search(stderr_text or '')
+    if match:
+        return PublicError(f"Monitor adapter cannot start: Python module '{match.group(1)}' is missing for the ATS "
+                           f"interpreter {sys.executable}. Install the Monitor requirements for that interpreter "
+                           "and retry; run \"server doctor\" on the Global for the full check.")
+    return PublicError('Monitor adapter failed; run "server doctor" on the Global and inspect its journal.')
 
 
 def execute(argv, value, timeout=60):
@@ -28,17 +44,18 @@ def execute(argv, value, timeout=60):
                 except subprocess.TimeoutExpired:
                     first = False
                     if time.monotonic() >= deadline or os.fstat(out.fileno()).st_size > cluster.MAX_OUTPUT or os.fstat(err.fileno()).st_size > cluster.MAX_OUTPUT:
-                        raise ValueError('Operation exceeded time or output limit; inspect the originating server before retrying')
+                        raise PublicError('Operation exceeded time or output limit; inspect the originating server before retrying')
         except Exception:
             process.kill(); process.wait()
             raise
         out.seek(0)
         data = out.read(cluster.MAX_OUTPUT+1)
         if len(data) > cluster.MAX_OUTPUT:
-            raise ValueError('Operation output exceeded limit')
-        # stderr may contain credentials; never return it to a caller.
+            raise PublicError('Operation output exceeded limit')
+        # stderr may contain credentials; only a recognised module name is relayed.
         if process.returncode:
-            raise ValueError('Global adapter failed; inspect private operator logs')
+            err.seek(max(0, os.fstat(err.fileno()).st_size - 8192))
+            raise adapter_failure(err.read(8192).decode('utf-8', 'replace'))
         return json.loads(data)
 
 
@@ -55,11 +72,18 @@ def dispatch(store, data, authenticated=None):
             if db.execute('UPDATE node SET secret=? WHERE id=? AND secret=?',
                           (secrets.token_hex(32), current['id'], current['secret'])).rowcount != 1:
                 raise ValueError('Credential changed before revocation; authenticate again')
+        # The exported pairing file must carry the replacement key, never the revoked one.
+        try:
+            import ats_server_cli
+            ats_server_cli.save_pairing(store)
+        except Exception:
+            pass
         return {'revoked': True}
     if kind == 'http':
         adapter = os.environ.get('ATS_MONITOR_ADAPTER')
         if not adapter or not Path(adapter).is_file():
-            raise ValueError('Monitor host adapter is not configured on this Global server')
+            raise PublicError('Monitor host adapter is not configured on this Global server; '
+                              'run "server setup --apply" on it')
         return execute([sys.executable, adapter], data)
     raise ValueError('Unsupported request kind')
 
@@ -87,6 +111,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass  # Do not log request payloads, credentials or URLs.
 
+    def unauthorized(self):
+        # The time is not secret and lets the caller tell clock skew from a wrong key.
+        return self.reply(401, {'ok': False, 'error': 'unauthorized', 'server_time': int(time.time())})
+
     def reply(self, code, data):
         payload = json.dumps(data).encode()
         if len(payload) > cluster.MAX_OUTPUT:
@@ -109,7 +137,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(413, {'ok': False})
             for key in ('X-ATS-Server', 'X-ATS-Time', 'X-ATS-Nonce', 'X-ATS-Signature'):
                 if len(self.headers.get_all(key, [])) != 1:
-                    return self.reply(401, {'ok': False})
+                    return self.unauthorized()
             body = self.rfile.read(int(lengths[0]))
             self.read_deadline.cancel()
             if len(body) != int(lengths[0]):
@@ -117,12 +145,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 authenticated = cluster.authenticate(self.server.store, 'POST', self.path, body, self.headers)
             except ValueError:
-                return self.reply(401, {'ok': False})
+                return self.unauthorized()
             acquired = SLOTS.acquire(blocking=False)
             if not acquired:
                 return self.reply(503, {'ok': False})
             result = dispatch(self.server.store, json.loads(body), authenticated)
             return self.reply(200, {'ok': True, 'server_id': self.server.store.node()['id'], 'data': result})
+        except PublicError as exc:
+            self.reply(502, {'ok': False, 'error': str(exc)})
         except (ValueError, OSError, subprocess.SubprocessError):
             self.reply(502, {'ok': False, 'error': 'Global operation failed'})
         finally:

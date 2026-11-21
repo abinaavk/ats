@@ -38,6 +38,32 @@ class CredentialTests(unittest.TestCase):
         local.connection(sid,'reconnect')
         self.assertEqual(cluster.remote(local.server(sid),{'kind':'health'})['server_id'],sid)
 
+    def test_pairing_file_finds_its_saved_server_by_id_then_address_then_name(self):
+        local=self.local()
+        sid,key=self.rotate(True)
+        # The Global was reinstalled: new ID and key, same HTTPS address.
+        bundle={'id':sid,'name':'Reinstalled','domain':self.origin,'secret':key}
+        self.assertEqual(local.find_server(bundle),self.node['id'])
+        self.assertEqual(local.find_server(dict(bundle,domain='https://other.example.com',name='remote')),self.node['id'])
+        with self.assertRaisesRegex(ValueError,'No saved Global matches'):
+            local.find_server(dict(bundle,domain='https://other.example.com',name='unrelated'))
+        self.assertEqual(local.find_server(dict(bundle,id=self.node['id'],domain='nonsense')),self.node['id'])
+        with self.assertRaisesRegex(ValueError,'JSON object'):local.find_server([])
+
+    def test_cli_replace_credentials_detects_the_server_without_an_id(self):
+        import json,sys,os
+        from unittest.mock import patch
+        import ats_server_cli as cli
+        local=self.local();sid,key=self.rotate(True)
+        bundle=Path(self.temp.name)/'new.json'
+        bundle.write_text(json.dumps({'id':sid,'name':'Remote','domain':self.origin,'secret':key}))
+        with patch.object(sys,'argv',['ats','replace-credentials','--pairing-file',str(bundle)]),patch.object(cli,'Store',return_value=local):
+            cli.main()
+        self.assertEqual(local.server(sid)['secret'],key)
+        with self.assertRaises(ValueError):local.server(self.node['id'])
+        with local.db() as db:
+            self.assertEqual(db.execute('SELECT server_id FROM routes').fetchone()[0],sid)
+
     def test_bad_new_key_leaves_old_entry_and_routes_intact(self):
         local=self.local();before=local.server(self.node['id'])
         with self.assertRaises(ValueError):

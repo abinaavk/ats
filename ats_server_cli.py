@@ -16,7 +16,7 @@ from ats_cluster import Store
 
 def _main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (signed HTTPS management and automatic Global setup)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials', 'doctor'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
@@ -28,21 +28,29 @@ def _main():
     parser.add_argument('--apply', action='store_true', help='Install and start the Global service and add its API tunnel route')
     parser.add_argument('--unit', help='Existing ATS daemon systemd unit (auto-detected by default)')
     parser.add_argument('--monitor-adapter', help='Installed Monitor remote_host.py')
+    parser.add_argument('--install-monitor', action='store_true',
+                        help='With --apply: clone the Monitor companion into a new root-owned directory if none is installed')
+    parser.add_argument('--monitor-repo', help='HTTPS git URL of the Monitor companion (default: the ats-monitor repository)')
+    parser.add_argument('--monitor-ref', default='origin/main', help='Git ref to check out for --install-monitor')
+    parser.add_argument('--monitor-dir', help='New directory for --install-monitor (default /opt/ats-monitor)')
     parser.add_argument('--adapter-state-dir', help='Private absolute directory for adapter security/job state')
-    parser.add_argument('--server-id')
+    parser.add_argument('--server-id', help='Saved Global ID (replace-credentials: detected from the pairing file when omitted)')
     parser.add_argument('--repository')
     parser.add_argument('--service')
     parser.add_argument('--branch', default='main')
     parser.add_argument('--secret-file')
     parser.add_argument('--replace-mapping', action='store_true')
+    parser.add_argument('--json', action='store_true', help='doctor: machine-readable output')
     args = parser.parse_args()
     if (args.monitor_adapter or args.adapter_state_dir) and args.action not in ('service', 'adapter', 'setup', 'configure'):
         parser.error('Adapter options require server service or server adapter')
     if args.apply and args.action not in ('configure', 'setup'):
         parser.error('--apply requires server configure or server setup')
+    if args.install_monitor and (not args.apply or args.action not in ('configure', 'setup')):
+        parser.error('--install-monitor requires --apply with server setup or server configure')
     if args.action in ('pair', 'replace-credentials') and not args.pairing_file:
         parser.error('--pairing-file is required')
-    if args.action in ('disconnect', 'reconnect', 'revoke', 'replace-credentials') and not args.server_id:
+    if args.action in ('disconnect', 'reconnect', 'revoke') and not args.server_id:
         parser.error('--server-id is required')
     if args.action == 'map' and not all((args.secret_file, args.repository, args.server_id, args.service)):
         parser.error('map requires --secret-file, --repository, --server-id and --service')
@@ -52,6 +60,12 @@ def _main():
             configure(store, args, sys.stdin.isatty())
         except (ValueError, OSError, yaml.YAMLError, EOFError) as exc:
             parser.error('Server setup failed: ' + str(exc))
+    elif args.action == 'doctor':
+        import ats_doctor
+        report = ats_doctor.run(store, port=args.port, cloudflare_config=args.cloudflare_config)
+        print(json.dumps(report.items, indent=2) if args.json else report.text())
+        if report.failed:
+            raise SystemExit(1)
     elif args.action == 'setup':
         try:
             setup_global(store, args)
@@ -95,7 +109,8 @@ def _main():
         if not isinstance(bundle, dict):
             parser.error('Pairing file must contain a JSON object')
         if args.action == 'replace-credentials':
-            store.replace_credentials(args.server_id, bundle['id'], args.name or bundle['name'], bundle['domain'], bundle['secret'])
+            sid = args.server_id or store.find_server(bundle)
+            store.replace_credentials(sid, bundle['id'], args.name or bundle['name'], bundle['domain'], bundle['secret'])
             print('Credentials verified and replaced; connection state and webhook mappings preserved')
         else:
             store.pair(bundle['id'], args.name or bundle['name'], bundle['domain'], bundle['secret'])
@@ -191,14 +206,52 @@ def configure(store, args, interactive):
 
 
 def setup_global(store, args):
-    from ats_global_setup import apply, build_plan, public_plan
+    import ats_global_setup as gs
     options = dict(port=getattr(args, 'port', None), config_path=getattr(args, 'cloudflare_config', None),
                    monitor_adapter=getattr(args, 'monitor_adapter', None), state_dir=getattr(args, 'adapter_state_dir', None),
                    unit=getattr(args, 'unit', None))
-    result = apply(store, **options) if getattr(args, 'apply', False) else public_plan(build_plan(store, **options))
+    if getattr(args, 'apply', False):
+        install = dict(install=bool(getattr(args, 'install_monitor', False)))
+        if getattr(args, 'monitor_repo', None):
+            install['monitor_repo'] = args.monitor_repo
+        if getattr(args, 'monitor_ref', None):
+            install['monitor_ref'] = args.monitor_ref
+        if getattr(args, 'monitor_dir', None):
+            install['monitor_dir'] = args.monitor_dir
+        result = gs.apply(store, **options, **install)
+        print(json.dumps(result, indent=2))
+        print_setup_summary(store, result)
+        return result
+    plan = gs.build_plan(store, **options)
+    result = gs.public_plan(plan)
+    try:
+        gs.adapter_check(plan)
+        result['adapter_check'] = 'ok'
+    except ValueError as exc:
+        result['adapter_check'] = 'FAILED: ' + str(exc)
     print(json.dumps(result, indent=2))
-    if not getattr(args, 'apply', False):
-        print('Preview only. Use server setup --apply to install, enable and verify. Existing DNS/tunnel credentials are reused.')
+    print('Preview only. Use server setup --apply to install, enable and verify. Existing DNS/tunnel credentials are reused.')
+    return result
+
+
+def print_setup_summary(store, result):
+    """A short plain-language result, so the next step is never a guess."""
+    try:
+        save_pairing(store)
+    except (ValueError, OSError):
+        pass
+    node = store.node() or {}
+    print()
+    print('Global setup complete')
+    print(f"  API service      : {result.get('service')} (enabled, running)")
+    print(f"  Tunnel route     : {node.get('domain')}/v1/request -> http://127.0.0.1:{result.get('loopback_port')}"
+          f" ({'added' if result.get('route_change') else 'already present'})")
+    print('  Verified         : adapter self-check, signed loopback health, adapter service read')
+    print(f"  Public HTTPS     : {result.get('public_health')}")
+    if result.get('monitor_installed'):
+        print(f"  Monitor installed: {result['monitor_installed']['path']} @ {result['monitor_installed']['revision'][:12]}")
+    print(f"Next: on the Local server open Monitor -> Settings -> Servers and pair this Global using {default_pairing_path()}")
+    print('      (the private file holds this Global\'s ID and passkey; copy it over a secure channel and delete it afterwards)')
 
 
 def tunnel_guidance(store, config_path=None, port=None):
@@ -427,6 +480,18 @@ def unit_quote(value):
     return '"' + value.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%') + '"'
 
 
+def unit_path(value):
+    """A systemd path setting such as WorkingDirectory=.
+
+    These are not command lines: systemd takes the text literally, so surrounding
+    quotes make the unit invalid ("path is not absolute"). Only specifiers need escaping.
+    """
+    value = str(value)
+    if not value.startswith('/') or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError('Invalid service path')
+    return value.replace('%', '%%')
+
+
 def adapter_environment(store, monitor_adapter=None, state_dir=None):
     """Prepare an explicit Global adapter without importing it or changing state."""
     node = store.node()
@@ -525,7 +590,7 @@ def service_unit(store, port=None, *, monitor_adapter=None, adapter_state_dir=No
         env.update(adapter_environment(store, monitor_adapter, adapter_state_dir))
     lines = ['[Unit]', 'Description=ATS persistent '+node['role'].title()+' daemon',
              'Wants=network-online.target', 'After=network-online.target', 'StartLimitIntervalSec=0',
-             '', '[Service]', 'Type=simple', 'User=root', 'WorkingDirectory='+unit_quote(checkout)]
+             '', '[Service]', 'Type=simple', 'User=root', 'WorkingDirectory='+unit_path(checkout)]
     if node['role'] == 'global' and not Path(env.get('ATS_MONITOR_ADAPTER', '')).is_file():
         lines += ['# Global management adapter is not configured; health alone can still pass.',
                   '# Preview its settings with server adapter --monitor-adapter /absolute/path/to/remote_host.py --adapter-state-dir /private/state/path']
@@ -571,8 +636,9 @@ def menu(store=None, ui=None):
                 ('5', 'Pair Global from private file'), ('6', 'Disconnect Global'),
                 ('7', 'Reconnect Global'), ('8', 'Revoke Global'),
                 ('9', 'Check Global API tunnel route'), ('10', 'Preview automatic startup service'),
-                ('11', 'Set up Global API service and tunnel'), ('12', 'Update saved Global ID / passkey'), ('0', 'Back'))
-        allowed = {'1', '10', '0'} | ({'2', '3', '9', '11'} if node.get('role') == 'global' else {'4', '5', '6', '7', '8', '12'})
+                ('11', 'Set up Global API service and tunnel'), ('12', 'Update saved Global ID / passkey'),
+                ('13', 'Run health check (doctor)'), ('0', 'Back'))
+        allowed = {'1', '10', '13', '0'} | ({'2', '3', '9', '11'} if node.get('role') == 'global' else {'4', '5', '6', '7', '8', '12'})
         for number, label in options:
             if number not in allowed:
                 continue
@@ -585,17 +651,31 @@ def menu(store=None, ui=None):
             if choice not in allowed:
                 status('This action is unavailable for this server role', 'warning')
             elif choice == '11':
-                args = argparse.Namespace(apply=False)
-                setup_global(store, args)
-                if input('Apply this service/tunnel setup and restart affected services? [yes/NO] ') == 'yes':
+                import ats_global_setup as gs
+                args = argparse.Namespace(apply=False, install_monitor=False)
+                try:
+                    setup_global(store, args)
+                    proceed = input('Apply this service/tunnel setup and restart affected services? [yes/NO] ') == 'yes'
+                except gs.MonitorMissing as exc:
+                    status(str(exc), 'warning')
+                    args.install_monitor = proceed = input(
+                        f'Install the Monitor companion from {gs.DEFAULT_MONITOR_REPO} into {gs.DEFAULT_MONITOR_DIR} '
+                        'and apply setup now? [yes/NO] ') == 'yes'
+                if proceed:
                     args.apply = True
                     setup_global(store, args)
+            elif choice == '13':
+                import ats_doctor
+                print(ats_doctor.run(store).text())
             elif choice == '12':
-                sid = input('Existing saved Global server ID: ').strip()
                 with open(input('New private pairing file path: ').strip()) as f:
                     bundle = json.load(f)
+                sid = store.find_server(bundle)
+                saved = store.server(sid)
+                if input(f"Replace the saved ID/passkey of {saved['name']} ({saved['id'][:8]}…)? [yes/NO] ") != 'yes':
+                    raise ValueError('Cancelled; nothing was changed')
                 store.replace_credentials(sid, bundle['id'], bundle['name'], bundle['domain'], bundle['secret'])
-                status('Credentials verified and updated; connection state preserved', 'success')
+                status('Credentials verified and updated; connection state preserved (use Reconnect if it was disconnected)', 'success')
             elif choice == '10':
                 print(service_unit(store))
             elif choice == '1':

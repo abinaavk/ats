@@ -8,7 +8,7 @@ From the existing ATS checkout and Python environment, preserving the host's `AT
 sudo -E /absolute/path/to/python /absolute/path/to/ats/app.py server service --port 9997
 ```
 
-Option 12 also offers this preview. It does not install or start anything. Review the printed interpreter, configuration and database paths. The Global `ATS_MONITOR_ADAPTER` must point to the installed Monitor `remote_host.py` to serve data and management requests; health alone does not verify that adapter. The interpreter needs both ATS and Monitor dependencies.
+Option 12 also offers this preview. It does not install or start anything. Review the printed interpreter, configuration and database paths. The Global `ATS_MONITOR_ADAPTER` must point to the installed Monitor `remote_host.py` to serve data and management requests; health alone does not verify that adapter. The interpreter needs the ATS dependencies and Flask; the adapter runs headless, so Socket.IO and gevent are not required. `server doctor` verifies this.
 
 To prepare a complete Global service, add `--monitor-adapter /absolute/path/to/remote_host.py --adapter-state-dir /var/lib/ats-server2-adapter` to `server service`. For an existing service, `server adapter` with the same options prints only an adapter drop-in, preserving the service's configuration, registry and start command. Both commands are previews. See [Global Monitor adapter setup](global-monitor-adapter.md) for installation, private state directories and verification.
 

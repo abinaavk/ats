@@ -137,6 +137,9 @@ class TLSIntegrationTests(unittest.TestCase):
         root=Path(self.temp.name);cert=root/'cert.pem';key=root/'key.pem'
         subprocess.run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-keyout',str(key),'-out',str(cert),'-days','1','-subj','/CN=localhost','-addext','subjectAltName=DNS:localhost'],check=True,capture_output=True)
         self.env=patch.dict(os.environ,{'SSL_CERT_FILE':str(cert)});self.env.start();self.addCleanup(self.env.stop)
+        import ats_server_cli
+        self.pairing=root/'files'/'pairing.json'
+        pairing=patch.object(ats_server_cli,'default_pairing_path',return_value=self.pairing);pairing.start();self.addCleanup(pairing.stop)
         self.global_store=c.Store(root/'global.db');self.node=self.global_store.configure('global','Remote','https://localhost')
         self.http=ats_remote.Server(('127.0.0.1',0),self.global_store)
         ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain(cert,key)
@@ -162,6 +165,9 @@ class TLSIntegrationTests(unittest.TestCase):
         from ats_server_cli import configuration_issues
         self.assertEqual(configuration_issues(self.global_store.node()), [])
         fresh = self.global_store.node()
+        # Remote revocation must refresh the private export with the replacement key.
+        self.assertEqual(json.loads(self.pairing.read_text())['secret'], fresh['secret'])
+        self.assertEqual(self.pairing.stat().st_mode & 0o777, 0o600)
         local.pair(fresh['id'], 'Remote', self.origin, fresh['secret'])
         self.assertEqual(c.remote(local.server(fresh['id']), {'kind':'health'})['role'], 'global')
 
@@ -216,4 +222,5 @@ class TLSIntegrationTests(unittest.TestCase):
         self.assertEqual(self.request(b'',{'Content-Length':str(c.MAX_BODY+1)}),413)
         self.assertEqual(self.request(b'{}',{},'/other'),400)
         bad=dict(self.server,domain=self.origin.replace('localhost','127.0.0.1'))
-        with self.assertRaises(ssl.SSLCertVerificationError):c.remote(bad,{'kind':'health'})
+        with self.assertRaises(c.TransportError) as caught:c.remote(bad,{'kind':'health'})
+        self.assertEqual(caught.exception.code,'tls')
