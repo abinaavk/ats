@@ -32,9 +32,10 @@ SH
 
 Confirm the printed revision matches. Use the host's already authorized GitHub
 access; do not put credentials in a URL. The daemon interpreter must have both
-ATS and Monitor requirements installed. Package installation or upgrades are a
-separate deployment change. Distribution metadata alone does not prove that
-runtime imports work. Keep this Monitor checkout free of `ats.db`, which its
+ATS requirements and Flask installed (the adapter runs headless and does not need Socket.IO
+or gevent; `psutil` is optional). Package installation or upgrades are a separate deployment
+change. Run `python /path/to/remote_host.py --check` (or `server doctor`) to prove the runtime
+imports work; distribution metadata alone does not. Keep this Monitor checkout free of `ats.db`, which its
 legacy data lookup would otherwise prefer over `ATS_HOME`.
 
 ## Preview settings for Server2

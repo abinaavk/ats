@@ -162,18 +162,20 @@ class PairingFileTests(unittest.TestCase):
         def replace(*args, **kwargs):
             original_replace(*args, **kwargs)
             root_files.add(self.path.stat().st_ino)
-        directory_uid = self.path.parent.stat().st_uid
+        # Present a non-root login user as the owner even when the suite itself runs as root.
+        login_uid = os.getuid() or 1000
+        directory_uid = self.path.parent.stat().st_uid or login_uid
         def fstat(fd):
             info = original_fstat(fd)
             if info.st_ino in root_files:
-                fields = list(info)
-                fields[4] = 0
-                return os.stat_result(fields)
-            if info.st_ino == self.path.parent.stat().st_ino:
-                fields = list(info)
-                fields[4] = directory_uid
-                return os.stat_result(fields)
-            return info
+                owner = 0
+            elif info.st_ino == self.path.parent.stat().st_ino:
+                owner = directory_uid
+            else:
+                owner = login_uid
+            fields = list(info)
+            fields[4] = owner
+            return os.stat_result(fields)
         def fchown(fd, uid, gid):
             nonlocal directory_uid
             inode = original_fstat(fd).st_ino

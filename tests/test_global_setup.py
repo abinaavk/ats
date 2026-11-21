@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -33,12 +34,18 @@ class SetupTests(unittest.TestCase):
         self.options=dict(monitor_adapter=str(self.adapter),unit_dir=str(self.unitdir),runner=self.fake_run)
         self.rootcheck=patch.object(setup,'require_root');self.rootcheck.start();self.addCleanup(self.rootcheck.stop)
         self.health=[]
+        self.adapter_report={'ok':True}
+        sleep=patch.object(setup.time,'sleep');sleep.start();self.addCleanup(sleep.stop)
 
     def fake_run(self,argv,**kwargs):
         self.calls.append(argv)
         if self.fail and self.fail(argv):raise ValueError('injected failure')
-        out=''
-        if argv[:2]==['systemctl','list-unit-files']:out='\n'.join(k+' enabled' for k in self.units)
+        out='';code=0
+        if argv[:2]==['systemctl','list-unit-files']:
+            # Real systemd exits 1 when the pattern matches no unit file (a fresh Global).
+            out='\n'.join(k+' enabled' for k in self.units);code=0 if self.units else 1
+            if code and kwargs.get('check',True):raise ValueError('systemctl list-unit-files failed')
+        elif len(argv)==3 and argv[2]=='--check':out=json.dumps(self.adapter_report)
         elif argv[:2]==['systemctl','show']:
             name=argv[2]
             if name=='cloudflared.service':props={'ActiveState':'active','ExecStart':'cloudflared --config '+str(self.cf)+' tunnel run'}
@@ -47,7 +54,7 @@ class SetupTests(unittest.TestCase):
             out='\n'.join(k+'='+v for k,v in props.items())
         elif argv[:2] in (['systemctl','start'],['systemctl','restart']) and argv[2]!='cloudflared.service':
             self.units[argv[2]]={'LoadState':'loaded','ActiveState':'active','UnitFileState':'enabled','ExecStart':str(Path(cli.__file__).parent/'app.py')+' --daemon','Environment':'ATS_CLUSTER_DB='+self.store.path,'FragmentPath':str(self.unitdir/argv[2])}
-        return subprocess.CompletedProcess(argv,0,out,'')
+        return subprocess.CompletedProcess(argv,code,out,'')
 
     def verify(self,plan,**kwargs):self.health.append(kwargs)
     def plan(self,**kwargs):return setup.build_plan(self.store,**{**self.options,**kwargs})
@@ -114,15 +121,29 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(any(c[:2]==['systemctl','disable'] for c in self.calls))
 
     def test_cloudflare_failure_restores_files(self):
-        before=self.cf.read_bytes();failed=False
+        before=self.cf.read_bytes();restarts=0
+        def broken(argv):
+            nonlocal restarts
+            if argv==['systemctl','restart','cloudflared.service']:
+                restarts+=1;return restarts<=setup.TUNNEL_RETRIES
+            return argv==['systemctl','is-active','cloudflared.service'] and restarts<=setup.TUNNEL_RETRIES
+        self.fail=broken
+        with self.assertRaisesRegex(ValueError,'restored'):self.apply()
+        self.assertEqual(self.cf.read_bytes(),before)
+        # Every bounded retry is tried, then the previous route file is restarted once.
+        self.assertEqual(self.calls.count(['systemctl','restart','cloudflared.service']),setup.TUNNEL_RETRIES+1)
+
+    def test_slow_tunnel_start_that_systemd_recovers_is_not_a_failure(self):
+        failed=False
         def once(argv):
             nonlocal failed
             if argv==['systemctl','restart','cloudflared.service'] and not failed:failed=True;return True
             return False
         self.fail=once
-        with self.assertRaisesRegex(ValueError,'restored'):self.apply()
-        self.assertEqual(self.cf.read_bytes(),before)
-        self.assertEqual(self.calls.count(['systemctl','restart','cloudflared.service']),2)
+        result=self.apply()
+        self.assertEqual(result['route_change'],True)
+        self.assertNotEqual(self.cf.read_bytes(),yaml.safe_dump(self.config).encode())
+        self.assertIn(['systemctl','is-active','cloudflared.service'],self.calls)
 
     def test_occupied_port_does_not_compete_with_terminal_daemon(self):
         with socket.socket() as listener:
@@ -202,6 +223,136 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(self.cf.is_dir())
         self.assertTrue(any(c[:2] == ['systemctl', 'stop'] for c in self.calls))
         self.assertTrue(any(c[:2] == ['systemctl', 'disable'] for c in self.calls))
+
+    def verify_with_real_systemd(self, directory, unit):
+        import shutil
+        if not shutil.which('systemd-analyze'):
+            self.skipTest('systemd-analyze is not installed')
+        result=subprocess.run(['systemd-analyze','verify',str(directory/unit)],capture_output=True,text=True,timeout=60)
+        # Warnings about unrelated host units are not ours; a fatal error in this unit is.
+        mine=[l for l in result.stderr.splitlines() if unit in l or str(directory) in l]
+        self.assertEqual(mine,[],result.stderr)
+
+    def test_generated_unit_is_accepted_by_real_systemd(self):
+        # Regression: a quoted WorkingDirectory= made systemd reject every generated unit.
+        plan=self.plan()
+        self.assertNotIn('WorkingDirectory="',plan['full_unit'])
+        self.assertRegex(plan['full_unit'],r'(?m)^WorkingDirectory=/')
+        directory=self.root/'real-unit';directory.mkdir()
+        (directory/'ats-global-check.service').write_text(plan['full_unit'])
+        self.verify_with_real_systemd(directory,'ats-global-check.service')
+
+    def test_generated_dropin_for_an_existing_daemon_is_accepted_by_real_systemd(self):
+        app=str(Path(cli.__file__).parent/'app.py')
+        name='ats-existing.service'
+        self.units[name]={'LoadState':'loaded','ActiveState':'active','UnitFileState':'enabled','ExecStart':app+' --daemon',
+                          'Environment':'ATS_CLUSTER_DB='+self.store.path,'FragmentPath':str(self.unitdir/name)}
+        plan=self.plan(unit=name)
+        self.assertTrue(plan['existing'])
+        directory=self.root/'real-dropin';(directory/(name+'.d')).mkdir(parents=True)
+        (directory/name).write_text('[Unit]\nDescription=operator unit\n[Service]\nExecStart='+sys.executable+' '+app+' --daemon\n')
+        (directory/(name+'.d')/'60-ats-global.conf').write_bytes(plan['unit_content'])
+        self.assertNotIn(b'WorkingDirectory="',plan['unit_content'])
+        self.verify_with_real_systemd(directory,name)
+
+    def test_unit_path_is_literal_not_quoted(self):
+        self.assertEqual(cli.unit_path('/opt/my ats'),'/opt/my ats')
+        self.assertEqual(cli.unit_path('/opt/100%'),'/opt/100%%')
+        for bad in ('relative/path','/x\ny'):
+            with self.assertRaises(ValueError):cli.unit_path(bad)
+
+    def test_fresh_global_without_any_ats_unit_can_be_planned(self):
+        # systemd exits 1 for list-unit-files with no match; that must not abort first-time setup.
+        self.assertEqual(self.units,{})
+        plan=self.plan()
+        self.assertFalse(plan['existing'])
+        self.assertEqual(plan['unit'],'ats-global-'+self.node['id']+'.service')
+
+    def test_bus_failure_listing_units_is_still_reported(self):
+        def broken(argv,**kwargs):
+            if argv[:2]==['systemctl','list-unit-files']:
+                return subprocess.CompletedProcess(argv,1,'','Failed to connect to bus')
+            return self.fake_run(argv,**kwargs)
+        with self.assertRaisesRegex(ValueError,'systemd'):
+            setup.build_plan(self.store,**{**self.options,'runner':broken})
+
+    def test_existing_localhost_route_is_accepted_and_normalised(self):
+        self.config['ingress'].insert(1,{'hostname':'api.example.com','service':'http://localhost:9997'})
+        self.cf.write_text(yaml.safe_dump(self.config))
+        plan=self.plan()
+        routes=yaml.safe_load(plan['cf_content'])['ingress']
+        mine=[r for r in routes if r.get('hostname')=='api.example.com']
+        self.assertEqual(mine,[{'hostname':'api.example.com','path':'^/v1/request$','service':'http://127.0.0.1:9997'}])
+        self.config['ingress'][1]['service']='http://localhost:9000'
+        self.cf.write_text(yaml.safe_dump(self.config))
+        with self.assertRaisesRegex(ValueError,'routes elsewhere'):self.plan()
+
+    def test_tunnel_service_config_discovery(self):
+        def props(start,user='root'):return {'ActiveState':'active','ExecStart':start,'User':user}
+        setup.check_tunnel_config(props('cloudflared tunnel --config '+str(self.cf)+' run'),self.cf)
+        # No --config: only cloudflared's default locations are acceptable.
+        setup.check_tunnel_config(props('cloudflared tunnel run'),Path('/etc/cloudflared/config.yml'))
+        setup.check_tunnel_config(props('cloudflared tunnel run'),Path('/root/.cloudflared/config.yml'))
+        with self.assertRaisesRegex(ValueError,'default locations'):setup.check_tunnel_config(props('cloudflared tunnel run'),self.cf)
+        with self.assertRaisesRegex(ValueError,'different config'):setup.check_tunnel_config(props('cloudflared tunnel --config /other.yml run'),self.cf)
+        with self.assertRaisesRegex(ValueError,'Token-managed'):setup.check_tunnel_config(props('cloudflared tunnel run --token abc'),self.cf)
+
+    def test_adapter_self_check_failure_changes_nothing(self):
+        before=self.cf.read_bytes()
+        self.adapter_report={'ok':False,'problems':["Python module 'flask' is missing for /usr/bin/python3"]}
+        with self.assertRaisesRegex(ValueError,"module 'flask' is missing"):self.apply()
+        self.assertEqual(self.cf.read_bytes(),before)
+        self.assertFalse(any(c[:2] in (['systemctl','start'],['systemctl','enable'],['systemctl','daemon-reload']) for c in self.calls))
+        self.assertEqual(list(self.unitdir.iterdir()),[])
+
+    def test_outdated_companion_without_self_check_is_explained(self):
+        self.adapter_report=None
+        with self.assertRaisesRegex(ValueError,'no adapter self-check'):self.apply()
+
+    def test_adapter_check_uses_scratch_state_and_the_daemon_interpreter(self):
+        seen={}
+        def capture(argv,**kwargs):
+            if len(argv)==3 and argv[2]=='--check':seen.update(argv=argv,env=kwargs['env'])
+            return self.fake_run(argv,**kwargs)
+        plan=self.plan()
+        setup.adapter_check(plan,capture)
+        self.assertEqual(seen['argv'][0],plan['interpreter'])
+        self.assertNotIn(plan['adapter_env']['ATS_SECURITY_DB'],seen['env'].values())
+        self.assertTrue(seen['env']['ATS_SECURITY_DB'].startswith(tempfile.gettempdir()))
+        self.assertEqual(seen['env']['ATS_CLUSTER_DB'],self.store.path)
+        self.assertNotIn(self.node['secret'],json.dumps(seen['env']))
+
+    def test_missing_companion_is_reported_with_the_install_option(self):
+        options={k:v for k,v in self.options.items() if k!='monitor_adapter'}
+        fake_checkout=self.root/'elsewhere'/'ats_server_cli.py'
+        with patch.object(cli,'__file__',str(fake_checkout)),patch.object(setup,'DEFAULT_MONITOR_DIR',str(self.root/'opt-ats-monitor')):
+            with self.assertRaisesRegex(setup.MonitorMissing,'--install-monitor'):setup.build_plan(self.store,**options)
+
+    def test_install_monitor_is_a_new_pinned_hookless_checkout(self):
+        if self.root.stat().st_uid!=0:self.skipTest('needs a root-owned parent directory')
+        target=self.root/'opt-ats-monitor'
+        def git(argv,**kwargs):
+            self.calls.append(argv)
+            if argv[1]=='clone':
+                target.mkdir();(target/'remote_host.py').write_text('# adapter\n')
+            return subprocess.CompletedProcess(argv,0,'abc123def456\n' if argv[-1]=='HEAD' else '','')
+        adapter,head=setup.install_monitor(git,destination=str(target))
+        self.assertEqual((adapter,head),(str(target/'remote_host.py'),'abc123def456'))
+        clone=[c for c in self.calls if c[:2]==['git','clone']][0]
+        self.assertEqual(clone[2],'--no-checkout')
+        self.assertTrue(any('core.hooksPath=/dev/null' in c for c in self.calls if c[0]=='git' and len(c)>2))
+        with self.assertRaisesRegex(ValueError,'already exists'):setup.install_monitor(git,destination=str(target))
+        with self.assertRaisesRegex(ValueError,'https'):setup.install_monitor(git,repo='http://x/y.git',destination=str(self.root/'other'))
+        with self.assertRaisesRegex(ValueError,'ref'):setup.install_monitor(git,ref='../x',destination=str(self.root/'other'))
+
+    def test_failed_install_leaves_no_partial_directory_and_names_private_repo_fix(self):
+        target=self.root/'monitor'
+        if self.root.stat().st_uid!=0:self.skipTest('needs a root-owned parent directory')
+        def broken(argv,**kwargs):
+            if argv[1]=='clone':target.mkdir();raise ValueError('git clone failed')
+            return subprocess.CompletedProcess(argv,0,'','')
+        with self.assertRaisesRegex(ValueError,'private'):setup.install_monitor(broken,destination=str(target))
+        self.assertFalse(target.exists())
 
     def test_setup_command_preview_does_not_apply_and_missing_pair_file_is_clear(self):
         import contextlib,io,sys

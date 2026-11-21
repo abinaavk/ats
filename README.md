@@ -72,10 +72,25 @@ fake Git, Docker, systemctl, OpenSSL and rclone commands. They do not verify a r
 Docker daemon, systemd host, Cloudflare tunnel, Google Drive or GitHub delivery.
 Use a disposable service for the final server check after an approved merge.
 
+### Full-stack rehearsal
+
+Mocks cannot prove that systemd, cloudflared and the Monitor accept what ATS generates, so
+`tests/rehearsal/rehearse.py` runs the whole flow with real processes in a temporary directory:
+`server setup --apply` against real `systemd-analyze` and `cloudflared ingress validate`, a real Global
+daemon on a Flask-only Python, a TLS tunnel simulator that routes by the generated YAML, and a real Local
+Monitor (pair, manage, rotate/replace credentials, ID change, revoke, outage diagnostics). It needs root,
+free ports 443/19997/19998 and a sibling `ats-monitor`, and skips (exit 77) otherwise:
+
+```sh
+sudo REHEARSAL_MONITOR_PYTHON=/path/to/monitor-venv/bin/python python3 tests/rehearsal/rehearse.py
+```
+
 ### Automatic Global service and tunnel setup
 
 Use `server setup` to inspect detected settings and `server setup --apply` to
 install/enable the API service and add its route to the existing Cloudflare
-configuration. CLI option 12 exposes the same flow. Existing server entries
+configuration; add `--install-monitor` if the Monitor companion is not installed.
+`server doctor` checks a Global or every paired Global from the Local and explains each
+failure with its fix. CLI option 12 exposes the same flow. Existing server entries
 support `server replace-credentials --server-id ID --pairing-file FILE` with
 verified, atomic credential updates. See [setup and recovery](docs/automatic-global-setup.md).

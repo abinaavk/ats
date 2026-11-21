@@ -1,0 +1,121 @@
+#!/usr/bin/python3
+"""Rehearsal systemctl: reads generated unit files and really launches/stops their daemon."""
+import fnmatch, os, shlex, signal, subprocess, sys, time
+from pathlib import Path
+
+STATE = Path(os.environ['E2E_STATE'])
+UNITS = Path(os.environ['E2E_UNITS'])
+TUNNEL = os.environ.get('E2E_TUNNEL_UNIT', 'ats-e2e-tunnel.service')
+CF = os.environ['E2E_CF']
+(STATE / 'run').mkdir(parents=True, exist_ok=True)
+with open(STATE / 'calls.log', 'a') as log:
+    log.write(' '.join(sys.argv[1:]) + '\n')
+
+def unit_text(name):
+    parts = []
+    main = UNITS / name
+    if main.is_file():
+        parts.append(main.read_text())
+    drop = UNITS / (name + '.d')
+    if drop.is_dir():
+        for f in sorted(drop.glob('*.conf')):
+            parts.append(f.read_text())
+    return parts
+
+def parse(name):
+    execstart, env, wd, pre = None, {}, None, []
+    for text in unit_text(name):
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith('ExecStart='):
+                value = line[len('ExecStart='):]
+                execstart = shlex.split(value) if value else None
+            elif line.startswith('Environment='):
+                for item in shlex.split(line[len('Environment='):]):
+                    k, _, v = item.partition('=')
+                    env[k] = v
+            elif line.startswith('WorkingDirectory='):
+                wd = shlex.split(line[len('WorkingDirectory='):])[0]
+            elif line.startswith('ExecStartPre='):
+                pre.append(shlex.split(line[len('ExecStartPre='):]))
+    return execstart, env, wd, pre
+
+def pidfile(name): return STATE / 'run' / (name + '.pid')
+def alive(name):
+    try:
+        pid = int(pidfile(name).read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+def stop(name):
+    pid = alive(name)
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            try: os.kill(pid, 0)
+            except OSError: break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    pidfile(name).unlink(missing_ok=True)
+
+def start(name):
+    execstart, env, wd, pre = parse(name)
+    if not execstart:
+        print('unit has no ExecStart', file=sys.stderr); sys.exit(1)
+    full = dict(env_base(), **env)
+    for cmd in pre:
+        if subprocess.run(cmd, env=full, cwd=wd).returncode:
+            print('ExecStartPre failed: ' + ' '.join(cmd), file=sys.stderr); sys.exit(1)
+    out = open(STATE / (name + '.log'), 'ab')
+    proc = subprocess.Popen(execstart, env=full, cwd=wd, stdout=out, stderr=out, stdin=subprocess.DEVNULL,
+                            start_new_session=True, close_fds=True)
+    pidfile(name).write_text(str(proc.pid))
+
+def env_base():
+    return {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG') if k in os.environ}
+
+args = sys.argv[1:]
+cmd = args[0] if args else ''
+if cmd == 'list-unit-files':
+    pattern = args[1]
+    names = sorted(p.name for p in UNITS.glob('*.service') if fnmatch.fnmatch(p.name, pattern))
+    for n in names: print(n + ' enabled')
+    sys.exit(0 if names else 1)
+if cmd == 'show':
+    name = args[1]
+    props = {}
+    if name == TUNNEL:
+        props = {'LoadState': 'loaded', 'ActiveState': 'active', 'UnitFileState': 'enabled', 'User': 'root',
+                 'ExecStart': '{ path=/usr/local/bin/cloudflared ; argv[]=/usr/local/bin/cloudflared tunnel --config %s run ; ignore_errors=no }' % CF}
+    elif unit_text(name):
+        execstart, env, wd, pre = parse(name)
+        props = {'LoadState': 'loaded', 'FragmentPath': str(UNITS / name),
+                 'ActiveState': 'active' if alive(name) else 'inactive',
+                 'UnitFileState': 'enabled' if (STATE / 'run' / (name + '.enabled')).exists() else 'disabled',
+                 'ExecStart': '{ path=%s ; argv[]=%s ; ignore_errors=no }' % (execstart[0], ' '.join(execstart)) if execstart else '',
+                 'Environment': shlex.join(f'{k}={v}' for k, v in env.items()), 'User': 'root'}
+    else:
+        props = {'LoadState': 'not-found', 'ActiveState': 'inactive', 'UnitFileState': ''}
+    wanted = [a.split('=', 1)[1] for a in args if a.startswith('--property=')]
+    for k in wanted:
+        print(f'{k}={props.get(k, "")}')
+    sys.exit(0)
+if cmd == 'daemon-reload': sys.exit(0)
+if cmd == 'enable':
+    (STATE / 'run' / (args[1] + '.enabled')).touch(); sys.exit(0)
+if cmd == 'disable':
+    (STATE / 'run' / (args[1] + '.enabled')).unlink(missing_ok=True); sys.exit(0)
+if cmd in ('start', 'restart'):
+    name = args[1]
+    if name == TUNNEL: sys.exit(0)
+    stop(name); start(name); sys.exit(0)
+if cmd == 'stop':
+    stop(args[1]); sys.exit(0)
+if cmd == 'is-active':
+    name = args[1]
+    ok = name == TUNNEL or alive(name)
+    print('active' if ok else 'inactive'); sys.exit(0 if ok else 3)
+print('fake systemctl: unsupported ' + ' '.join(args), file=sys.stderr); sys.exit(1)

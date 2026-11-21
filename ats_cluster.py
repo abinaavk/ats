@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import sqlite3
+import ssl
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -22,6 +24,22 @@ WINDOW = 120
 ID = re.compile(r'^[0-9a-f]{32}$')
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$')
 REPO = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+# Cloudflare's Browser Integrity Check can drop requests that carry no User-Agent.
+USER_AGENT = 'ATS-Cluster/1 (+https://github.com/abinaavk/ats)'
+
+
+class TransportError(ValueError):
+    """A failure whose message is written by ATS and safe to show an operator.
+
+    It never contains credentials, signatures or remote response bodies. It is a
+    ValueError so every existing handler keeps working; ``code`` names the failure
+    class (tls, dns, refused, timeout, network, auth, clock, blocked, route,
+    unavailable, adapter, protocol) for UI and doctor output.
+    """
+
+    def __init__(self, message, code='transport'):
+        super().__init__(message)
+        self.code = code
 
 
 def domain(value):
@@ -194,6 +212,9 @@ class Store:
         if previous['revocation_pending'] and previous['secret'] == secret:
             raise ValueError('Rotate credentials on Global before replacing this pairing')
         health = self._verified(candidate)
+        # Connection state is deliberately preserved: re-enabling a disconnected or revoked
+        # server stays an explicit operator action (Reconnect).
+        connected = previous['connected']
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             self._unchanged(db, previous)
@@ -203,13 +224,33 @@ class Store:
                 # Temporarily free this entry's unique name/domain inside the transaction.
                 db.execute('UPDATE servers SET name=?,domain=NULL WHERE id=?', ('replacement-'+secrets.token_hex(16), sid))
                 db.execute('INSERT INTO servers(id,name,domain,secret,connected,local,revision) VALUES(?,?,?,?,?,0,?)',
-                           (new_id, label, candidate['domain'], secret, previous['connected'], previous['revision']+1))
+                           (new_id, label, candidate['domain'], secret, connected, previous['revision']+1))
                 db.execute('UPDATE routes SET server_id=? WHERE server_id=?', (new_id, sid))
                 db.execute('DELETE FROM servers WHERE id=?', (sid,))
             else:
-                db.execute('UPDATE servers SET name=?,domain=?,secret=?,revocation_pending=0,revision=revision+1 WHERE id=?',
-                           (label, candidate['domain'], secret, sid))
+                db.execute('UPDATE servers SET name=?,domain=?,secret=?,connected=?,revocation_pending=0,revision=revision+1 WHERE id=?',
+                           (label, candidate['domain'], secret, connected, sid))
         return health
+
+    def find_server(self, bundle):
+        """The saved Global a pairing bundle refers to: same ID, else same HTTPS origin, else same name."""
+        if not isinstance(bundle, dict):
+            raise ValueError('Pairing bundle must be a JSON object')
+        self._local()
+        saved = [s for s in self.servers() if not s['local']]
+        try:
+            origin = domain(bundle.get('domain'))
+        except ValueError:
+            origin = None
+        for key, wanted in (('id', bundle.get('id')), ('domain', origin),
+                            ('name', (bundle.get('name') or '').lower() if isinstance(bundle.get('name'), str) else None)):
+            if not wanted:
+                continue
+            # ID, address and name are each unique in the registry, so a hit is never ambiguous.
+            for saved_server in saved:
+                if (saved_server[key].lower() if key == 'name' else saved_server[key]) == wanted:
+                    return saved_server['id']
+        raise ValueError('No saved Global matches this pairing file (ID, address or name); pair it as a new server instead')
 
     def connection(self, sid, action):
         self._local()
@@ -309,29 +350,102 @@ def authenticate(store, method, path, body, headers):
     return n
 
 
+def _safe_json(data):
+    try:
+        value = json.loads(data)
+    except (ValueError, UnicodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _public_error(value):
+    """Keep only a short printable message written by the Global itself."""
+    if isinstance(value, str) and 0 < len(value) <= 300 and value.isprintable():
+        return value
+    return None
+
+
+def _http_failure(host, status, headers, data):
+    """Explain a non-200 reply without echoing any remote body or credential."""
+    body = _safe_json(data)
+    detail = _public_error((body or {}).get('error'))
+    behind_cloudflare = 'cloudflare' in (headers.get('Server') or '').lower() or bool(headers.get('CF-Ray'))
+    if status == 401:
+        server_time = (body or {}).get('server_time')
+        if isinstance(server_time, int) and not isinstance(server_time, bool) and abs(server_time - time.time()) > WINDOW // 2:
+            skew = int(server_time - time.time())
+            return TransportError(
+                f'Clock mismatch: {host} reports a time {abs(skew)} s {"ahead of" if skew > 0 else "behind"} this server '
+                f'(requests are accepted within {WINDOW} s). Enable time sync on both servers, e.g. '
+                '"timedatectl set-ntp true", then retry.', 'clock')
+        return TransportError(
+            f'{host} rejected the server ID or passkey. Check they match that Global\'s current pairing file '
+            '("server export" on that Global), then pair again or use Update ID and passkey.', 'auth')
+    if status in (403, 429) and behind_cloudflare and not detail:
+        return TransportError(
+            f'Cloudflare blocked the request before it reached {host} (HTTP {status}). Allow this server in '
+            'Cloudflare security rules (WAF / Bot Fight Mode / rate limiting) for /v1/request.', 'blocked')
+    if status == 404:
+        return TransportError(
+            f'{host} has no /v1/request route. On that Global run "server setup --apply" so the Cloudflare '
+            'tunnel forwards /v1/request to the ATS API.', 'route')
+    if status in (502, 503, 504) or 520 <= status <= 530:
+        if detail:
+            return TransportError(f'{host}: {detail}', 'adapter' if 'adapter' in detail.lower() else 'unavailable')
+        return TransportError(
+            f'{host} is unreachable through its tunnel (HTTP {status}). Check that the Global ATS API service and '
+            'cloudflared are running ("server doctor" on that Global).', 'unavailable')
+    if detail:
+        return TransportError(f'{host}: {detail} (HTTP {status})', 'protocol')
+    return TransportError(f'{host} answered HTTP {status}; expected a signed ATS response. '
+                          'Check the hostname points at the ATS API tunnel route.', 'protocol')
+
+
 def remote(server, payload, *, timeout=None):
     if server['local'] or not server['connected'] or not server['secret']:
-        raise ValueError('Selected Global server is disconnected or revoked')
+        raise TransportError('Selected Global server is disconnected or revoked', 'disabled')
     u = urlsplit(domain(server['domain']))
+    host = u.hostname + (':' + str(u.port) if u.port and u.port != 443 else '')
     body = json.dumps(payload, separators=(',', ':')).encode()
     if len(body) > MAX_BODY:
         raise ValueError('Request too large')
     conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout or (5 if payload.get('kind') == 'health' else 10 if payload.get('kind') == 'revoke' else 65))
+    headers = signed_headers(server['secret'], server['id'], body)
+    headers['User-Agent'] = USER_AGENT
+    headers['Accept'] = 'application/json'
     try:
-        conn.request('POST', '/v1/request', body, signed_headers(server['secret'], server['id'], body))
-        r = conn.getresponse()
-        data = r.read(MAX_OUTPUT+1)
-        if len(data) > MAX_OUTPUT or r.status != 200:
-            raise ValueError('Global API rejected request or returned an oversized response (HTTP %s)' % r.status)
-        result = json.loads(data)
-        if not isinstance(result, dict) or result.get('server_id') != server['id']:
-            raise ValueError('Global response identity mismatch')
+        try:
+            conn.request('POST', '/v1/request', body, headers)
+            r = conn.getresponse()
+            data = r.read(MAX_OUTPUT + 1)
+        except ssl.SSLCertVerificationError as exc:
+            raise TransportError(f'The HTTPS certificate for {host} could not be verified ({exc.verify_message}). '
+                                 'Use the real Cloudflare hostname; certificate checks are never disabled.', 'tls') from None
+        except ssl.SSLError:
+            raise TransportError(f'TLS handshake with {host} failed. Check the hostname is proxied by Cloudflare '
+                                 'and served over HTTPS.', 'tls') from None
+        except socket.gaierror:
+            raise TransportError(f'Cannot resolve {host}. Create the tunnel DNS record for this hostname '
+                                 '(cloudflared tunnel route dns) and check this server\'s DNS.', 'dns') from None
+        except (socket.timeout, TimeoutError):
+            raise TransportError(f'Timed out waiting for {host}. The Global may be busy or its tunnel may be down.', 'timeout') from None
+        except ConnectionRefusedError:
+            raise TransportError(f'{host} refused the connection.', 'refused') from None
+        except OSError as exc:
+            raise TransportError(f'Network error contacting {host}: {exc.strerror or type(exc).__name__}', 'network') from None
+        except (http.client.HTTPException, UnicodeError):
+            raise TransportError('Global transport returned an invalid or incomplete response', 'protocol') from None
+        if len(data) > MAX_OUTPUT:
+            raise TransportError(f'{host} returned an oversized response', 'protocol')
+        if r.status != 200:
+            raise _http_failure(host, r.status, r.headers, data)
+        result = _safe_json(data)
+        if result is None or result.get('server_id') != server['id']:
+            raise TransportError('Global response identity mismatch: the hostname answers for a different server ID', 'auth')
         if result.get('ok') is not True:
-            raise ValueError(result.get('error', 'Global operation failed'))
+            raise TransportError(_public_error(result.get('error')) or 'Global operation failed', 'adapter')
         if not isinstance(result.get('data'), dict):
-            raise ValueError('Invalid Global response payload')
+            raise TransportError('Invalid Global response payload', 'protocol')
         return result['data']
-    except (http.client.HTTPException, UnicodeError) as exc:
-        raise ValueError('Global transport returned an invalid or incomplete response') from exc
     finally:
         conn.close()
