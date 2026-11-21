@@ -90,6 +90,20 @@ class SessionTests(TerminalBase):
         text, _ = self.until(sid, 'still-alive-130')
         self.assertNotIn('no job control', text)
 
+    def test_ctrl_c_works_even_when_the_daemon_inherited_ignored_signals(self):
+        # Regression: a daemon started with nohup / as a background job ignores SIGINT, and every shell it spawned did too.
+        import signal
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        previous_quit = signal.signal(signal.SIGQUIT, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
+        self.addCleanup(signal.signal, signal.SIGQUIT, previous_quit)
+        sid = self.open()
+        self.send(sid, 'sleep 30\n')
+        time.sleep(0.6)
+        self.send(sid, '\x03')
+        self.send(sid, 'echo ignored-sig-$?\n')
+        self.until(sid, 'ignored-sig-130')
+
     def test_unacknowledged_reads_are_repeated_not_lost(self):
         sid = self.open()
         self.send(sid, 'echo first-marker\n')

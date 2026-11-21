@@ -40,8 +40,11 @@ COALESCE = 0.03
 PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 HELPER = r'''
-import fcntl, json, os, sys, termios
+import fcntl, json, os, signal, sys, termios
 spec = json.loads(sys.argv[1])
+# A daemon started with nohup or from a background job inherits "ignore SIGINT/SIGQUIT"; a terminal must not.
+for number in (signal.SIGINT, signal.SIGQUIT, signal.SIGHUP, signal.SIGTERM, signal.SIGPIPE, signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU):
+    signal.signal(number, signal.SIG_DFL)
 os.setsid()
 fcntl.ioctl(0, termios.TIOCSCTTY, 1)
 if os.geteuid() == 0 and spec['uid'] != 0:
@@ -54,6 +57,16 @@ except OSError:
     os.chdir('/')
 os.execvpe(spec['argv'][0], spec['argv'], spec['env'])
 '''
+
+
+def log(message):
+    """Journal line for session lifecycle events (never keystrokes or output); silent during interpreter shutdown."""
+    if sys.is_finalizing():
+        return
+    try:
+        print(message, flush=True)
+    except (OSError, ValueError, RuntimeError):
+        pass
 
 
 class TerminalError(ValueError):
@@ -228,7 +241,7 @@ def _reap_loop():
             for sid in stale:
                 session = _sessions.pop(sid)
                 session.close()
-                print(f'terminal {sid[:8]} closed after {IDLE_SECONDS} s idle', flush=True)
+                log(f'terminal {sid[:8]} closed after {IDLE_SECONDS} s idle')
 
 
 def _session(sid):
@@ -289,7 +302,7 @@ def open_session(data):
         if _reaper is None:
             _reaper = threading.Thread(target=_reap_loop, daemon=True)
             _reaper.start()
-    print(f'terminal {sid[:8]} opened ({label}) as {entry.pw_name}', flush=True)
+    log(f'terminal {sid[:8]} opened ({label}) as {entry.pw_name}')
     return {'sid': sid, 'user': entry.pw_name}
 
 
@@ -329,7 +342,7 @@ def handle(kind, data):
         with _lock:
             _sessions.pop(data['sid'], None)
         session.close()
-        print(f"terminal {data['sid'][:8]} closed", flush=True)
+        log(f"terminal {data['sid'][:8]} closed")
         return {'closed': True}
     raise TerminalError('Unsupported terminal request')
 
