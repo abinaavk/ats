@@ -1,4 +1,4 @@
-"""Interactive and headless server setup; never changes production tunnel routes."""
+"""Interactive and headless server configuration and explicit Global setup."""
 import argparse
 import contextlib
 import stat
@@ -8,23 +8,26 @@ from pathlib import Path
 import secrets
 import shlex
 import sys
+import sqlite3
 from urllib.parse import urlsplit
 import yaml
 from ats_cluster import Store
 
 
-def main():
-    parser = argparse.ArgumentParser(description='ATS multi-server configuration (operator-managed TLS, storage and GitHub)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter'])
+def _main():
+    parser = argparse.ArgumentParser(description='ATS multi-server configuration (signed HTTPS management and automatic Global setup)')
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
     parser.add_argument('--webhook-host')
     parser.add_argument('--cloudflare-config')
     parser.add_argument('--confirm-existing-route', action='store_true')
-    parser.add_argument('--port', type=int, default=int(os.environ.get('ATS_REMOTE_PORT', '9997')))
+    parser.add_argument('--port', type=int, default=None)
     parser.add_argument('--pairing-file')
-    parser.add_argument('--monitor-adapter', help='Installed Monitor remote_host.py (preview only)')
+    parser.add_argument('--apply', action='store_true', help='Install and start the Global service and add its API tunnel route')
+    parser.add_argument('--unit', help='Existing ATS daemon systemd unit (auto-detected by default)')
+    parser.add_argument('--monitor-adapter', help='Installed Monitor remote_host.py')
     parser.add_argument('--adapter-state-dir', help='Private absolute directory for adapter security/job state')
     parser.add_argument('--server-id')
     parser.add_argument('--repository')
@@ -33,14 +36,27 @@ def main():
     parser.add_argument('--secret-file')
     parser.add_argument('--replace-mapping', action='store_true')
     args = parser.parse_args()
-    if (args.monitor_adapter or args.adapter_state_dir) and args.action not in ('service', 'adapter'):
+    if (args.monitor_adapter or args.adapter_state_dir) and args.action not in ('service', 'adapter', 'setup', 'configure'):
         parser.error('Adapter options require server service or server adapter')
+    if args.apply and args.action not in ('configure', 'setup'):
+        parser.error('--apply requires server configure or server setup')
+    if args.action in ('pair', 'replace-credentials') and not args.pairing_file:
+        parser.error('--pairing-file is required')
+    if args.action in ('disconnect', 'reconnect', 'revoke', 'replace-credentials') and not args.server_id:
+        parser.error('--server-id is required')
+    if args.action == 'map' and not all((args.secret_file, args.repository, args.server_id, args.service)):
+        parser.error('map requires --secret-file, --repository, --server-id and --service')
     store = Store()
     if args.action == 'configure':
         try:
             configure(store, args, sys.stdin.isatty())
         except (ValueError, OSError, yaml.YAMLError, EOFError) as exc:
             parser.error('Server setup failed: ' + str(exc))
+    elif args.action == 'setup':
+        try:
+            setup_global(store, args)
+        except (ValueError, OSError, yaml.YAMLError) as exc:
+            parser.error('Global setup failed: '+str(exc))
     elif args.action in ('service', 'adapter'):
         try:
             if args.action == 'adapter':
@@ -69,15 +85,21 @@ def main():
             parser.error(str(exc))
         if not store.node() or store.node()['role'] != 'global':
             parser.error('Configure this instance as Global first')
-        os.environ['ATS_REMOTE_PORT'] = str(args.port)
+        os.environ['ATS_REMOTE_PORT'] = str(args.port or os.environ.get('ATS_REMOTE_PORT', '9997'))
         import asyncio
         import app as runtime
         asyncio.run(runtime.run_daemon())
-    elif args.action == 'pair':
+    elif args.action in ('pair', 'replace-credentials'):
         with open(args.pairing_file) as f:
             bundle = json.load(f)
-        store.pair(bundle['id'], args.name or bundle['name'], bundle['domain'], bundle['secret'])
-        print('Global server paired and verified')
+        if not isinstance(bundle, dict):
+            parser.error('Pairing file must contain a JSON object')
+        if args.action == 'replace-credentials':
+            store.replace_credentials(args.server_id, bundle['id'], args.name or bundle['name'], bundle['domain'], bundle['secret'])
+            print('Credentials verified and replaced; connection state and webhook mappings preserved')
+        else:
+            store.pair(bundle['id'], args.name or bundle['name'], bundle['domain'], bundle['secret'])
+            print('Global server paired and verified')
     elif args.action == 'map':
         with open(args.secret_file) as f:
             secret = f.read().strip()
@@ -93,14 +115,26 @@ def main():
         store.connection(args.server_id, args.action)
 
 
+def main():
+    try:
+        _main()
+    except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+        print('Server setup failed: '+str(exc), file=sys.stderr)
+        raise SystemExit(1) from None
+
+
 def configure(store, args, interactive):
     """Shared setup for explicit configuration and launch-time upgrade checks."""
+    if getattr(args, 'apply', False) and args.role == 'local':
+        raise ValueError('--apply is only supported for Global setup')
     role = args.role or (input('Role (local/global): ').strip() if interactive else None)
+    if getattr(args, 'apply', False) and role != 'global':
+        raise ValueError('--apply is only supported for Global setup')
     label = args.name or (input('Server name: ').strip() if interactive else None)
     origin = args.api_domain
     host = args.webhook_host
     if role == 'global' and not origin and interactive:
-        origin = input('HTTPS API origin (configure TLS manually): ').strip()
+        origin = input('HTTPS API origin: ').strip()
     if role == 'local':
         if not host and interactive:
             host = input('Central webhook hostname: ').strip()
@@ -142,10 +176,29 @@ def configure(store, args, interactive):
             node = store.configure(role, label, origin, host)
             json.dump(node, f)
         print('Pairing file saved privately at ' + str(args.pairing_file or default_pairing_path()))
-        tunnel_guidance(store)
+        print('Global identity saved; existing credentials preserved.')
+        if getattr(args, 'apply', False):
+            setup_global(store, args)
+        elif interactive:
+            if input('Install/update the Global API service and configured tunnel route now? [yes/NO] ') == 'yes':
+                args.apply = True
+                setup_global(store, args)
+        else:
+            print('Run server setup to inspect automatic setup, then server setup --apply to install it.')
     else:
         store.configure(role, label, origin, host)
-    print('Configuration saved. Configure/validate TLS proxy, storage and GitHub manually; no services or tunnel routes were changed.')
+        print('Local configuration saved. Existing webhook routes were preserved.')
+
+
+def setup_global(store, args):
+    from ats_global_setup import apply, build_plan, public_plan
+    options = dict(port=getattr(args, 'port', None), config_path=getattr(args, 'cloudflare_config', None),
+                   monitor_adapter=getattr(args, 'monitor_adapter', None), state_dir=getattr(args, 'adapter_state_dir', None),
+                   unit=getattr(args, 'unit', None))
+    result = apply(store, **options) if getattr(args, 'apply', False) else public_plan(build_plan(store, **options))
+    print(json.dumps(result, indent=2))
+    if not getattr(args, 'apply', False):
+        print('Preview only. Use server setup --apply to install, enable and verify. Existing DNS/tunnel credentials are reused.')
 
 
 def tunnel_guidance(store, config_path=None, port=None):
@@ -517,8 +570,9 @@ def menu(store=None, ui=None):
                 ('3', 'Rotate Global credentials'), ('4', 'List servers'),
                 ('5', 'Pair Global from private file'), ('6', 'Disconnect Global'),
                 ('7', 'Reconnect Global'), ('8', 'Revoke Global'),
-                ('9', 'Check Global API tunnel route'), ('10', 'Preview automatic startup service'), ('0', 'Back'))
-        allowed = {'1', '10', '0'} | ({'2', '3', '9'} if node.get('role') == 'global' else {'4', '5', '6', '7', '8'})
+                ('9', 'Check Global API tunnel route'), ('10', 'Preview automatic startup service'),
+                ('11', 'Set up Global API service and tunnel'), ('12', 'Update saved Global ID / passkey'), ('0', 'Back'))
+        allowed = {'1', '10', '0'} | ({'2', '3', '9', '11'} if node.get('role') == 'global' else {'4', '5', '6', '7', '8', '12'})
         for number, label in options:
             if number not in allowed:
                 continue
@@ -530,6 +584,18 @@ def menu(store=None, ui=None):
                 return
             if choice not in allowed:
                 status('This action is unavailable for this server role', 'warning')
+            elif choice == '11':
+                args = argparse.Namespace(apply=False)
+                setup_global(store, args)
+                if input('Apply this service/tunnel setup and restart affected services? [yes/NO] ') == 'yes':
+                    args.apply = True
+                    setup_global(store, args)
+            elif choice == '12':
+                sid = input('Existing saved Global server ID: ').strip()
+                with open(input('New private pairing file path: ').strip()) as f:
+                    bundle = json.load(f)
+                store.replace_credentials(sid, bundle['id'], bundle['name'], bundle['domain'], bundle['secret'])
+                status('Credentials verified and updated; connection state preserved', 'success')
             elif choice == '10':
                 print(service_unit(store))
             elif choice == '1':
@@ -570,7 +636,7 @@ def menu(store=None, ui=None):
                 status('Invalid choice', 'warning')
         except (EOFError, KeyboardInterrupt):
             return
-        except (ValueError, OSError, KeyError, yaml.YAMLError) as exc:
+        except (ValueError, OSError, KeyError, sqlite3.Error, yaml.YAMLError) as exc:
             status('Server setup failed: ' + str(exc), 'error')
         if ui:
             try:

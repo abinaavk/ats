@@ -71,3 +71,11 @@ Host integration tests use temporary config, database and unit directories plus
 fake Git, Docker, systemctl, OpenSSL and rclone commands. They do not verify a real
 Docker daemon, systemd host, Cloudflare tunnel, Google Drive or GitHub delivery.
 Use a disposable service for the final server check after an approved merge.
+
+### Automatic Global service and tunnel setup
+
+Use `server setup` to inspect detected settings and `server setup --apply` to
+install/enable the API service and add its route to the existing Cloudflare
+configuration. CLI option 12 exposes the same flow. Existing server entries
+support `server replace-credentials --server-id ID --pairing-file FILE` with
+verified, atomic credential updates. See [setup and recovery](docs/automatic-global-setup.md).

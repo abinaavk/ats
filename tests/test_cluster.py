@@ -65,7 +65,7 @@ class ClusterTests(unittest.TestCase):
         with self.assertRaises(ValueError):ats_remote.execute([sys.executable,'-c','print("x"*5000000)'],{})
 
     def test_https_origin_restrictions(self):
-        for value in ['http://example.com','https://u:p@example.com','https://example.com/x','https://example.com?x=y','https://a.example/#x','https://a..example']:
+        for value in ['http://example.com','https://u:p@example.com','https://example.com/x','https://example.com?x=y','https://a.example/#x','https://a..example','https://api.example.com:0']:
             with self.subTest(value=value),self.assertRaises(ValueError):c.domain(value)
 
     def test_duplicate_mapping_and_ambiguous_service_rejected(self):
@@ -204,7 +204,7 @@ class TLSIntegrationTests(unittest.TestCase):
     def test_tampering_replay_timestamp_and_wrong_server(self):
         body=b'{"kind":"health"}';headers=c.signed_headers(self.node['secret'],self.node['id'],body)
         self.assertEqual(self.request(body,headers),200);self.assertEqual(self.request(body,headers),401)
-        for changes in [{'X-ATS-Server':'a'*32},{'X-ATS-Time':'0'},{'X-ATS-Signature':'0'*64}]:
+        for changes in [{'X-ATS-Server':'a'*32},{'X-ATS-Time':'0'},{'X-ATS-Signature':'0'*64},{'X-ATS-Signature':'é'*64}]:
             h=c.signed_headers(self.node['secret'],self.node['id'],body);h.update(changes)
             self.assertEqual(self.request(body,h),401)
         self.assertEqual(self.request(b'{"kind":"revoke"}',c.signed_headers(self.node['secret'],self.node['id'],body)),401)

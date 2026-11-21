@@ -33,6 +33,8 @@ def domain(value):
             len(u.hostname) > 253 or any(not re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', label) for label in u.hostname.split('.'))):
         raise ValueError('Use an HTTPS origin without credentials, path, query or fragment')
     port = u.port
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError('HTTPS port must be between 1 and 65535')
     return 'https://'+u.hostname.lower()+(':'+str(port) if port and port != 443 else '')
 
 
@@ -66,6 +68,11 @@ class Store:
               CREATE TABLE IF NOT EXISTS seen(scope TEXT, nonce TEXT, created REAL,
                 state TEXT, result TEXT, PRIMARY KEY(scope,nonce));
             ''')
+            db.execute('BEGIN IMMEDIATE')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(servers)')}
+            for column in ('revision', 'revocation_pending'):
+                if column not in columns:
+                    db.execute('ALTER TABLE servers ADD COLUMN '+column+' INTEGER NOT NULL DEFAULT 0')
 
     @contextlib.contextmanager
     def db(self):
@@ -110,7 +117,7 @@ class Store:
 
     def servers(self):
         with self.db() as db:
-            return [dict(r) for r in db.execute('SELECT id,name,domain,connected,local,(secret IS NOT NULL) AS paired FROM servers ORDER BY local DESC,name')]
+            return [dict(r) for r in db.execute('SELECT id,name,domain,connected,local,revocation_pending,(secret IS NOT NULL) AS paired FROM servers ORDER BY local DESC,name')]
 
     def server(self, sid):
         if not isinstance(sid, str) or not ID.fullmatch(sid):
@@ -121,58 +128,132 @@ class Store:
                 raise ValueError('Unknown server')
             return dict(r)
 
-    def pair(self, sid, label, origin, secret):
+    def _local(self):
         node = self.node()
         if not node or node['role'] != 'local':
-            raise ValueError('Only the primary Local can pair servers')
+            raise ValueError('Only the primary Local can manage servers')
+        return node
+
+    def _candidate(self, sid, label, origin, secret):
+        node = self._local()
         if not isinstance(sid, str) or not ID.fullmatch(sid) or sid == node['id']:
             raise ValueError('Invalid Global identity')
         name(label); origin = domain(origin)
         if not isinstance(secret, str) or not re.fullmatch('[0-9a-f]{64}', secret):
             raise ValueError('Invalid pairing secret')
-        candidate = dict(id=sid, name=label, domain=origin, secret=secret, connected=1, local=0)
+        return dict(id=sid, name=label, domain=origin, secret=secret, connected=1, local=0)
+
+    @staticmethod
+    def _verified(candidate):
         health = remote(candidate, {'kind': 'health'})
-        if health.get('server_id') != sid:
-            raise ValueError('Pairing identity mismatch')
+        if not isinstance(health, dict) or health.get('server_id') != candidate['id'] or health.get('role') != 'global':
+            raise ValueError('Pairing identity or role mismatch')
+        return health
+
+    def _unique_secret(self, db, secret, sid):
+        if (db.execute('SELECT 1 FROM servers WHERE secret=? AND id!=?', (secret, sid)).fetchone()
+                or db.execute('SELECT 1 FROM node WHERE secret=?', (secret,)).fetchone()):
+            raise ValueError('Credentials already used by another server')
+
+    @staticmethod
+    def _unchanged(db, server):
+        row = db.execute('SELECT * FROM servers WHERE id=?', (server['id'],)).fetchone()
+        if not row or dict(row) != server:
+            raise ValueError('Server changed during verification; refresh and retry')
+
+    def pair(self, sid, label, origin, secret):
+        candidate = self._candidate(sid, label, origin, secret)
         with self.db() as db:
-            # Different servers must never share credentials.
-            if db.execute('SELECT 1 FROM servers WHERE secret=? AND id!=?', (secret, sid)).fetchone():
-                raise ValueError('Credentials already used by another server')
-            db.execute('INSERT INTO servers VALUES(?,?,?,?,1,0) ON CONFLICT(id) DO UPDATE SET name=excluded.name,domain=excluded.domain,secret=excluded.secret,connected=1',
-                       (sid, label, origin, secret))
+            row = db.execute('SELECT * FROM servers WHERE id=?', (sid,)).fetchone()
+            previous = dict(row) if row else None
+        if previous and previous['revocation_pending'] and previous['secret'] == secret:
+            raise ValueError('Rotate credentials on Global before pairing again')
+        health = self._verified(candidate)
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._unique_secret(db, secret, sid)
+            if previous:
+                self._unchanged(db, previous)
+                db.execute('UPDATE servers SET name=?,domain=?,secret=?,connected=1,revocation_pending=0,revision=revision+1 WHERE id=?',
+                           (label, candidate['domain'], secret, sid))
+            else:
+                db.execute('INSERT INTO servers(id,name,domain,secret,connected,local) VALUES(?,?,?,?,1,0)',
+                           (sid, label, candidate['domain'], secret))
+        return health
+
+    def replace_credentials(self, sid, new_id, label, origin, secret):
+        """Verify first, then atomically replace the entry and its explicit routes.
+
+        Connection state is retained. Old jobs keep their originating identity.
+        No request is sent with the old key and no Global key is changed here.
+        """
+        previous = self.server(sid)
+        if previous['local']:
+            raise ValueError('Cannot replace the primary Local identity')
+        candidate = self._candidate(new_id, label, origin, secret)
+        if previous['revocation_pending'] and previous['secret'] == secret:
+            raise ValueError('Rotate credentials on Global before replacing this pairing')
+        health = self._verified(candidate)
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._unchanged(db, previous)
+            self._unique_secret(db, secret, sid)
+            if new_id != sid:
+                # Insert before migrating FKs; never merge two saved servers.
+                # Temporarily free this entry's unique name/domain inside the transaction.
+                db.execute('UPDATE servers SET name=?,domain=NULL WHERE id=?', ('replacement-'+secrets.token_hex(16), sid))
+                db.execute('INSERT INTO servers(id,name,domain,secret,connected,local,revision) VALUES(?,?,?,?,?,0,?)',
+                           (new_id, label, candidate['domain'], secret, previous['connected'], previous['revision']+1))
+                db.execute('UPDATE routes SET server_id=? WHERE server_id=?', (new_id, sid))
+                db.execute('DELETE FROM servers WHERE id=?', (sid,))
+            else:
+                db.execute('UPDATE servers SET name=?,domain=?,secret=?,revocation_pending=0,revision=revision+1 WHERE id=?',
+                           (label, candidate['domain'], secret, sid))
         return health
 
     def connection(self, sid, action):
-        s = self.server(sid)
-        if s['local']:
+        self._local()
+        server = self.server(sid)
+        if server['local']:
             raise ValueError('The primary Local cannot be disconnected or revoked')
-        if action == 'reconnect':
-            remote(dict(s, connected=1), {'kind': 'health'})
-        elif action == 'revoke':
-            # Fail closed even if the Global rotates its key but its reply is lost.
-            # Retain the private key until confirmation so the operator can retry.
+        if action == 'disconnect':
             with self.db() as db:
-                db.execute('UPDATE servers SET connected=0 WHERE id=?', (sid,))
-            remote(dict(s, connected=1), {'kind': 'revoke'})
-        elif action != 'disconnect':
+                db.execute('UPDATE servers SET connected=0,revision=revision+1 WHERE id=?', (sid,))
+            return
+        if action == 'reconnect':
+            if server['revocation_pending']:
+                raise ValueError('Revocation is unconfirmed; replace with a fresh Global credential first')
+            self._verified(dict(server, connected=1))
+        elif action == 'revoke':
+            with self.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                self._unchanged(db, server)
+                db.execute('UPDATE servers SET connected=0,revocation_pending=1,revision=revision+1 WHERE id=?', (sid,))
+            server.update(connected=0, revocation_pending=1, revision=server['revision']+1)
+            result = remote(dict(server, connected=1), {'kind': 'revoke'})
+            if not isinstance(result, dict) or result.get('revoked') is not True:
+                raise ValueError('Global did not confirm revocation')
+        else:
             raise ValueError('Invalid connection action')
         with self.db() as db:
-            db.execute('UPDATE servers SET connected=?,secret=? WHERE id=?',
-                       (int(action == 'reconnect'), None if action == 'revoke' else s['secret'], sid))
+            db.execute('BEGIN IMMEDIATE')
+            self._unchanged(db, server)
+            if action == 'reconnect':
+                db.execute('UPDATE servers SET connected=1,revision=revision+1 WHERE id=?', (sid,))
+            else:
+                db.execute('UPDATE servers SET connected=0,secret=NULL,revocation_pending=0,revision=revision+1 WHERE id=?', (sid,))
 
     def update_server(self, sid, label, origin):
+        self._local()
         server = self.server(sid)
         if server['local']:
             raise ValueError('Configure the primary Local from its ATS CLI')
         name(label); origin = domain(origin)
-        if not server['secret']:
-            raise ValueError('Pair this server again before editing its endpoint')
-        candidate = dict(server, name=label, domain=origin, connected=1)
-        health = remote(candidate, {'kind': 'health'})
-        if health.get('server_id') != sid:
-            raise ValueError('Server identity mismatch')
+        self._verified(dict(server, name=label, domain=origin, connected=1))
         with self.db() as db:
-            db.execute('UPDATE servers SET name=?,domain=? WHERE id=?', (label, origin, sid))
+            db.execute('BEGIN IMMEDIATE')
+            self._unchanged(db, server)
+            db.execute('UPDATE servers SET name=?,domain=?,revision=revision+1 WHERE id=?', (label, origin, sid))
 
     def mapping(self, repository, sid, service, branch, secret, replace=False):
         if not isinstance(repository, str) or not REPO.fullmatch(repository):
@@ -220,9 +301,12 @@ def authenticate(store, method, path, body, headers):
         raise ValueError('Unauthorized')
     if not re.fullmatch('[0-9]{1,12}', ts) or abs(time.time()-int(ts)) > WINDOW or not re.fullmatch('[0-9a-f]{48}', nonce):
         raise ValueError('Unauthorized')
+    if not re.fullmatch('[0-9a-f]{64}', sig):
+        raise ValueError('Unauthorized')
     expected = hmac.new(n['secret'].encode(), canonical(method, path, body, sid, ts, nonce), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig) or not store.claim('auth', nonce):
         raise ValueError('Unauthorized')
+    return n
 
 
 def remote(server, payload, *, timeout=None):
@@ -242,8 +326,12 @@ def remote(server, payload, *, timeout=None):
         result = json.loads(data)
         if not isinstance(result, dict) or result.get('server_id') != server['id']:
             raise ValueError('Global response identity mismatch')
-        if not result.get('ok'):
+        if result.get('ok') is not True:
             raise ValueError(result.get('error', 'Global operation failed'))
+        if not isinstance(result.get('data'), dict):
+            raise ValueError('Invalid Global response payload')
         return result['data']
+    except (http.client.HTTPException, UnicodeError) as exc:
+        raise ValueError('Global transport returned an invalid or incomplete response') from exc
     finally:
         conn.close()
