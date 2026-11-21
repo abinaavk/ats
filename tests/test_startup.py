@@ -88,7 +88,7 @@ class StartupTests(unittest.TestCase):
 
     def test_global_automatically_exports_without_webhook(self):
         path = self.root / 'files' / 'pairing.json'
-        node = self.launch(['global', 'Remote', 'https://remote.example.com'])
+        node = self.launch(['global', 'Remote', 'https://remote.example.com', 'no'])
         self.assertIsNone(node['webhook'])
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         import json
@@ -97,7 +97,7 @@ class StartupTests(unittest.TestCase):
     def test_owned_public_directory_is_secured_during_global_setup(self):
         directory = self.root / 'files'
         directory.mkdir(mode=0o755)
-        node = self.launch(['global', 'Remote', 'https://remote.example.com'])
+        node = self.launch(['global', 'Remote', 'https://remote.example.com', 'no'])
         self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
         self.assertEqual(self.store.node(), node)
         self.assertTrue((directory / 'pairing.json').exists())

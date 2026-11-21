@@ -42,7 +42,7 @@ def execute(argv, value, timeout=60):
         return json.loads(data)
 
 
-def dispatch(store, data):
+def dispatch(store, data, authenticated=None):
     if not isinstance(data, dict):
         raise ValueError('JSON object required')
     kind = data.get('kind')
@@ -51,7 +51,10 @@ def dispatch(store, data):
                 'management_ready': Path(os.environ.get('ATS_MONITOR_ADAPTER', '')).is_file()}
     if kind == 'revoke':
         with store.db() as db:
-            db.execute('UPDATE node SET secret=?', (secrets.token_hex(32),))
+            current = authenticated or store.node()
+            if db.execute('UPDATE node SET secret=? WHERE id=? AND secret=?',
+                          (secrets.token_hex(32), current['id'], current['secret'])).rowcount != 1:
+                raise ValueError('Credential changed before revocation; authenticate again')
         return {'revoked': True}
     if kind == 'http':
         adapter = os.environ.get('ATS_MONITOR_ADAPTER')
@@ -112,13 +115,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) != int(lengths[0]):
                 return self.reply(400, {'ok': False})
             try:
-                cluster.authenticate(self.server.store, 'POST', self.path, body, self.headers)
+                authenticated = cluster.authenticate(self.server.store, 'POST', self.path, body, self.headers)
             except ValueError:
                 return self.reply(401, {'ok': False})
             acquired = SLOTS.acquire(blocking=False)
             if not acquired:
                 return self.reply(503, {'ok': False})
-            result = dispatch(self.server.store, json.loads(body))
+            result = dispatch(self.server.store, json.loads(body), authenticated)
             return self.reply(200, {'ok': True, 'server_id': self.server.store.node()['id'], 'data': result})
         except (ValueError, OSError, subprocess.SubprocessError):
             self.reply(502, {'ok': False, 'error': 'Global operation failed'})
