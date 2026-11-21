@@ -210,13 +210,18 @@ def configure(store, args, interactive):
         print('Local configuration saved. Existing webhook routes were preserved.')
 
 
-def ats_database():
-    """This instance's service database, found the same way the daemon finds it."""
+def ats_settings():
+    """This instance's ATS settings file, found the same way the daemon finds it."""
     instance = os.environ.get('ATS_INSTANCE', '')
     path = os.environ.get('ATS_CONFIG_FILE') or ('/etc/ats/config-' + instance + '.yml' if instance and all(c.isalnum() or c in '_-' for c in instance) else '/etc/ats/config.yml')
     with open(path) as f:
         settings = yaml.safe_load(f) or {}
-    return Path(settings.get('ats_home') or os.environ.get('ATS_HOME') or '/home/gaia') / 'ats.db'
+    return settings if isinstance(settings, dict) else {}
+
+
+def ats_database():
+    """This instance's service database."""
+    return Path(ats_settings().get('ats_home') or os.environ.get('ATS_HOME') or '/home/gaia') / 'ats.db'
 
 
 def github_repository(url):

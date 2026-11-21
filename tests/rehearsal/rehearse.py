@@ -108,7 +108,7 @@ subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-ke
 CF.write_text("tunnel: e2e-tunnel\ncredentials-file: /nonexistent/e2e.json\ningress:\n"
               "  - hostname: app.example.test\n    service: http://localhost:8000\n  - service: http_status:404\n")
 (G / 'config.yml').write_text(
-    f"service_user: root\nmain_domain: example.test\ndefault_storage: {G/'storage'}\ncloudflare_config: {CF}\n"
+    f"service_user: nobody\nmain_domain: example.test\ndefault_storage: {G/'storage'}\ncloudflare_config: {CF}\n"
     f"ats_home: {G/'home'}\ncloudflared_service: ats-e2e-tunnel\nservice_group: root\n")
 (G / 'config.yml').chmod(0o600)
 
@@ -384,6 +384,31 @@ try:
     probe = http.client.HTTPConnection('127.0.0.1', HOOK_PORT, timeout=10); probe.request('GET', '/webhook/hooksvc')
     check(probe.getresponse().status == 405, 'GET is refused with 405'); probe.close()
     os.killpg(hook_daemon.pid, signal.SIGTERM)
+
+
+    step('Terminal on a Global through the Local Monitor (real PTY, unprivileged shell, signed relay)')
+    def terminal_run(mode, server):
+        rc, out, err = sh([VENV, str(HERE / 'terminal_client.py'), base_url, 'e2e-password', server, mode], lenv, timeout=150)
+        return rc, (out + err).strip()
+    def shells():
+        return int(sh(['/bin/sh', '-c', 'ps -u nobody -o comm= | grep -c "^bash$" || true'], base)[1].strip() or 0)
+    before = shells()
+    rc, out = terminal_run('shell', sid)
+    check(rc == 0 and 'RELAYED_OK' in out, f'Global shell through the Monitor: command output, resize, Ctrl-C, UTF-8, exit: {out[-260:]}')
+    rc, out = terminal_run('bad', 'f' * 32)
+    check(rc == 0 and 'Unknown server' in out, f'an unknown server is refused with a reason in the terminal: {out[-120:]}')
+    rc, out = terminal_run('abandon', sid)
+    check(rc == 0 and 'ABANDONED' in out, 'a session is opened and the browser tab is closed without typing exit')
+    end = time.time() + 20
+    while shells() > before and time.time() < end:
+        time.sleep(0.5)
+    check(shells() <= before, 'closing the browser ends the shell on the Global (no leftover process)')
+    call('POST', f'/api/servers/{sid}/disconnect', {}, headers={'X-CSRF-Token': csrf()})
+    rc, out = terminal_run('bad', sid)
+    check(rc == 0 and 'disconnected or revoked' in out, f'a disconnected Global gets a clear message, not a hang: {out[-140:]}')
+    call('POST', f'/api/servers/{sid}/reconnect', {}, headers={'X-CSRF-Token': csrf()})
+    status, body = call('GET', f'/api/servers/{sid}/health')
+    check(status == 200 and body.get('terminal') is True, f'health advertises the terminal capability: {body}')
 
     step('Failure explanations: tunnel route removed / daemon stopped / tunnel down')
     original = CF.read_text()

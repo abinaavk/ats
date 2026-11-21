@@ -259,10 +259,25 @@ data, panels, confirmations, polling and sockets. The previous server's detached
 jobs keep running there and can be viewed by switching back. A disconnected,
 revoked, missing or unknown target produces an error with no Local fallback.
 Account/Devices/Themes remain primary browser administration; host settings and
-all host data/operations target the selected server. Current Global capability
-does not include interactive terminal or Docker exec shell transport; those UIs
-report unavailable and reject local-shell connections for remote selections.
-Use the operator's authenticated SSH session if interactive access is needed.
+all host data/operations target the selected server. The Terminal tab and the Docker
+shell also work on a Global (see *Terminals on a Global* below); a remote selection never gets a
+shell on the Local.
+
+## Terminals on a Global
+
+The Monitor relays a browser terminal to the Global over the same signed HTTPS route as every other
+call (`term.open`, `term.read` long poll, `term.input`, `term.resize`, `term.close`): no extra tunnel
+route, port or WebSocket is needed, and the request signature, destination identity and replay checks
+apply to each call.
+
+* The shell runs as the **ATS service user** (or `ATS_TERMINAL_USER`), never as root. If that user is root,
+  terminals stay disabled unless you set `ATS_TERMINAL_ALLOW_ROOT=1` deliberately.
+* At most 3 terminals per Global; idle ones close after 10 minutes; closing the browser tab ends the shell.
+* Keystrokes and output are relayed in memory only. The Global's journal records only that a session opened or
+  closed (`terminal <id> opened (shell) as <user>`).
+* `ATS_TERMINAL=off` in the daemon environment disables terminals on that Global. `server doctor` and the
+  Servers page show whether a Global's terminal is available and why not.
+* A Global must run this ATS version; an older one answers with a hint to update.
 
 ## Disconnect, reconnect and revoke
 
