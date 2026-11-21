@@ -32,8 +32,12 @@ MANAGED = '# ATS managed Global setup\n'
 
 def run(argv, *, check=True, env=None, timeout=45):
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env,
+                                stdin=subprocess.DEVNULL)  # never inherit a terminal: an older companion would wait on it
     except (OSError, subprocess.TimeoutExpired) as exc:
+        if isinstance(exc, subprocess.TimeoutExpired) and len(argv) == 3 and argv[2] == '--check':
+            raise ValueError('The Monitor companion at '+argv[1]+' did not answer its self-check in time; '
+                             'it is probably an older version. Update it (git pull in that directory) and retry') from exc
         raise ValueError('Could not complete '+argv[0]+' '+argv[1]+'; inspect the host locally') from exc
     if check and result.returncode:
         # Tool stderr/configuration can contain tokens. Keep it off the console.

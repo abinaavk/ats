@@ -305,6 +305,20 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(any(c[:2] in (['systemctl','start'],['systemctl','enable'],['systemctl','daemon-reload']) for c in self.calls))
         self.assertEqual(list(self.unitdir.iterdir()),[])
 
+    def test_subprocesses_never_inherit_the_terminal_and_an_old_companion_is_named(self):
+        # Regression: an older remote_host.py reads stdin for any invocation; with an inherited
+        # terminal, doctor/setup hung until the timeout and reported "inspect the host locally".
+        old=self.root/'old_remote_host.py'
+        old.write_text('import json,sys\njson.load(sys.stdin)\n')
+        r=setup.run([sys.executable,str(old),'--check'],check=False)
+        self.assertNotEqual(r.returncode,0)
+        self.assertEqual(r.stdout,'')
+        plan=self.plan()
+        plan['adapter_env']=dict(plan['adapter_env'],ATS_MONITOR_ADAPTER=str(old))
+        with self.assertRaisesRegex(ValueError,'no adapter self-check'):setup.adapter_check(plan)
+        with patch('subprocess.run',side_effect=subprocess.TimeoutExpired(['x'],1)),self.assertRaisesRegex(ValueError,'older version'):
+            setup.run([sys.executable,str(old),'--check'])
+
     def test_outdated_companion_without_self_check_is_explained(self):
         self.adapter_report=None
         with self.assertRaisesRegex(ValueError,'no adapter self-check'):self.apply()
