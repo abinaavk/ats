@@ -5,7 +5,7 @@ import hmac
 import json
 import re
 import time
-from ats_cluster import Store, remote
+from ats_cluster import Store, TransportError, remote
 
 
 def route(store, target, headers, body):
@@ -54,6 +54,19 @@ def route(store, target, headers, body):
         for nonce in (delivery, fingerprint):
             db.execute('INSERT INTO seen VALUES(?,?,?,\'pending\',?)', ('webhook', nonce, time.time(), data))
     return row, payload, delivery
+
+
+def failure_reason(a, exc):
+    """Why a delivery failed, in words an operator can act on, without credentials.
+
+    ATS validators and the signed transport write their own messages; anything else
+    (git, filesystem, database) is shown as its type plus a redacted, bounded message.
+    The retry advice stays: a failed delivery may have partly run.
+    """
+    text = a.redact_repo_url(str(exc))[:240] if str(exc) else ''
+    own = isinstance(exc, (TransportError, ValueError))
+    reason = text if own and text else (type(exc).__name__ + (': ' + text if text else ''))
+    return reason + ' (inspect the destination before a manual retry)'
 
 
 async def receive(a, target, headers, body):
@@ -105,9 +118,10 @@ async def process(a, store, delivery):
             if result.get('status', 500) >= 400:
                 raise ValueError('Global deployment request failed')
         status = 'updated' if server['local'] else 'dispatched'
-    except Exception:
+    except Exception as exc:
         # Do not blindly retry an operation whose result may be ambiguous.
-        result = {'error': 'Delivery failed or outcome unknown; inspect destination before a manual retry'}
+        result = {'error': failure_reason(a, exc)}
+        a.logger.warning('Webhook delivery %s for %s failed: %s', delivery, mapping.get('service'), result['error'])
     with store.db() as db:
         db.execute('UPDATE seen SET state=?,result=? WHERE scope=\'webhook\' AND nonce=?', (status, json.dumps(result), delivery))
     a.record_webhook_event(mapping['service'], 'push', data['payload']['ref'], data['payload']['after'],

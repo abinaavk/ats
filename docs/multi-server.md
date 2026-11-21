@@ -204,6 +204,22 @@ policy after setup.
 
 ## Repository mappings and GitHub
 
+### Easiest ways to create a mapping
+
+```sh
+# A Local service that already has a GitHub webhook: reuse its repository, branch and secret.
+# GitHub keeps working with no change (same payload URL and secret).
+sudo python3 app.py server map --from-service SERVICE
+
+# Any server (including a Global): generate a fresh secret, shown once, and print what GitHub needs.
+sudo python3 app.py server map --repository owner/repo --server-id SERVER_ID --service SERVICE --generate-secret
+```
+
+Manage's per-service webhook secret is only honoured by the central receiver once the service is mapped.
+Manage's Webhook tab shows whether it is (**Central receiver: mapped / not mapped**) and the exact command when not.
+The `--secret-file` form below still works. A delivery that fails after acceptance is recorded with its real
+reason (for example a missing service directory or a rejected passkey), not a generic message.
+
 Create a separate random GitHub webhook secret in a private file, for example by
 using an operator secret manager. It must contain a 64-character random hex key.
 Register each destination **explicitly** on Local:

@@ -37,8 +37,10 @@ def _main():
     parser.add_argument('--server-id', help='Saved Global ID (replace-credentials: detected from the pairing file when omitted)')
     parser.add_argument('--repository')
     parser.add_argument('--service')
-    parser.add_argument('--branch', default='main')
+    parser.add_argument('--branch', help='Branch to track (default: the service\'s branch with --from-service, else main)')
     parser.add_argument('--secret-file')
+    parser.add_argument('--from-service', metavar='NAME', help='map: map a Local service using its existing repository, branch and webhook secret')
+    parser.add_argument('--generate-secret', action='store_true', help='map: create a fresh webhook secret and show it once')
     parser.add_argument('--replace-mapping', action='store_true')
     parser.add_argument('--json', action='store_true', help='doctor: machine-readable output')
     args = parser.parse_args()
@@ -52,8 +54,14 @@ def _main():
         parser.error('--pairing-file is required')
     if args.action in ('disconnect', 'reconnect', 'revoke') and not args.server_id:
         parser.error('--server-id is required')
-    if args.action == 'map' and not all((args.secret_file, args.repository, args.server_id, args.service)):
-        parser.error('map requires --secret-file, --repository, --server-id and --service')
+    if args.action == 'map':
+        if args.from_service:
+            if args.secret_file or args.generate_secret or args.service or (args.server_id and args.server_id != ''):
+                parser.error('--from-service maps that Local service with its own secret; do not combine it with --secret-file, --generate-secret, --service or --server-id')
+        elif not (args.repository and args.server_id and args.service):
+            parser.error('map requires --repository, --server-id and --service (or --from-service NAME for a Local service)')
+        elif bool(args.secret_file) == bool(args.generate_secret):
+            parser.error('map needs exactly one of --secret-file or --generate-secret')
     store = Store()
     if args.action == 'configure':
         try:
@@ -116,10 +124,7 @@ def _main():
             store.pair(bundle['id'], args.name or bundle['name'], bundle['domain'], bundle['secret'])
             print('Global server paired and verified')
     elif args.action == 'map':
-        with open(args.secret_file) as f:
-            secret = f.read().strip()
-        store.mapping(args.repository, args.server_id, args.service, args.branch, secret, replace=args.replace_mapping)
-        print('Explicit webhook mapping saved')
+        map_repository(store, args)
     elif args.action == 'unmap':
         if not args.repository:
             parser.error('--repository is required')
@@ -203,6 +208,64 @@ def configure(store, args, interactive):
     else:
         store.configure(role, label, origin, host)
         print('Local configuration saved. Existing webhook routes were preserved.')
+
+
+def ats_database():
+    """This instance's service database, found the same way the daemon finds it."""
+    instance = os.environ.get('ATS_INSTANCE', '')
+    path = os.environ.get('ATS_CONFIG_FILE') or ('/etc/ats/config-' + instance + '.yml' if instance and all(c.isalnum() or c in '_-' for c in instance) else '/etc/ats/config.yml')
+    with open(path) as f:
+        settings = yaml.safe_load(f) or {}
+    return Path(settings.get('ats_home') or os.environ.get('ATS_HOME') or '/home/gaia') / 'ats.db'
+
+
+def github_repository(url):
+    """owner/repository from an https or ssh GitHub URL."""
+    import re
+    match = re.fullmatch(r'(?:https://(?:[^/@\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?', (url or '').strip())
+    if not match:
+        raise ValueError('The service repository is not a github.com URL; pass --repository owner/repository')
+    return match.group(1)
+
+
+def map_repository(store, args):
+    """Create an explicit webhook mapping, then say exactly what GitHub needs."""
+    import re
+    node = store._local()
+    generated = None
+    if args.from_service:
+        path = ats_database()
+        if not path.is_file():
+            raise ValueError('ATS database not found at ' + str(path))
+        with sqlite3.connect('file:' + str(path) + '?mode=ro', uri=True) as db:
+            row = db.execute('SELECT name,repo_url,branch,webhook_secret FROM services WHERE name=?', (args.from_service,)).fetchone()
+        if not row:
+            raise ValueError('No Local service named ' + args.from_service)
+        repository = args.repository or github_repository(row[1])
+        secret = row[3]
+        if not re.fullmatch('[0-9a-f]{64}', secret or ''):
+            raise ValueError('That service has no usable webhook secret; map it with --generate-secret instead')
+        server_id, service, branch = node['id'], row[0], args.branch or row[2] or 'main'
+    else:
+        repository, server_id, service, branch = args.repository, args.server_id, args.service, args.branch or 'main'
+        if args.generate_secret:
+            secret = generated = secrets.token_hex(32)
+        else:
+            with open(args.secret_file) as f:
+                secret = f.read().strip()
+    target = store.server(server_id)
+    store.mapping(repository, server_id, service, branch, secret, replace=args.replace_mapping)
+    print(f"Explicit webhook mapping saved: {repository} -> {service} on {target['name']} (branch {branch})")
+    print('In GitHub: Settings -> Webhooks -> Add webhook')
+    print(f"  Payload URL : https://{node['webhook']}/webhook/{service}")
+    print('  Content type: application/json    Events: just the push event    SSL verification: on')
+    if generated:
+        print('  Secret      : ' + generated)
+        print('  (shown once; paste it into GitHub now. It is stored only in the private cluster registry.)')
+    elif args.from_service:
+        print("  Secret      : the service's existing webhook secret. A GitHub webhook that already uses this URL and secret needs no change.")
+    else:
+        print('  Secret      : the one in your secret file')
 
 
 def setup_global(store, args):
