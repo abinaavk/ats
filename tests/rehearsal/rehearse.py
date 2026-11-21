@@ -6,7 +6,7 @@ stand-in systemctl), the real Monitor adapter under a Flask-only interpreter, a 
 that routes strictly by the generated Cloudflare YAML, and a real Local Monitor under gunicorn.
 Real `systemd-analyze` and `cloudflared ... ingress validate` check the generated files.
 
-Needs: root, free port 443, a sibling ats-monitor checkout (or ATS_MONITOR_DIR), PyYAML and Flask for
+Needs: root, free ports 443, 9999, 19997, 19998, a sibling ats-monitor checkout (or ATS_MONITOR_DIR), PyYAML and Flask for
 REHEARSAL_GLOBAL_PYTHON (default /usr/bin/python3), and the Monitor requirements for
 REHEARSAL_MONITOR_PYTHON (default: this interpreter). It touches nothing outside a temporary directory
 (deleted afterwards; pass --keep to retain it) and never calls the host's systemctl or cloudflared service.
@@ -21,7 +21,11 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import hashlib
+import hmac
+import http.client
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -35,7 +39,7 @@ ATS_SRC = HERE.parents[1]
 MON = Path(os.environ.get('ATS_MONITOR_DIR') or ATS_SRC.parent / 'ats-monitor')
 VENV = os.environ.get('REHEARSAL_MONITOR_PYTHON') or sys.executable
 SYSPY = os.environ.get('REHEARSAL_GLOBAL_PYTHON') or '/usr/bin/python3'   # ideally Flask only, like a clean Global
-PORT, TLS_PORT, MON_PORT = 19997, 443, 19998
+PORT, TLS_PORT, MON_PORT, HOOK_PORT = 19997, 443, 19998, 9999
 failures, procs = [], []
 
 
@@ -53,7 +57,7 @@ if os.geteuid() != 0:
     skip('ATS is root-only; run with sudo')
 if not (MON / 'remote_host.py').is_file():
     skip(f'ats-monitor checkout not found at {MON}; set ATS_MONITOR_DIR')
-for _port in (TLS_PORT, PORT, MON_PORT):
+for _port in (TLS_PORT, PORT, MON_PORT, HOOK_PORT):
     if not port_free(_port):
         skip(f'port {_port} is in use on this host')
 KEEP = '--keep' in sys.argv
@@ -285,6 +289,101 @@ try:
     check(status == 200, f're-paired with the refreshed file: {status} {body}')
     status, body = call('GET', '/api/manage/services', headers=target)
     check(status == 200, 'management works after re-pairing')
+
+
+    step('GitHub webhook -> real Local receiver -> real Global (signed, explicit mapping)')
+    (L / 'config.yml').write_text(
+        f"service_user: root\nmain_domain: example.test\ndefault_storage: {L/'storage'}\ncloudflare_config: {L/'cloudflared.yml'}\n"
+        f"ats_home: {L/'home'}\ncloudflared_service: ats-e2e-tunnel\nservice_group: root\n")
+    (L / 'config.yml').chmod(0o600)
+    (L / 'cloudflared.yml').write_text('tunnel: local\ningress:\n  - service: http_status:404\n')
+    local_ats = dict(base, ATS_CONFIG_FILE=str(L / 'config.yml'), ATS_CLUSTER_DB=str(L / 'cluster.sqlite3'))
+    # Create each ATS database, then a service on the Global and one on the Local for the mappings to target.
+    check(sh([SYSPY, str(ATS / 'app.py'), '--api', 'services.list'], local_ats, stdin='{}')[0] == 0, 'Local ATS CLI initialised its database')
+    def add_service(home, name, port):
+        with sqlite3.connect(home / 'ats.db') as database:
+            database.execute("INSERT INTO services(name,port,domain,storage_path,repo_url,branch) VALUES(?,?,?,?,?,'main')",
+                             (name, port, f'{name}.example.test', str(E / 'storage'), 'https://github.com/owner/' + name + '.git'))
+    add_service(G / 'home', 'hooksvc', 18080)
+    add_service(L / 'home', 'localsvc', 18081)
+    def map_with(argv, label):
+        rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'map', *argv], local_ats)
+        check(rc == 0, f'server map {label}: {(out + err).strip()[-110:]}')
+        return out
+    # A Global service gets a freshly generated secret that is shown once.
+    out = map_with(['--repository', 'owner/hooksvc', '--server-id', sid, '--service', 'hooksvc', '--branch', 'main', '--generate-secret'], '--generate-secret (Global)')
+    shown = re.search(r'Secret\s*: ([0-9a-f]{64})', out)
+    check(bool(shown) and 'shown once' in out and 'webhook/hooksvc' in out, 'the generated secret and the GitHub payload URL are printed once')
+    remote_secret = shown.group(1) if shown else ''
+    # A Local service that already had an old-style per-service secret keeps working with no GitHub change.
+    legacy_secret = os.urandom(32).hex()
+    with sqlite3.connect(L / 'home' / 'ats.db') as database:
+        database.execute('UPDATE services SET webhook_secret=? WHERE name=?', (legacy_secret, 'localsvc'))
+    out = map_with(['--from-service', 'localsvc'], '--from-service (Local, existing secret)')
+    check('needs no change' in out and legacy_secret not in out, 'the existing secret is reused and never echoed')
+    local_secret = legacy_secret
+    local_id = json.loads(sh([VENV, '-c', f"import sys,json;sys.path.insert(0,'{ATS}');import ats_cluster;print(json.dumps(ats_cluster.Store().node()['id']))"], lenv)[1])
+    hook_daemon = subprocess.Popen([SYSPY, str(ATS / 'app.py'), '--daemon'], env=local_ats, cwd=str(ATS),
+                                   stdout=open(E / 'local-daemon.log', 'w'), stderr=subprocess.STDOUT, start_new_session=True)
+    procs.append(hook_daemon)
+    check(wait_port(HOOK_PORT, 60), 'Local daemon is listening for webhooks on 127.0.0.1:9999')
+
+    def deliver(secret, repo='owner/hooksvc', service='hooksvc', event='push', ref='refs/heads/main', delivery=None, commit=None, signature=None, path=None):
+        body = json.dumps({'repository': {'full_name': repo}, 'ref': ref, 'after': commit or os.urandom(20).hex(), 'deleted': False}).encode()
+        mac = signature or 'sha256=' + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        connection = http.client.HTTPConnection('127.0.0.1', HOOK_PORT, timeout=30)
+        connection.request('POST', path or '/webhook/' + service, body, {'X-GitHub-Event': event, 'X-GitHub-Delivery': delivery or os.urandom(8).hex(),
+                                                                         'X-Hub-Signature-256': mac, 'Content-Type': 'application/json'})
+        response = connection.getresponse(); text = response.read().decode(); connection.close()
+        return response.status, text, body
+    def events(service):
+        with sqlite3.connect(L / 'home' / 'ats.db') as database:
+            return database.execute('SELECT result,message FROM webhook_events WHERE service_name=? ORDER BY id', (service,)).fetchall()
+    def wait_event(service, count, seconds=60):
+        end = time.time() + seconds
+        while time.time() < end:
+            rows = events(service)
+            if len(rows) >= count and rows[count - 1][0] not in ('pending', 'running'):
+                return rows[count - 1]
+            time.sleep(0.5)
+        return events(service)[count - 1] if len(events(service)) >= count else None
+
+    status, text, _ = deliver(remote_secret, event='ping'); check(status == 200, f'GitHub ping accepted: {status} {text}')
+    check(deliver(remote_secret, signature='sha256=' + '0' * 64)[0] == 401, 'a wrong signature is rejected (401)')
+    check(deliver(remote_secret, signature='nonsense')[0] == 401, 'a malformed signature is rejected (401)')
+    check(deliver(remote_secret, repo='owner/unmapped')[0] == 400, 'an unmapped repository is rejected (400)')
+    check(deliver(remote_secret, ref='refs/heads/other')[0] == 400, 'a push to another branch is rejected (400)')
+    check(deliver(remote_secret, path='/webhook/localsvc')[0] == 400, 'the wrong service path is rejected (400)')
+    check(deliver(remote_secret, repo='owner/localsvc', service='localsvc')[0] == 401, "one repository's secret cannot trigger another's mapping (401)")
+    check(not events('hooksvc'), 'rejected deliveries start nothing')
+
+    status, text, body = deliver(remote_secret, delivery='delivery-1', commit='b' * 40)
+    check(status == 202, f'valid push accepted before work starts: {status} {text}')
+    result = wait_event('hooksvc', 1)
+    check(result is not None and result[0] == 'dispatched', f'Local forwarded it to the Global (event recorded as dispatched): {result}')
+    jobs = [json.loads(m.read_text()) for m in (G / 'adapter' / 'jobs').glob('*/meta.json')]
+    check(any(j.get('op') == 'services.action' and j.get('name') == 'hooksvc' for j in jobs), 'the Global started its own update job for hooksvc (jobs: %s)' % [(j.get("op"), j.get("name")) for j in jobs])
+    check(any(j.get('server_id') == sid for j in jobs), 'the job is stamped with the Global identity, not the Local')
+    status, text, _ = deliver(remote_secret, delivery='delivery-1', commit='b' * 40)
+    check(status == 200 and 'Duplicate' in text, f'an exact replay is not deployed twice: {status} {text}')
+    check(len(events('hooksvc')) == 1, 'the replay created no second update')
+
+    status, text, _ = deliver(local_secret, repo='owner/localsvc', service='localsvc', commit='c' * 40)
+    check(status == 202, f'push mapped to the Local itself is accepted: {status}')
+    result = wait_event('localsvc', 1)
+    check(result is not None and result[0] in ('updated', 'failed'), f'Local update was attempted and its outcome recorded (never stuck pending): {result}')
+    check(result is not None and 'Delivery failed or outcome unknown' not in result[1] and 'inspect the destination' in result[1], f'a failure states its real reason, not a generic message: {result and result[1][:140]}')
+
+    call('POST', f'/api/servers/{sid}/disconnect', {}, headers={'X-CSRF-Token': csrf()})
+    status, text, _ = deliver(remote_secret, commit='d' * 40)
+    check(status == 503, f'a disconnected Global is not contacted: {status} {text}')
+    check(len(events('hooksvc')) == 1, 'nothing was dispatched while disconnected')
+    call('POST', f'/api/servers/{sid}/reconnect', {}, headers={'X-CSRF-Token': csrf()})
+    status, text, _ = deliver(remote_secret, commit='e' * 40)
+    check(status == 202 and wait_event('hooksvc', 2) and wait_event('hooksvc', 2)[0] == 'dispatched', 'after reconnecting, deliveries are forwarded again')
+    probe = http.client.HTTPConnection('127.0.0.1', HOOK_PORT, timeout=10); probe.request('GET', '/webhook/hooksvc')
+    check(probe.getresponse().status == 405, 'GET is refused with 405'); probe.close()
+    os.killpg(hook_daemon.pid, signal.SIGTERM)
 
     step('Failure explanations: tunnel route removed / daemon stopped / tunnel down')
     original = CF.read_text()

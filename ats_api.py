@@ -120,6 +120,15 @@ def webhook(a,args):
     result={'listener':{'url':'https://'+host,'port':a.WEBHOOK_PORT,'bind':a.webhook_bind_address(),'active':a.check_port_listening(a.WEBHOOK_PORT),'route_present':any(r.get('hostname')==host for r in entries)}}
     if args.get('name'):
         s=service(a,args);result['service']=dict(a.get_webhook_info(s['name']),last_events=a.list_webhook_events(s['name'],20))
+        # The central receiver only accepts deliveries for an explicit mapping; say whether this service has one.
+        try:
+            import ats_cluster
+            store=ats_cluster.Store();node=store.node()
+            with store.db() as db:
+                row=db.execute('SELECT repository FROM routes WHERE server_id=? AND service=?',(node['id'],s['name'])).fetchone()
+            result['service'].update(mapped=bool(row),mapped_repository=row['repository'] if row else None)
+        except Exception:
+            result['service'].update(mapped=None,mapped_repository=None)
     return result
 
 
