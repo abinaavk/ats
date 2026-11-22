@@ -179,6 +179,9 @@ def dependencies(a):
                 r=command([key,'version' if key=='openssl' else '--version'],timeout=10);good=r.returncode==0;version=(r.stdout or r.stderr).splitlines()[0][:200]
             except (OSError,subprocess.SubprocessError,IndexError):good=False
         result[key]={'ok':good,'version':version,'hint':'' if good else 'Install '+key+' on the host'}
+        if not good and key in runtime.INSTALLABLE:
+            manager=runtime.package_manager()
+            result[key].update(installable=bool(manager),package_manager=manager,hint='Install '+key+' on this server from the '+manager+' packages' if manager else result[key]['hint'])
     try:result['venv']={'ok':command(['python3','-m','venv','--help']).returncode==0}
     except (OSError,subprocess.SubprocessError):result['venv']={'ok':False}
     try:

@@ -1,7 +1,9 @@
 """Noninteractive ATS service operations, shared with signed webhook updates."""
+import collections
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -9,6 +11,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 
 
@@ -414,49 +417,349 @@ def cloudflare(a, op, args):
         return {'added':added,'fixed':fixed,'removed':[]}
 
 
+GONE = re.compile(r'not loaded|not-found|not found|does not exist|no such (file|unit|container|image)|could not be found|unknown (unit|container)', re.I)
+MISSING = object()
+
+
+def tolerant(argv, what, timeout=60):
+    """Run one cleanup command. Success and "already gone" both mean done.
+
+    Returns None when done, MISSING when the program is not installed, otherwise a short reason.
+    """
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f'{what} timed out after {timeout}s'
+    except FileNotFoundError:
+        return MISSING
+    except OSError as exc:
+        return f'{what} failed: {exc.strerror or exc}'
+    if result.returncode == 0:
+        return None
+    text = (result.stderr or result.stdout or '').strip()
+    return None if GONE.search(text) else f'{what} failed: {text[-300:]}'
+
+
 def delete(a, args):
+    """Delete a service as a series of idempotent steps.
+
+    Every step may be repeated, so an interrupted or partly failed delete is finished by simply running it
+    again. Cleanup that cannot matter for the outcome (a stopped container, a missing unit, a Cloudflare
+    route that cannot be edited right now) is reported as a warning instead of blocking the delete.
+    """
     name = a.validate_service_name(args['name'])
     if args.get('confirm') != name: raise ValueError('Type the service name to confirm deletion')
+    warnings = []
+    log = getattr(a, 'api_log', lambda message, level='info': None)
+
+    def warn(message):
+        warnings.append(message)
+        log(message, 'warn')
+
     with global_lock(a), a.service_lock(name):
-        s = row(a,name)
-        if args.get('backup_first') and not a.create_local_backup(s): raise a.ServiceOpError('Backup failed; deletion cancelled')
-        a._systemctl('stop',name)
-        a.run_root(['systemctl','disable',name])
-        a.cloudflare.remove_route(s['domain'])
-        directory, database = paths(a,s)
-        if s['runtime']=='docker':
-            for command in (['docker','rm','-f','ats-'+name],['docker','rmi','ats-'+name+':latest']):
-                rc = subprocess.run(command,capture_output=True,text=True,timeout=120)
-                if rc.returncode and 'No such' not in rc.stderr: raise a.ServiceOpError(rc.stderr[-500:])
-        for path in (a._unit_path(name),os.path.join(getattr(a,'LOGROTATE_DIR','/etc/logrotate.d'),'ats-'+name)):
-            if os.path.lexists(path): os.unlink(path)
-        if args.get('delete_files',True):
-            for path in (directory,database):
-                if os.path.islink(path): raise ValueError('Refusing to delete a symlinked service path')
-                if os.path.isdir(path): shutil.rmtree(path)
-        if args.get('delete_backups',False):
-            for backup in a.db.query('SELECT * FROM backups WHERE service_name=?',(name,),fetch_all=True):
-                filename=backup['filename']
-                if os.path.basename(filename)!=filename: raise ValueError('Invalid backup record')
-                if backup['location']=='gdrive':
-                    result = subprocess.run(['rclone','deletefile',a.GDRIVE_FOLDER+'/'+name+'/'+filename],capture_output=True,text=True,timeout=120)
-                    if result.returncode: raise a.ServiceOpError('Drive backup deletion failed: '+result.stderr[-500:])
-                else:
-                    path=backup['local_path'] or os.path.join(a.BACKUP_DIR,filename)
-                    if os.path.islink(path): raise ValueError('Refusing a symlinked backup')
-                    if os.path.isfile(path): os.unlink(path)
-            sql(a,'DELETE FROM backups WHERE service_name=?',(name,))
-        # Preserve backup records unless their deletion was explicitly requested.
-        with contextlib.closing(sqlite3.connect(a.DB_FILE)) as conn:
-            with conn: conn.execute('DELETE FROM services WHERE name=?',(name,))
-        a.run_root(['systemctl','daemon-reload'])
-        a.audit_log('SERVICE_DELETE',name)
-        return {'deleted':True}
+        s = row(a, name)
+        directory, database = paths(a, s)
+        if args.get('backup_first'):
+            def backup():
+                if not a.create_local_backup(s): raise a.ServiceOpError('Backup failed; nothing was deleted')
+            step(a, 'backup', backup)
+
+        def stop():
+            problem = tolerant(['systemctl', 'stop', name], 'Stopping ' + name, 120)
+            if problem is MISSING: raise a.ServiceOpError('systemctl is not available on this server')
+            if problem: raise a.ServiceOpError(problem)
+            if a.check_systemd_active(name): raise a.ServiceOpError(name + ' is still running after the stop request; nothing else was deleted')
+        step(a, 'stop', stop)
+
+        def disable():
+            problem = tolerant(['systemctl', 'disable', name], 'Disabling ' + name)
+            if problem and problem is not MISSING: warn(problem)
+        step(a, 'disable', disable)
+
+        def route():
+            try:
+                a.cloudflare.remove_route(s['domain'])
+            except Exception as exc:
+                warn(f"The Cloudflare route for {s['domain']} was not removed ({str(exc).splitlines()[0][:200] if str(exc) else type(exc).__name__}). "
+                     'The service is deleted anyway; run Cloudflare sync or edit the tunnel config to drop the route.')
+        step(a, 'cloudflare', route)
+
+        if s['runtime'] == 'docker':
+            def container():
+                if not shutil.which('docker'):
+                    warn('Docker is not installed on this server, so the container and image could not be removed (there is nothing to remove if it never ran).')
+                    return
+                for command in (['docker', 'rm', '-f', 'ats-' + name], ['docker', 'rmi', 'ats-' + name + ':latest']):
+                    problem = tolerant(command, ' '.join(command[:2]), 120)
+                    if problem and problem is not MISSING: warn(problem)
+            step(a, 'container', container)
+
+        def units():
+            for path in (a._unit_path(name), os.path.join(getattr(a, 'LOGROTATE_DIR', '/etc/logrotate.d'), 'ats-' + name)):
+                try:
+                    if os.path.lexists(path): os.unlink(path)
+                except OSError as exc:
+                    raise a.ServiceOpError(f'Could not remove {path}: {exc.strerror}')
+        step(a, 'unit', units)
+
+        if args.get('delete_files', True):
+            def files():
+                for path in (directory, database):
+                    if os.path.islink(path): raise ValueError('Refusing to delete a symlinked service path')
+                    if os.path.isdir(path):
+                        try:
+                            shutil.rmtree(path)
+                        except OSError as exc:
+                            raise a.ServiceOpError(f'Could not delete {path}: {exc.strerror}. Fix the permissions or close what is using it, then run the delete again.')
+            step(a, 'files', files)
+
+        if args.get('delete_backups', False):
+            def backups():
+                for backup in a.db.query('SELECT * FROM backups WHERE service_name=?', (name,), fetch_all=True):
+                    filename = backup['filename']
+                    if os.path.basename(filename) != filename: raise ValueError('Invalid backup record')
+                    done = True
+                    if backup['location'] == 'gdrive':
+                        problem = tolerant(['rclone', 'deletefile', a.GDRIVE_FOLDER + '/' + name + '/' + filename], 'Drive backup ' + filename, 120)
+                        if problem is MISSING:
+                            warn(f'rclone is not installed, so the Google Drive backup {filename} was kept (its record stays so you can delete it later).')
+                            done = False
+                        elif problem:
+                            warn(problem + ' (record kept)')
+                            done = False
+                    else:
+                        path = backup['local_path'] or os.path.join(a.BACKUP_DIR, filename)
+                        if os.path.islink(path): raise ValueError('Refusing a symlinked backup')
+                        try:
+                            if os.path.isfile(path): os.unlink(path)
+                        except OSError as exc:
+                            warn(f'Could not delete backup {filename}: {exc.strerror} (record kept)')
+                            done = False
+                    if done: sql(a, 'DELETE FROM backups WHERE id=?', (backup['id'],))
+            step(a, 'backups', backups)
+
+        def record():
+            # Backup records not deleted above are kept on purpose.
+            with contextlib.closing(sqlite3.connect(a.DB_FILE)) as conn:
+                with conn: conn.execute('DELETE FROM services WHERE name=?', (name,))
+        step(a, 'record', record)
+
+        def reload():
+            problem = tolerant(['systemctl', 'daemon-reload'], 'systemctl daemon-reload')
+            if problem and problem is not MISSING: warn(problem)
+        step(a, 'reload', reload)
+        a.audit_log('SERVICE_DELETE', name, {'warnings': len(warnings)})
+        return {'deleted': True, 'warnings': warnings}
+
+
+
+# ── Cloudflare tunnel config file: read and edit safely ──
+CF_MAX = 512 * 1024
+CF_BACKUP = re.compile(r'\.bak-\d{8}-\d{6}\Z')
+
+
+def cloudflare_file(a, op, args):
+    """Read or replace the configured tunnel config. Only the path in ATS's own settings is ever touched.
+
+    A change is validated (YAML shape plus `cloudflared ingress validate` when installed), the previous file is
+    kept as a timestamped backup, the write is atomic and keeps owner and mode, and if cloudflared will not
+    start with the new file the previous one is put back.
+    """
+    path = os.path.realpath(a.CLOUDFLARE_CONFIG)
+    warnings = []
+    with global_lock(a):
+        try:
+            with open(path, 'rb') as stream: raw = stream.read(CF_MAX + 1)
+        except FileNotFoundError:
+            raw = None
+        except OSError as exc:
+            raise a.ServiceOpError(f'Cannot read {path}: {exc.strerror}')
+        if raw is not None and len(raw) > CF_MAX: raise ValueError('The Cloudflare config is larger than 512 KiB')
+        digest = hashlib.sha256(raw or b'').hexdigest()
+        services = [dict(x) for x in a.db.query('SELECT * FROM services', fetch_all=True)]
+        if op == 'cloudflare.config.get':
+            return {'path': a.CLOUDFLARE_CONFIG, 'exists': raw is not None, 'content': (raw or b'').decode('utf-8', 'replace'),
+                    'sha256': digest, 'service': a.CLOUDFLARED_SERVICE, 'active': a.check_systemd_active(a.CLOUDFLARED_SERVICE),
+                    'validator': bool(shutil.which('cloudflared'))}
+        content, base, restart = args.get('content'), args.get('base_sha256'), args.get('restart', True)
+        if not isinstance(content, str) or '\x00' in content: raise ValueError('content must be text')
+        if not isinstance(base, str) or not re.fullmatch('[0-9a-f]{64}', base): raise ValueError('base_sha256 is required')
+        if not isinstance(restart, bool): raise ValueError('restart must be true or false')
+        text = content.replace('\r\n', '\n')
+        text = text if text.endswith('\n') else text + '\n'
+        if len(text.encode()) > CF_MAX: raise ValueError('The Cloudflare config is larger than 512 KiB')
+        if base != digest:
+            raise a.ServiceOpError('The file changed on the server after you opened it. Reload it and apply your edit again.', 'conflict')
+        try:
+            before = a.yaml.safe_load((raw or b'').decode('utf-8', 'replace')) or {}
+        except a.yaml.YAMLError:
+            before = {}
+
+        def validate():
+            try:
+                config = a.yaml.safe_load(text)
+            except a.yaml.YAMLError as exc:
+                raise ValueError('Not valid YAML: ' + (str(exc).splitlines() or ['parse error'])[0][:200])
+            if not isinstance(config, dict): raise ValueError('The file must be a YAML mapping')
+            ingress = config.get('ingress')
+            if not isinstance(ingress, list) or not ingress or any(not isinstance(rule, dict) for rule in ingress):
+                raise ValueError('ingress must be a non-empty list of rules')
+            last = ingress[-1]
+            if last.get('hostname') or last.get('path') or not last.get('service'):
+                raise ValueError('The last ingress rule must be a catch-all with only a service, for example "service: http_status:404"')
+            if any(not rule.get('service') for rule in ingress[:-1]): raise ValueError('Every ingress rule needs a service')
+            if isinstance(before, dict):
+                for key in ('tunnel', 'credentials-file'):
+                    if before.get(key) and not config.get(key): raise ValueError(f'"{key}" must not be removed: the tunnel could not start')
+            if shutil.which('cloudflared'):
+                with tempfile.TemporaryDirectory(prefix='ats-cf-') as scratch:
+                    candidate = os.path.join(scratch, 'config.yml')
+                    atomic(candidate, text)
+                    result = subprocess.run(['cloudflared', 'tunnel', '--config', candidate, 'ingress', 'validate'], capture_output=True, text=True, timeout=30)
+                    if result.returncode:
+                        lines = [line for line in (result.stderr or result.stdout).strip().splitlines() if line.strip()]
+                        raise ValueError('cloudflared rejected the config: ' + (lines[-1][:240] if lines else 'validation failed'))
+            else:
+                warnings.append('cloudflared is not installed here, so only the YAML structure was checked.')
+            return config
+        config = step(a, 'validate', validate)
+
+        saved = {}
+
+        def backup():
+            if raw is None: return
+            stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+            saved['backup'] = f'{path}.bak-{stamp}'
+            atomic(saved['backup'], raw.decode('utf-8', 'replace'))
+            old = sorted(name for name in os.listdir(os.path.dirname(path)) if name.startswith(os.path.basename(path)) and CF_BACKUP.search(name))
+            for name in old[:-10]:
+                try: os.unlink(os.path.join(os.path.dirname(path), name))
+                except OSError: pass
+        step(a, 'backup', backup)
+
+        def replace(data):
+            info = os.stat(path) if raw is not None else None
+            handle, temporary = tempfile.mkstemp(prefix='.ats-cf-', dir=os.path.dirname(path))
+            try:
+                with os.fdopen(handle, 'wb') as stream:
+                    os.fchmod(stream.fileno(), info.st_mode & 0o7777 if info else 0o600)
+                    if info: os.fchown(stream.fileno(), info.st_uid, info.st_gid)
+                    stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            finally:
+                if os.path.exists(temporary): os.unlink(temporary)
+        try:
+            step(a, 'write', lambda: replace(text.encode()))
+        except OSError as exc:
+            raise a.ServiceOpError(f'Could not write {path}: {exc.strerror}')
+
+        restarted = False
+        if restart:
+            def bring_up():
+                try:
+                    a.restart_cloudflared_resilient()
+                except Exception as exc:
+                    try:
+                        if raw is None: os.unlink(path)
+                        else: replace(raw)
+                        a.restart_cloudflared_resilient(max_attempts=1, poll_timeout=15)
+                    except Exception:
+                        pass
+                    first = (str(exc).splitlines() or [type(exc).__name__])[0][:200]
+                    raise a.ServiceOpError(f'cloudflared did not start with the new config, so the previous file was restored ({first})')
+            step(a, 'restart', bring_up)
+            restarted = True
+        else:
+            warnings.append('The file was saved but cloudflared was not restarted, so the running tunnel still uses the old routes.')
+        routes = {rule.get('hostname') for rule in config['ingress'] if isinstance(rule, dict)}
+        a.audit_log('CLOUDFLARE_CONFIG_EDIT', 'SYSTEM', {'bytes': len(text.encode()), 'restarted': restarted})
+        return {'saved': True, 'restarted': restarted, 'backup': saved.get('backup'), 'sha256': hashlib.sha256(text.encode()).hexdigest(),
+                'missing_routes': sorted(x['domain'] for x in services if x['domain'] not in routes), 'warnings': warnings}
+
+
+# ── installing the tools ATS can use but does not require ──
+# The package manager never runs with an inherited PATH (ATS runs as root); tests point this at fakes.
+SAFE_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+INSTALLABLE = {
+    'docker': {'binary': 'docker', 'apt': ['docker.io'], 'dnf': ['docker'], 'label': 'Docker'},
+    'rclone': {'binary': 'rclone', 'apt': ['rclone'], 'dnf': ['rclone'], 'label': 'rclone'},
+}
+
+
+def package_manager():
+    for manager, binary in (('apt', 'apt-get'), ('dnf', 'dnf')):
+        if shutil.which(binary): return manager
+    return None
+
+
+def install_dependency(a, args):
+    """Install Docker or rclone from the distribution's own packages. Nothing is downloaded or run from the internet."""
+    name = args.get('name')
+    if not isinstance(name, str) or name not in INSTALLABLE: raise ValueError('Only docker and rclone can be installed from here')
+    spec = INSTALLABLE[name]
+    log = getattr(a, 'api_log', lambda message, level='info': None)
+    warnings = []
+    with global_lock(a):
+        if shutil.which(spec['binary']):
+            return {'installed': False, 'already': True, 'name': name, 'warnings': []}
+        manager = package_manager()
+        if not manager:
+            raise a.ServiceOpError(f"No supported package manager (apt or dnf) was found. Install {spec['label']} on this server manually.", 'unsupported')
+        packages = spec[manager]
+        env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', LC_ALL='C', PATH=SAFE_PATH)
+
+        def stream(argv, timeout):
+            tail = collections.deque(maxlen=12)
+            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, env=env)
+            timer = threading.Timer(timeout, process.kill)
+            timer.start()
+            try:
+                for line in process.stdout:
+                    line = line.rstrip()
+                    if line:
+                        tail.append(line[:200])
+                        if not line.startswith(('Reading', 'Building', '(Reading')): log(line[:200])
+                code = process.wait()
+            finally:
+                timer.cancel()
+            if code:
+                if any('lock' in line.lower() for line in tail):
+                    raise a.ServiceOpError('The package manager is busy (another update is running). Try again in a few minutes.', 'busy')
+                raise a.ServiceOpError(f'{argv[0]} failed (exit {code}): ' + ' | '.join(list(tail)[-3:]))
+
+        if manager == 'apt':
+            step(a, 'prepare', lambda: stream(['apt-get', 'update', '-qq'], 300))
+        else:
+            step(a, 'prepare', lambda: None)
+        install = ['apt-get', 'install', '-y', '--no-install-recommends'] if manager == 'apt' else ['dnf', 'install', '-y']
+        step(a, 'install', lambda: stream(install + packages, 1500))
+        if name == 'docker':
+            def enable():
+                problem = tolerant(['systemctl', 'enable', '--now', 'docker'], 'Starting the Docker service', 120)
+                if problem and problem is not MISSING: warnings.append(problem)
+            step(a, 'enable', enable)
+
+            def access():
+                problem = tolerant(['usermod', '-aG', 'docker', a.SERVICE_USER], f'Giving {a.SERVICE_USER} access to Docker')
+                if problem and problem is not MISSING: warnings.append(problem)
+            step(a, 'access', access)
+
+        def verify():
+            if not shutil.which(spec['binary']): raise a.ServiceOpError(f"{spec['label']} was installed but is not on the PATH")
+            result = subprocess.run([spec['binary'], '--version'], capture_output=True, text=True, timeout=20)
+            return (result.stdout or result.stderr).strip().splitlines()[0][:200] if (result.stdout or result.stderr).strip() else ''
+        version = step(a, 'verify', verify)
+        a.audit_log('DEPENDENCY_INSTALL', 'SYSTEM', {'name': name, 'version': version})
+        next_step = ("Configure the Google Drive remote on this server with `rclone config` (name it the remote ATS expects)."
+                     if name == 'rclone' else f"Docker is running and {a.SERVICE_USER} was added to the docker group.")
+        return {'installed': True, 'name': name, 'version': version, 'next': next_step, 'warnings': warnings}
 
 
 def run(a, op, args):
-    if op not in {'cloudflare.status','cloudflare.sync','cloudflare.restart','services.deploy','services.delete','services.config.set','services.resources','services.action','webhook.test','services.redeploy'}:
+    if op not in {'cloudflare.config.get','cloudflare.config.set','system.install','cloudflare.status','cloudflare.sync','cloudflare.restart','services.deploy','services.delete','services.config.set','services.resources','services.action','webhook.test','services.redeploy'}:
         raise a.ServiceOpError('Unsupported operation','unsupported')
+    if op in ('cloudflare.config.get','cloudflare.config.set'): return cloudflare_file(a,op,args)
+    if op=='system.install': return install_dependency(a,args)
     if op.startswith('cloudflare.'): return cloudflare(a,op,args)
     if op=='services.deploy': return deploy(a,args)
     if op=='services.delete': return delete(a,args)

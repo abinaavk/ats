@@ -410,6 +410,53 @@ try:
     status, body = call('GET', f'/api/servers/{sid}/health')
     check(status == 200 and body.get('terminal') is True, f'health advertises the terminal capability: {body}')
 
+
+    step('Server tools on a Global through the Local Monitor: edit the tunnel config, delete a service with progress steps')
+    def job_result(response, seconds=120):
+        status, body = response
+        if status != 202:
+            return status, body, []
+        jid = body['data']['job_id']
+        end = time.time() + seconds
+        while time.time() < end:
+            code, data = call('GET', f'/api/manage/jobs/{jid}', headers=target)
+            if code == 200 and data['data']['status'] != 'running':
+                return code, data['data'], data['data'].get('steps', [])
+            time.sleep(0.5)
+        return 0, {'status': 'timeout'}, []
+    status, body = call('GET', '/api/manage/cloudflare/config', headers=target)
+    check(status == 200 and body['data']['path'] == str(CF) and 'ingress' in body['data']['content'], f'the Global tunnel config is readable through the Monitor: {status}')
+    config = body['data']
+    import yaml
+    document = yaml.safe_load(config['content'])
+    document['ingress'].insert(-1, {'hostname': 'edited.example.test', 'service': 'http://localhost:8123'})
+    edited = yaml.safe_dump(document, sort_keys=False)
+    code, job, steps = job_result(call('PUT', '/api/manage/cloudflare/config', {'content': edited, 'base_sha256': config['sha256'], 'restart': True},
+                                       headers={**target, 'X-CSRF-Token': csrf()}))
+    check(code == 200 and job['status'] == 'done', f'a valid edit is saved by a job: {job.get("status")} {str(job.get("result"))[:200]}')
+    check([x['id'] for x in steps if x['state'] == 'done'] == ['validate', 'backup', 'write', 'restart'], f'its progress steps are reported in order: {[(x["id"], x["state"]) for x in steps]}')
+    check('edited.example.test' in CF.read_text() and list(CF.parent.glob('cloudflared.yml.bak-*')), 'the file changed on the Global and the previous version was kept as a backup')
+    stale = call('PUT', '/api/manage/cloudflare/config', {'content': edited + '# again\n', 'base_sha256': config['sha256']}, headers={**target, 'X-CSRF-Token': csrf()})
+    code, job, steps = job_result(stale)
+    check(job.get('status') == 'failed' and 'changed on the server' in str(job.get('result')), f'a stale edit is refused instead of overwriting: {str(job.get("result"))[:150]}')
+    fresh = call('GET', '/api/manage/cloudflare/config', headers=target)[1]['data']
+    code, job, steps = job_result(call('PUT', '/api/manage/cloudflare/config', {'content': 'ingress: [', 'base_sha256': fresh['sha256']}, headers={**target, 'X-CSRF-Token': csrf()}))
+    check(job.get('status') == 'failed' and 'Not valid YAML' in str(job.get('result')) and CF.read_text() == fresh['content'], 'an invalid file is refused and the real file is untouched')
+    status, body = call('GET', '/api/manage/cloudflare/config', headers=target)
+    code, job, steps = job_result(call('PUT', '/api/manage/cloudflare/config', {'content': body['data']['content'].replace('edited.example.test', 'hooksvc.example.test'),
+                                                                                'base_sha256': body['data']['sha256'], 'restart': False}, headers={**target, 'X-CSRF-Token': csrf()}))
+    check(job.get('status') == 'done' and 'not restarted' in str(job['result']['data']['warnings']), 'saving without a restart says the tunnel still runs the old routes')
+
+    code, job, steps = job_result(call('DELETE', '/api/manage/services/hooksvc', {'confirm': 'hooksvc'}, headers={**target, 'X-CSRF-Token': csrf()}))
+    check(code == 200 and job['status'] == 'done', f'deleting a service runs as a job: {job.get("status")} {str(job.get("result"))[:200]}')
+    check([x['id'] for x in steps if x['state'] == 'done'] == ['stop', 'disable', 'cloudflare', 'unit', 'files', 'record', 'reload'], f'every delete step is reported: {[(x["id"], x["state"]) for x in steps]}')
+    with sqlite3.connect(G / 'home' / 'ats.db') as database:
+        check(database.execute("SELECT count(*) FROM services WHERE name='hooksvc'").fetchone()[0] == 0, 'the service record is gone on the Global')
+    code, job, steps = job_result(call('DELETE', '/api/manage/services/hooksvc', {'confirm': 'hooksvc'}, headers={**target, 'X-CSRF-Token': csrf()}))
+    check(job.get('status') == 'failed' and 'not' in str(job.get('result')).lower(), f'deleting it again gives a clear error, not a crash: {str(job.get("result"))[:120]}')
+    status, body = call('GET', '/api/manage/dependencies', headers=target)
+    check(status == 200 and {'git', 'docker', 'rclone'} <= set(body['data']['dependencies']), 'dependency status is reported for the Global')
+
     step('Failure explanations: tunnel route removed / daemon stopped / tunnel down')
     original = CF.read_text()
     import yaml
