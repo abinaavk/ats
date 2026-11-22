@@ -167,7 +167,7 @@ def main():
     try:
         _main()
     except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-        print('Server setup failed: '+str(exc), file=sys.stderr)
+        print('Server command failed: '+str(exc), file=sys.stderr)
         raise SystemExit(1) from None
 
 

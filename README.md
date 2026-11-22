@@ -43,6 +43,12 @@ preview its complete service environment with `server adapter`. See
 [persistent startup](docs/persistent-startup.md). A passing signed health check
 does not verify management reads or writes.
 
+## Fleet operations
+
+Version visibility and one-click update, one-time pairing codes, key rotation, a fleet overview (CPU, memory, disk), alerts
+(ntfy, Telegram, webhook), registry backups and restore, and the audit trail are described in
+[docs/fleet-operations.md](docs/fleet-operations.md).
+
 ## Upgrade notes
 
 - Existing unsigned GitHub webhooks need the per-service secret shown in Manage

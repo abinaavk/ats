@@ -457,6 +457,68 @@ try:
     status, body = call('GET', '/api/manage/dependencies', headers=target)
     check(status == 200 and {'git', 'docker', 'rclone'} <= set(body['data']['dependencies']), 'dependency status is reported for the Global')
 
+    step('Fleet operations through the real stack: overview, restore a tunnel backup, pairing code, key rotation, registry backup and restore')
+    status, body = call('POST', '/api/fleet/refresh', {}, headers={'X-CSRF-Token': csrf()})
+    check(status == 200 and body['servers'][sid]['status'] == 'up', f'the fleet overview reaches the real Global through the tunnel: {str(body)[:200]}')
+    metrics = body['servers'][sid]['metrics']
+    check(metrics and 0 <= metrics['cpu'] <= 100 and 0 < metrics['memory'] <= 100 and 0 < metrics['disk'] <= 100 and metrics['companion'], f'it carries CPU, memory, disk and the companion version: {metrics}')
+    check(metrics['ats'] is None, 'the rehearsal copy of ATS is not a git checkout, so no ATS commit is claimed (nothing invented)')
+
+    status, body = call('GET', '/api/manage/cloudflare/backups', headers=target)
+    listed = body['data']['backups'] if status == 200 else []
+    check(status == 200 and len(listed) >= 2, f'the Global lists the tunnel config backups the editor made: {len(listed)}')
+    oldest = listed[-1]
+    current = call('GET', '/api/manage/cloudflare/config', headers=target)[1]['data']
+    code, job, steps = job_result(call('POST', '/api/manage/cloudflare/restore', {'name': oldest['name'], 'base_sha256': current['sha256'], 'restart': True},
+                                       headers={**target, 'X-CSRF-Token': csrf()}))
+    check(code == 200 and job['status'] == 'done', f'restoring a backup runs as a job: {job.get("status")} {str(job.get("result"))[:200]}')
+    check([x['id'] for x in steps if x['state'] == 'done'] == ['validate', 'backup', 'write', 'restart'], f'it uses the same validated steps as an edit: {[(x["id"], x["state"]) for x in steps]}')
+    check(hashlib.sha256(CF.read_bytes()).hexdigest() == oldest['sha256'], 'the file on the Global is now exactly the chosen backup')
+    check(call('GET', f'/api/servers/{sid}/health')[0] == 200, 'the tunnel still serves the Global after the restore (restart worked)')
+
+    second = dict(lenv, ATS_CLUSTER_DB=str(L / 'second.sqlite3'))
+    rc, out, err = sh([VENV, '-c', from_local], second)
+    check(rc == 0, 'a second, fresh Local is configured: ' + err[-200:])
+    rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'pair-code'], genv)
+    found = re.search(r'One-time pairing code: ([A-Z2-9]{4}-[A-Z2-9]{4}-[A-Z2-9]{4})', out)
+    check(rc == 0 and found, f'the Global prints a one-time code: {out[-200:]}')
+    code_text = found.group(1) if found else 'AAAA-BBBB-CCCC'
+    rc, out, err = sh([VENV, str(ATS / 'app.py'), 'server', 'pair', '--domain', 'https://localhost', '--code', code_text], second)
+    check(rc == 0 and 'paired and verified' in out, f'the second Local pairs with the code, no key copied: {out[-150:]} {err[-200:]}')
+    check(gnode['secret'] not in out + err, 'the key is never printed')
+    rc, out, err = sh([VENV, str(ATS / 'app.py'), 'server', 'pair', '--domain', 'https://localhost', '--code', code_text], dict(second, ATS_CLUSTER_DB=str(L / 'third.sqlite3')))
+    check(rc != 0, 'the same code cannot be used twice')
+
+    before_key = json.loads(pairing_path.read_text())['secret']
+    status, body = call('POST', f'/api/servers/{sid}/rotate', {}, headers={'X-CSRF-Token': csrf()})
+    check(status == 200 and body.get('grace_seconds') == 600, f'the Local rotates the Global key over the signed channel: {status} {str(body)[:200]}')
+    after_key = json.loads(pairing_path.read_text())['secret']
+    check(after_key != before_key and gnode['secret'] != after_key, 'the Global pairing file carries the new key')
+    check(call('GET', f'/api/servers/{sid}/health')[0] == 200, 'the Local keeps working with the new key, nothing pasted')
+    rc, out, err = sh([VENV, '-c', f"import sys;sys.path.insert(0,'{ATS}');import ats_cluster as c;print(c.Store().server('{sid}')['secret'])"], lenv)
+    check(out.strip() == after_key, 'the key saved on the Local is the one the Global now holds')
+    probe = dict(second, ATS_CLUSTER_DB=str(L / 'second.sqlite3'))
+    rc, out, err = sh([VENV, '-c', f"import sys;sys.path.insert(0,'{ATS}');import ats_cluster as c;s=c.Store();print(c.remote(s.server('{sid}'),{{'kind':'health'}}).get('role'))"], probe)
+    check('global' in out, f'the second Local still holds the pre-rotation key and it works during the grace window: {out.strip()} {err[-150:]}')
+
+    backup_file = E / 'registry-backup.sqlite3'
+    rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'backup', '--output', str(backup_file)], genv)
+    check(rc == 0 and backup_file.is_file() and (backup_file.stat().st_mode & 0o777) == 0o600 and 'NOT encrypted' in out, f'the Global registry is backed up privately: {out[-200:]}')
+    passfile = E / 'pass.txt'
+    passfile.write_text('rehearsal passphrase 123\n')
+    encrypted = E / 'registry-backup.sqlite3.enc'
+    rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'backup', '--output', str(encrypted), '--encrypt', '--passphrase-file', str(passfile)], genv)
+    check(rc == 0 and gnode['secret'].encode() not in encrypted.read_bytes() and after_key.encode() not in encrypted.read_bytes(), 'an encrypted backup holds no readable key')
+    wrong = E / 'wrong.txt'
+    wrong.write_text('not the passphrase!\n')
+    rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'restore', '--input', str(encrypted), '--yes', '--passphrase-file', str(wrong)], genv)
+    check(rc != 0 and 'Wrong passphrase' in out + err, f'a wrong passphrase restores nothing: {(out + err)[-150:]}')
+    rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'restore', '--input', str(encrypted), '--yes', '--passphrase-file', str(passfile)], genv)
+    check(rc == 0 and 'Safety copy' in out, f'the right passphrase restores it, with a safety copy: {out[-200:]}')
+    check(call('GET', f'/api/servers/{sid}/health')[0] == 200, 'the live Global still authenticates the Local after a restore')
+    rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'restore', '--input', str(backup_file)], dict(genv))
+    check(rc != 0 and 'Nothing was changed' in out + err, 'restore without --yes and without a terminal changes nothing')
+
     step('Failure explanations: tunnel route removed / daemon stopped / tunnel down')
     original = CF.read_text()
     import yaml
