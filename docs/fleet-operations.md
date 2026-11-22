@@ -37,6 +37,8 @@ The Global creates a new key over the signed channel; the Local verifies it with
 
 The ATS daemon on the Local probes every connected Global each minute (`status`, falling back to `health` for older Globals) and keeps the result in the registry. Monitor shows CPU, memory, the fullest disk, uptime and version for every server; **Check now** probes immediately without saving anything.
 
+Alerts also cover what each server's own collector finds: a **failed systemd unit**, and the **deployment / service / health / backup** problems ATS already tracks for each service (`ops_alerts`). Each is announced once when it first appears and once when it clears; problems that already exist when a server is first seen are announced once so they are not silent. Choose the kinds, and list units to **ignore** (for example a long-dead `atopacct.service`), under Alerts → *What to tell me about*. Disk is left to the threshold below, so it is not reported twice.
+
 Alerts go to any of: **ntfy**, **Telegram**, or a generic **webhook** (https only, redirects never followed; tokens are stored in the registry and never shown again). A Global is *down* after N failed checks (default 3), announced once, announced again as *recovered*, and mentioned again only every 6 hours while it stays down. Disk and memory thresholds (default 90 % / 95 %) alert once and clear with 5 % hysteresis. Failed deliveries are recorded and shown in `server doctor`.
 
 ## Registry backups
@@ -50,6 +52,18 @@ sudo python3 app.py server restore --input FILE [--passphrase-file FILE] [--yes]
 ```
 
 Backups use SQLite's online backup, so they are consistent while ATS runs. `--encrypt` uses `openssl` AES-256 with PBKDF2; set `ATS_REGISTRY_BACKUP_PASSPHRASE_FILE` to encrypt the daily ones too. A restore checks the file first, refuses a backup from a different server identity unless `--force`, and keeps a `pre-restore-*` copy of what it replaces. Restart ATS (and Monitor) afterwards. Backups are never served to the browser and cannot be restored from Monitor.
+
+### Off-host copies
+
+A backup that lives only on the disk it protects is lost with that disk. The Local can therefore push **encrypted** copies of its registry to every connected Global over the signed channel:
+
+```bash
+sudo python3 app.py server backup-push [--passphrase-file FILE]       # send now (prompts when run in a terminal)
+sudo python3 app.py server backup-fetch [--server-id ID] [--backup-name NAME] --output FILE   # bring one back
+sudo python3 app.py server restore --input FILE --passphrase-file FILE                          # then restore it as usual
+```
+
+With `ATS_REGISTRY_BACKUP_PASSPHRASE_FILE` set, the daily backup is encrypted and pushed automatically. Copies are never sent in the clear: the Local refuses a plain backup, and a Global refuses any file that is not an `openssl` encrypted one, so a Global never holds a readable key. Files travel in checksummed chunks, are stored under `offsite-backups/` (0600 in a 0700 directory), appear under their real name only once complete and verified, and the newest 10 are kept (16 MB limit). `server doctor` and Monitor show when the last copy went and whether it worked.
 
 ## Webhook mappings in Monitor
 
@@ -66,3 +80,7 @@ Monitor records which signed-in device did what, on which server and when: servi
 ## Cloudflare config backups
 
 The tunnel config editor keeps timestamped copies. `cloudflare.config.backups` lists them (newest first, with the hostnames each routes) and `cloudflare.config.restore` puts one back through the same validation, backup-first, atomic write and automatic roll-back as an edit. Only files named like the editor's own backups are offered; symlinks are never followed.
+
+## Tests and CI
+
+Both repositories run their unit suites on every pull request (`.github/workflows/tests.yml`; as root, like a server). The full-stack rehearsal (`tests/rehearsal/rehearse.py`) needs root and port 443, so it is run by hand before a release.
