@@ -117,6 +117,31 @@ def cycle(store, now=None, probe=probe, send=ats_notify.send, local=ats_status.c
     return announcements
 
 
+def snapshot(store, probe=probe, local=ats_status.collect, workers=4, now=None):
+    """Probe every server right now and return what was found, without saving state or sending alerts.
+
+    The Monitor's Refresh button uses this, so it never competes with the daemon's watcher over saved state.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    now = int(now or time.time())
+    result, jobs = {}, []
+    for summary in store.servers():
+        sid = summary['id']
+        if summary['local']:
+            try:
+                result[sid] = {'status': 'up', 'error': None, 'metrics': compact(local(), now)}
+            except Exception:
+                result[sid] = {'status': 'unknown', 'error': 'This server could not read its own status', 'metrics': None}
+        elif not summary['paired'] or not summary['connected'] or summary['revocation_pending']:
+            result[sid] = {'status': 'disabled', 'error': None, 'metrics': None}
+        else:
+            jobs.append(sid)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for sid, (ok, data, error) in zip(jobs, pool.map(lambda sid: probe(store.server(sid)), jobs)):
+            result[sid] = {'status': 'up' if ok else 'down', 'error': error, 'metrics': compact(data, now) if ok else None}
+    return result
+
+
 async def worker(store=None):
     store = store or cluster.Store()
     while True:

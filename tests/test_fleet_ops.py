@@ -263,6 +263,18 @@ class FleetTests(Base):
         self.assertTrue(ok and data['legacy'])
         self.assertEqual(calls, ['status', 'health'])
 
+    def test_snapshot_probes_everything_but_saves_and_sends_nothing(self):
+        self.enable()
+        self.down = True
+        result = ats_fleet.snapshot(self.store, probe=self.probe, local=lambda: self.data(), now=500)
+        self.assertEqual({v['status'] for v in result.values()}, {'up', 'down'})
+        down = result['b' * 32]
+        self.assertEqual((down['status'], down['metrics'], down['error']), ('down', None, 'refused'))
+        self.assertIsNone(self.store.kv_get('fleet_state'))
+        self.assertEqual(self.sent, [])
+        self.store.connection('b' * 32, 'disconnect')
+        self.assertEqual(ats_fleet.snapshot(self.store, probe=self.probe, local=lambda: self.data())['b' * 32]['status'], 'disabled')
+
     def test_removed_servers_leave_no_state_behind(self):
         self.run_cycle(0)
         with self.store.db() as db:
