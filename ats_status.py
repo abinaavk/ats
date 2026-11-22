@@ -120,7 +120,40 @@ def uptime():
         return None
 
 
-def collect(adapter=None, storage=()):
+UNIT = __import__('re').compile(r'[A-Za-z0-9@_.:-]{1,100}\.(service|socket|timer|mount)\Z')
+
+
+def failed_units(runner=subprocess.run, limit=20):
+    """Names of failed systemd units on this host (read-only; empty when systemd is not available)."""
+    try:
+        result = runner(['systemctl', 'list-units', '--state=failed', '--no-legend', '--plain', '--no-pager', '--full'],
+                        capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL,
+                        env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C'})
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    names = [line.split()[0] for line in result.stdout.splitlines() if line.split()]
+    return [name for name in names if UNIT.match(name)][:limit]
+
+
+def ops_alerts(path, limit=50):
+    """Active, unacknowledged alerts the ATS collector raised (deployment, service, health, backup, disk). Read-only."""
+    if not path or not os.path.isfile(path):
+        return []
+    import sqlite3
+    try:
+        db = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=3)
+        try:
+            rows = db.execute('SELECT alert_key,name,kind,message FROM ops_alerts WHERE active=1 AND acknowledged=0 ORDER BY id LIMIT ?', (limit,)).fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return []
+    return [{'key': str(key)[:150], 'name': str(name)[:80], 'kind': str(kind)[:20], 'message': str(message or '')[:200]} for key, name, kind, message in rows]
+
+
+def collect(adapter=None, storage=(), ops_db=None):
     """Everything a fleet view needs about this host, in one small JSON-safe dict."""
     checkout = Path(__file__).resolve().parent
     companion = Path(adapter).resolve().parent if adapter and Path(adapter).is_file() else None
@@ -129,6 +162,7 @@ def collect(adapter=None, storage=()):
     except OSError:
         load = None
     return {'collected_at': int(time.time()), 'host': {'name': socket.gethostname(), 'kernel': platform.release(), 'python': sys.version.split()[0],
-                                                       'cpus': os.cpu_count(), 'uptime': uptime()},
+                                                       'cpus': os.cpu_count(), 'uptime': uptime(), 'failed_units': failed_units()},
+            'alerts': ops_alerts(ops_db),
             'ats': repo_info(checkout), 'companion': repo_info(companion) if companion else {'available': False},
             'metrics': {'cpu_percent': cpu_percent(), 'load': load, 'memory': memory(), 'disks': disks(storage), 'temperature_c': temperature()}}

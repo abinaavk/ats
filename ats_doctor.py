@@ -108,7 +108,7 @@ def check_local(report, store, node):
                        'on that Global run: sudo python3 app.py server setup --apply')
             continue
         terminal_line(report, label, health)
-        version_line(report, label, server)
+        version_line(report, label, server, store)
         read, ms2, error = timed(ats_cluster.remote, server, {'kind': 'http', 'method': 'GET', 'path': '/api/manage/services'})
         if error:
             report.add(FAIL, label, f'signed health passed, but a service read failed: {error}',
@@ -214,7 +214,7 @@ def terminal_line(report, label, health):
                    'a terminal needs a PTY and a login shell for the service user; see the reason above')
 
 
-def version_line(report, label, server):
+def version_line(report, label, server, store=None):
     """Compare the Global's code to this Local's. Differences are a warning, not a failure: mixed versions usually work."""
     import ats_status
     try:
@@ -223,6 +223,8 @@ def version_line(report, label, server):
         report.add(WARN, f'{label}: version', 'this Global does not report its version (older ATS)',
                    'update it: Monitor → Settings → Servers → Update, or git pull on that server and restart ATS')
         return
+    import ats_notify
+    failed_unit_line(report, label, (remote_info.get('host') or {}).get('failed_units') or [], ats_notify.load(store)['watch']['ignore_units'] if store else ())
     mine = ats_status.repo_info(Path(__file__).resolve().parent).get('commit')
     theirs = (remote_info.get('ats') or {})
     if not theirs.get('available'):
@@ -232,6 +234,15 @@ def version_line(report, label, server):
                    'update the older one: Monitor → Settings → Servers → Update')
     else:
         report.add(OK, f'{label}: version', f"ATS {theirs.get('short')} (same as this Local)")
+
+
+def failed_unit_line(report, label, units, ignore=()):
+    units = [u for u in units if u not in ignore]
+    if units:
+        report.add(WARN, f'{label}: failed services', ', '.join(units[:8]) + (f' and {len(units) - 8} more' if len(units) > 8 else ''),
+                   'look at one with: systemctl status NAME; journalctl -u NAME -n 50 (silence a known one under Alerts → Ignore these units)')
+    else:
+        report.add(OK, f'{label}: failed services', 'none')
 
 
 def tool_checks(report):
@@ -305,6 +316,9 @@ def run(store, *, port=None, cloudflare_config=None, **plan_options):
     registry_checks(report, store)
     backup_and_alert_checks(report, store, node)
     tool_checks(report)
+    import ats_notify
+    import ats_status
+    failed_unit_line(report, 'This server', ats_status.failed_units(), ats_notify.load(store)['watch']['ignore_units'])
     if node['role'] == 'local':
         check_local(report, store, node)
     else:
