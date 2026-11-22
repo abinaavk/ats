@@ -6,6 +6,7 @@ announced once, and a server that stays down is mentioned again every six hours 
 """
 import asyncio
 import logging
+import os
 import time
 
 import ats_cluster as cluster
@@ -34,7 +35,9 @@ def compact(data, now):
     metrics = (data or {}).get('metrics') or {}
     disks = metrics.get('disks') or []
     memory = metrics.get('memory') or {}
-    return {'at': now, 'cpu': metrics.get('cpu_percent'), 'memory': memory.get('used_percent'),
+    units = ((data or {}).get('host') or {}).get('failed_units') or []
+    return {'at': now, 'failed': units[:20], 'alerts': [{'name': a.get('name'), 'kind': a.get('kind'), 'message': a.get('message')} for a in ((data or {}).get('alerts') or [])[:10]],
+            'cpu': metrics.get('cpu_percent'), 'memory': memory.get('used_percent'),
             'disk': max((d['used_percent'] for d in disks), default=None), 'uptime': (data or {}).get('host', {}).get('uptime'),
             'ats': ((data or {}).get('ats') or {}).get('short'), 'companion': ((data or {}).get('companion') or {}).get('short'),
             'legacy': bool((data or {}).get('legacy'))}
@@ -56,10 +59,41 @@ def resources(entry, name, data, thresholds):
     return found
 
 
-def cycle(store, now=None, probe=probe, send=ats_notify.send, local=ats_status.collect):
+def watches(entry, name, data, watch):
+    """Things a server's own collector found: newly failed systemd units and newly raised alerts, and when they clear.
+
+    Each is announced once. Units the operator chose to ignore are never announced. A server that has never been
+    checked before announces whatever is already wrong, once, so existing problems are not silent.
+    """
+    if not data or data.get('legacy'):
+        return []
+    found, seen = [], entry.setdefault('seen', {'units': [], 'alerts': {}})
+    ignore = set(watch['ignore_units'])
+    units = [u for u in (data.get('host') or {}).get('failed_units') or [] if u not in ignore] if watch['failed_units'] else []
+    new = [u for u in units if u not in seen['units']]
+    gone = [u for u in seen['units'] if u not in units and u not in ignore]
+    if new:
+        found.append(('warn', f"{name}: {len(new)} failed service{'s' if len(new) != 1 else ''}: " + ', '.join(new[:5]) + (f' and {len(new) - 5} more' if len(new) > 5 else '')))
+    if gone:
+        found.append(('recovered', f"{name}: no longer failed: " + ', '.join(gone[:5])))
+    seen['units'] = units
+    alerts = {a['key']: a for a in data.get('alerts') or [] if a.get('kind') in watch['kinds']}
+    for key, alert in alerts.items():
+        if key not in seen['alerts']:
+            found.append(('warn', f"{name}: {alert['kind']} problem with {alert['name']}: {alert['message']}"))
+    for key, old in seen['alerts'].items():
+        if key not in alerts:
+            found.append(('recovered', f"{name}: {old['kind']} problem with {old['name']} cleared"))
+    seen['alerts'] = {key: {'name': a['name'], 'kind': a['kind']} for key, a in alerts.items()}
+    return found
+
+
+def cycle(store, now=None, probe=probe, send=ats_notify.send, local=None, ops_db=None):
     now = int(now or time.time())
+    if local is None:
+        local = lambda: ats_status.collect(os.environ.get('ATS_MONITOR_ADAPTER'), ops_db=ops_db)
     config = ats_notify.load(store)
-    thresholds = config['thresholds']
+    thresholds, watch = config['thresholds'], config['watch']
     state = store.kv_get('fleet_state', {})
     events = store.kv_get('fleet_events', [])
     announcements = []
@@ -80,7 +114,7 @@ def cycle(store, now=None, probe=probe, send=ats_notify.send, local=ats_status.c
             except Exception:
                 continue
             entry.update(status='up', fails=0, last_ok=now, error=None, metrics=compact(data, now))
-            for kind, message in resources(entry, name, data, thresholds):
+            for kind, message in resources(entry, name, data, thresholds) + watches(entry, name, data, watch):
                 record(kind, sid, name, message)
             continue
         if not summary['paired'] or not summary['connected'] or summary['revocation_pending']:
@@ -94,7 +128,7 @@ def cycle(store, now=None, probe=probe, send=ats_notify.send, local=ats_status.c
                 entry.update(status='up', since=now)
             if was == 'down':
                 record('recovered', sid, name, f'{name} is reachable again')
-            for kind, message in resources(entry, name, data, thresholds):
+            for kind, message in resources(entry, name, data, thresholds) + watches(entry, name, data, watch):
                 record(kind, sid, name, message)
         else:
             entry['fails'] += 1
@@ -117,13 +151,15 @@ def cycle(store, now=None, probe=probe, send=ats_notify.send, local=ats_status.c
     return announcements
 
 
-def snapshot(store, probe=probe, local=ats_status.collect, workers=4, now=None):
+def snapshot(store, probe=probe, local=None, workers=4, now=None, ops_db=None):
     """Probe every server right now and return what was found, without saving state or sending alerts.
 
     The Monitor's Refresh button uses this, so it never competes with the daemon's watcher over saved state.
     """
     from concurrent.futures import ThreadPoolExecutor
     now = int(now or time.time())
+    if local is None:
+        local = lambda: ats_status.collect(os.environ.get('ATS_MONITOR_ADAPTER'), ops_db=ops_db)
     result, jobs = {}, []
     for summary in store.servers():
         sid = summary['id']
@@ -142,11 +178,11 @@ def snapshot(store, probe=probe, local=ats_status.collect, workers=4, now=None):
     return result
 
 
-async def worker(store=None):
+async def worker(store=None, ops_db=None):
     store = store or cluster.Store()
     while True:
         try:
-            await asyncio.to_thread(cycle, store)
+            await asyncio.to_thread(cycle, store, None, probe, ats_notify.send, None, ops_db)
         except Exception:
             log.exception('Fleet check failed')
         await asyncio.sleep(INTERVAL)

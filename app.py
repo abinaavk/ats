@@ -6877,13 +6877,14 @@ async def run_daemon():
         import ats_remote
         asyncio.create_task(ats_operations.worker(sys.modules[__name__]))
         asyncio.create_task(auto_backup_scheduler())
+        ats_remote.OPS_DB = DB_FILE
         await asyncio.to_thread(ats_remote.serve, ats_cluster.Store(), int(os.environ.get('ATS_REMOTE_PORT', '9997')))
         return
     # Tunnel configuration is an explicit operator task, never a daemon side effect.
     print(f"{C_CYAN}→ Auto-Backup Scheduler: ACTIVE{C_RESET}")
     print(f"{C_CYAN}→ Webhook Listener:     ACTIVE ({webhook_bind_address()}:{WEBHOOK_PORT}){C_RESET}")
     
-    asyncio.create_task(ats_fleet.worker(registry))             # watch the Globals and alert on change
+    asyncio.create_task(ats_fleet.worker(registry, DB_FILE))             # watch the Globals and alert on change
     import ats_routing
     await ats_routing.recover(sys.modules[__name__])
     # Start tasks

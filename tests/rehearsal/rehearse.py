@@ -519,6 +519,22 @@ try:
     rc, out, err = sh([SYSPY, str(ATS / 'app.py'), 'server', 'restore', '--input', str(backup_file)], dict(genv))
     check(rc != 0 and 'Nothing was changed' in out + err, 'restore without --yes and without a terminal changes nothing')
 
+    step('Off-host registry copy: the Local pushes an encrypted backup to the Global through the tunnel, fetches it back and restores it')
+    rc, out, err = sh([VENV, str(ATS / 'app.py'), 'server', 'backup-push', '--passphrase-file', str(passfile)], lenv)
+    check(rc == 0 and 'copy stored' in out, f'the Local sends an encrypted copy: {(out + err)[-200:]}')
+    stored = sorted((G / 'offsite-backups').glob('registry-*.sqlite3.enc')) if (G / 'offsite-backups').exists() else []
+    check(len(stored) == 1 and (stored[0].stat().st_mode & 0o777) == 0o600 and stored[0].read_bytes().startswith(b'Salted__'), 'the Global holds one private, encrypted file')
+    local_secret = subprocess.run([VENV, '-c', f"import sys;sys.path.insert(0,'{ATS}');import ats_cluster as c;print(c.Store().server('{sid}')['secret'])"], env=lenv, capture_output=True, text=True).stdout.strip()
+    check(local_secret and local_secret.encode() not in stored[0].read_bytes(), 'no key is readable in what the Global stores')
+    fetched = E / 'fetched.enc'
+    rc, out, err = sh([VENV, str(ATS / 'app.py'), 'server', 'backup-fetch', '--output', str(fetched)], lenv)
+    check(rc == 0 and fetched.read_bytes() == stored[0].read_bytes(), f'the Local gets back exactly the stored bytes: {(out + err)[-200:]}')
+    rc, out, err = sh([VENV, str(ATS / 'app.py'), 'server', 'restore', '--input', str(fetched), '--yes', '--passphrase-file', str(passfile)], lenv)
+    check(rc == 0 and 'Safety copy' in out, f'the fetched copy restores the Local registry: {(out + err)[-200:]}')
+    check(call('GET', f'/api/servers/{sid}/health')[0] == 200, 'the Local still reaches the Global after restoring from the off-host copy')
+    rc, out, err = sh([VENV, str(ATS / 'app.py'), 'server', 'backup-push'], lenv)
+    check(rc != 0 and 'always encrypted' in out + err, 'a push without a passphrase is refused rather than sent in the clear')
+
     step('Failure explanations: tunnel route removed / daemon stopped / tunnel down')
     original = CF.read_text()
     import yaml

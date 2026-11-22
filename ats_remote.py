@@ -17,6 +17,9 @@ SLOTS = threading.BoundedSemaphore(8)
 MISSING_MODULE = re.compile(r"No module named '([A-Za-z0-9_.]+)'")
 
 
+OPS_DB = None      # the daemon sets this to ATS's own database so `status` can report collector alerts
+
+
 class PublicError(ValueError):
     """A failure whose message is written here and safe to return to the signed caller."""
 
@@ -82,6 +85,16 @@ def dispatch(store, data, authenticated=None):
         except Exception:
             pass
         return {'revoked': True}
+    if kind in ('backup.put', 'backup.list', 'backup.get'):
+        import ats_registry_backup as offsite
+        try:
+            if kind == 'backup.put':
+                return offsite.receive(store, data)
+            if kind == 'backup.list':
+                return {'backups': offsite.list_offsite(store)}
+            return offsite.read_part(store, data.get('name'), data.get('index'))
+        except ValueError as exc:
+            raise PublicError(str(exc)) from None
     if kind == 'rotate':
         fresh = store.rotate_own_secret(authenticated or store.node())
         try:
@@ -98,7 +111,7 @@ def dispatch(store, data, authenticated=None):
         return execute([sys.executable, adapter], data)
     if kind == 'status':
         import ats_status
-        return ats_status.collect(os.environ.get('ATS_MONITOR_ADAPTER'))
+        return ats_status.collect(os.environ.get('ATS_MONITOR_ADAPTER'), ops_db=OPS_DB)
     if kind == 'update':
         import ats_update
         if not isinstance(data.get('restart', True), bool):

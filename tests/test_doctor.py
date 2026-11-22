@@ -31,6 +31,14 @@ else:
 
 
 def isolate(case):
+    """Also: the real host's failed systemd units must never leak into a test."""
+    fake = patch('ats_status.failed_units', return_value=[])
+    fake.start()
+    case.addCleanup(fake.stop)
+    _isolate_tools(case)
+
+
+def _isolate_tools(case):
     """Doctor's host-tool probes must never touch the machine running the tests (it may have a real Docker)."""
     probe = patch.object(doctor, 'tool_checks', lambda report: None)
     probe.start()
@@ -342,11 +350,52 @@ class FleetChecksTests(unittest.TestCase):
             with patch.object(doctor.ats_cluster, 'remote', return_value=payload), \
                     patch.object(ats_status, 'repo_info', return_value={'commit': mine}):
                 doctor.version_line(report, 'Global', {})
-            self.assertEqual(report.items[0]['level'], level, payload)
+            self.assertEqual([i for i in report.items if i['title'].endswith(': version')][0]['level'], level, payload)
         report = doctor.Report()
         with patch.object(doctor.ats_cluster, 'remote', side_effect=c.TransportError('Unsupported request kind', 'adapter')):
             doctor.version_line(report, 'Global', {})
         self.assertIn('older ATS', report.items[0]['detail'])
+
+    def test_off_host_backup_is_checked_when_there_is_a_global_to_send_to(self):
+        import ats_registry_backup as backups
+        self.store.configure('local', 'Primary', webhook='hooks.example.com')
+
+        def run():
+            report = doctor.Report()
+            doctor.backup_and_alert_checks(report, self.store, self.store.node())
+            return {i['title']: i for i in report.items}
+        self.assertNotIn('Off-host backup', run())                                  # nothing to send to yet: no noise
+        with patch.object(c.Store, '_verified', return_value={}):
+            self.store.pair('b' * 32, 'Remote', 'https://api.example.com', 'c' * 64)
+        found = run()['Off-host backup']
+        self.assertEqual(found['level'], 'warn')
+        self.assertIn('backup-push', found['fix'])
+        self.store.kv_set('registry_backup_offsite', {'b' * 32: {'ok': False, 'at': 1, 'error': 'refused', 'server': 'Remote'}})
+        self.assertIn('failed: refused', run()['Off-host backup']['detail'])
+        self.store.kv_set('registry_backup_offsite', {'b' * 32: {'ok': True, 'at': time.time() - 5 * 86400, 'server': 'Remote'}})
+        self.assertIn('3 days old', run()['Off-host backup']['detail'])
+        self.store.kv_set('registry_backup_offsite', {'b' * 32: {'ok': True, 'at': time.time() - 3600, 'server': 'Remote'}})
+        self.assertEqual(run()['Off-host backup']['level'], 'ok')
+
+    def test_failed_services_are_listed_and_ignored_ones_are_not(self):
+        report = doctor.Report()
+        doctor.failed_unit_line(report, 'This server', ['atopacct.service', 'morphic.service'], ['atopacct.service'])
+        self.assertEqual((report.items[0]['level'], report.items[0]['detail']), ('warn', 'morphic.service'))
+        self.assertIn('journalctl -u NAME', report.items[0]['fix'])
+        report = doctor.Report()
+        doctor.failed_unit_line(report, 'This server', ['atopacct.service'], ['atopacct.service'])
+        self.assertEqual(report.items[0]['level'], 'ok')
+        report = doctor.Report()
+        doctor.failed_unit_line(report, 'G', [f'u{i}.service' for i in range(12)])
+        self.assertIn('and 4 more', report.items[0]['detail'])
+
+    def test_a_global_status_with_failed_units_shows_up_in_the_doctor(self):
+        report = doctor.Report()
+        payload = {'ats': {'available': False}, 'host': {'failed_units': ['x.service']}}
+        with patch.object(doctor.ats_cluster, 'remote', return_value=payload):
+            doctor.version_line(report, 'Global “B”', {}, self.store)
+        titles = {i['title']: i for i in report.items}
+        self.assertEqual(titles['Global “B”: failed services']['detail'], 'x.service')
 
     def test_backup_and_alert_checks_report_age_failures_and_delivery_problems(self):
         import ats_notify

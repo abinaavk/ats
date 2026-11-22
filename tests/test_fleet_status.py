@@ -81,6 +81,55 @@ class StatusTests(Repos):
             self.assertIsNone(ats_status.cpu_percent())
 
 
+class CollectorFindingsTests(unittest.TestCase):
+    """Failed systemd units and the alerts ATS's own collector raised, with a fake systemctl and a temporary database."""
+    def runner(self, stdout='', returncode=0, error=None):
+        def run(argv, **kwargs):
+            self.argv = argv
+            if error:
+                raise error
+            return subprocess.CompletedProcess(argv, returncode, stdout, '')
+        return run
+
+    def test_failed_units_are_parsed_and_junk_is_dropped(self):
+        out = ('atopacct.service loaded failed failed Atop process accounting daemon\n'
+               'morphic.service  loaded failed failed Morphic AI\n'
+               'bad name.service loaded failed failed x\n'
+               'evil;rm.service loaded failed failed x\n'
+               'backup@db.timer loaded failed failed ok\n\n')
+        self.assertEqual(ats_status.failed_units(self.runner(out)), ['atopacct.service', 'morphic.service', 'backup@db.timer'])
+        self.assertEqual(self.argv[:2], ['systemctl', 'list-units'])             # read-only: it never starts, stops or resets anything
+        many = ''.join(f'u{i}.service loaded failed failed x\n' for i in range(40))
+        self.assertEqual(len(ats_status.failed_units(self.runner(many))), 20)
+
+    def test_a_host_without_systemd_or_with_a_slow_one_reports_nothing(self):
+        for runner in (self.runner(error=FileNotFoundError()), self.runner(error=subprocess.TimeoutExpired('systemctl', 8)), self.runner('x.service l f f', returncode=1)):
+            self.assertEqual(ats_status.failed_units(runner), [])
+
+    def test_only_active_unacknowledged_alerts_are_reported(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'ats.db'
+            db = sqlite3.connect(path)
+            db.executescript('''CREATE TABLE ops_alerts (id INTEGER PRIMARY KEY, alert_key TEXT UNIQUE, name TEXT, kind TEXT, message TEXT, active INTEGER, acknowledged INTEGER, started REAL, last_seen REAL);
+              INSERT INTO ops_alerts(alert_key,name,kind,message,active,acknowledged) VALUES ('site:deployment','site','deployment','Deployment failed',1,0),
+                ('old:service','old','service','was down',0,0),('quiet:backup','quiet','backup','known',1,1);''')
+            db.commit(); db.close()
+            before = path.read_bytes()
+            found = ats_status.ops_alerts(str(path))
+            self.assertEqual(found, [{'key': 'site:deployment', 'name': 'site', 'kind': 'deployment', 'message': 'Deployment failed'}])
+            self.assertEqual(path.read_bytes(), before)                            # opened read-only
+            path.write_bytes(b'not a database' * 100)
+            self.assertEqual(ats_status.ops_alerts(str(path)), [])
+        self.assertEqual(ats_status.ops_alerts('/nonexistent/ats.db'), [])
+        self.assertEqual(ats_status.ops_alerts(None), [])
+
+    def test_collect_carries_both_without_leaking_anything_else(self):
+        data = ats_status.collect(ops_db='/nonexistent/ats.db')
+        self.assertIsInstance(data['host']['failed_units'], list)
+        self.assertEqual(data['alerts'], [])
+
+
 class UpdateTests(Repos):
     def update(self, **kwargs):
         with mock.patch.object(ats_update, 'check_code', kwargs.pop('check', lambda name, directory: None)):

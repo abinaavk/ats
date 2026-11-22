@@ -168,6 +168,15 @@ class NotifyTests(Base):
         for secret in ('tk_secretvalue', 'A' * 35, 'hidden'):
             self.assertNotIn(secret, json.dumps(outcome))
 
+    def test_watch_settings_are_validated_and_survive_a_round_trip(self):
+        shown = ats_notify.save(self.store, {'watch': {'kinds': ['service', 'deployment'], 'ignore_units': 'a.service, b.timer', 'failed_units': False}})
+        self.assertEqual(shown['watch'], {'kinds': ['deployment', 'service'], 'failed_units': False, 'ignore_units': ['a.service', 'b.timer']})
+        self.assertEqual(ats_notify.save(self.store, shown)['watch'], shown['watch'])
+        for bad in ({'kinds': ['nope']}, {'kinds': 'service'}, {'kinds': ['service', 'service']}, {'ignore_units': ['rm -rf /']}, {'ignore_units': ['x.service'] * 51},
+                    {'failed_units': 'yes'}, {'ignore_units': 5}):
+            with self.assertRaises(ValueError, msg=bad):
+                ats_notify.validate({'watch': bad})
+
     def test_redirects_are_not_followed(self):
         self.assertIsNone(ats_notify.NoRedirect().redirect_request(None, None, 302, 'x', {}, 'https://elsewhere.example.com'))
 
@@ -262,6 +271,63 @@ class FleetTests(Base):
             ok, data, error = ats_fleet.probe(self.store.server('b' * 32))
         self.assertTrue(ok and data['legacy'])
         self.assertEqual(calls, ['status', 'health'])
+
+    def with_findings(self, units=(), alerts=()):
+        data = self.data()
+        data['host']['failed_units'] = list(units)
+        data['alerts'] = [{'key': k, 'name': n, 'kind': kind, 'message': m} for k, n, kind, m in alerts]
+        return data
+
+    def cycle_with(self, at, data):
+        self.findings = data
+        return ats_fleet.cycle(self.store, now=at, probe=lambda server: (True, self.findings, None), send=lambda *a: self.sent.append(a) or {}, local=lambda: self.data())
+
+    def test_failed_units_are_announced_once_and_again_when_they_clear(self):
+        self.enable()
+        first = self.cycle_with(0, self.with_findings(units=['atopacct.service', 'morphic.service']))
+        self.assertEqual([(k, 'atopacct.service' in m and 'morphic.service' in m) for k, _, m in first], [('warn', True)])   # existing problems are not silent
+        self.assertEqual(self.cycle_with(60, self.with_findings(units=['atopacct.service', 'morphic.service'])), [])        # and not repeated
+        added = self.cycle_with(120, self.with_findings(units=['atopacct.service', 'morphic.service', 'nginx.service']))
+        self.assertIn('nginx.service', added[0][2]); self.assertNotIn('morphic', added[0][2])
+        cleared = self.cycle_with(180, self.with_findings(units=['atopacct.service']))
+        self.assertEqual(cleared[0][0], 'recovered')
+        self.assertIn('morphic.service', cleared[0][2])
+        state = self.store.kv_get('fleet_state')['b' * 32]['metrics']
+        self.assertEqual(state['failed'], ['atopacct.service'])
+
+    def test_ignored_units_and_the_off_switch_silence_them(self):
+        ats_notify.save(self.store, {'ntfy': {'url': 'https://ntfy.example.com/t'}, 'enabled': {'ntfy': True}, 'watch': {'ignore_units': 'atopacct.service morphic.service'}})
+        self.assertEqual(self.cycle_with(0, self.with_findings(units=['atopacct.service', 'morphic.service'])), [])
+        self.assertEqual([k for k, _, _ in self.cycle_with(60, self.with_findings(units=['atopacct.service', 'x.service']))], ['warn'])
+        self.assertEqual(self.cycle_with(120, self.with_findings(units=['atopacct.service'])) [0][0], 'recovered')   # a real one clearing is still news
+        ats_notify.save(self.store, {'ntfy': {'url': 'https://ntfy.example.com/t'}, 'enabled': {'ntfy': True}, 'watch': {'failed_units': False}})
+        self.assertEqual(self.cycle_with(180, self.with_findings(units=['brand-new.service'])), [])
+
+    def test_deployment_and_other_collector_alerts_are_announced_by_kind(self):
+        self.enable()
+        deploy = ('site:deployment', 'site', 'deployment', 'Deployment failed')
+        disk = ('host:disk', 'SYSTEM', 'disk', 'Storage disk is 91% used')
+        first = self.cycle_with(0, self.with_findings(alerts=[deploy, disk]))
+        self.assertEqual(len(first), 1)                                                      # disk is excluded by default: the threshold covers it
+        self.assertIn('deployment problem with site: Deployment failed', first[0][2])
+        self.assertEqual(self.cycle_with(60, self.with_findings(alerts=[deploy, disk])), [])
+        cleared = self.cycle_with(120, self.with_findings(alerts=[disk]))
+        self.assertEqual((cleared[0][0], 'cleared' in cleared[0][2]), ('recovered', True))
+        ats_notify.save(self.store, {'ntfy': {'url': 'https://ntfy.example.com/t'}, 'enabled': {'ntfy': True}, 'watch': {'kinds': ['disk']}})
+        self.assertEqual(len(self.cycle_with(180, self.with_findings(alerts=[disk, deploy]))), 1)       # kinds are the operator's choice
+
+    def test_older_globals_and_a_down_server_leave_the_findings_alone(self):
+        self.enable()
+        self.cycle_with(0, self.with_findings(units=['a.service']))
+        self.assertEqual(ats_fleet.cycle(self.store, now=60, probe=lambda s: (True, {'legacy': True, 'role': 'global'}, None), send=lambda *a: {}, local=lambda: self.data()), [])
+        ats_fleet.cycle(self.store, now=120, probe=lambda s: (False, None, 'refused'), send=lambda *a: {}, local=lambda: self.data())
+        self.assertEqual(self.cycle_with(180, self.with_findings(units=['a.service'])), [])       # still failing, still not repeated
+
+    def test_the_local_servers_own_findings_are_watched_too(self):
+        self.enable()
+        mine = self.with_findings(units=['local-thing.service'])
+        found = ats_fleet.cycle(self.store, now=0, probe=self.probe, send=lambda *a: {}, local=lambda: mine)
+        self.assertTrue(any('local-thing.service' in m for _, _, m in found))
 
     def test_snapshot_probes_everything_but_saves_and_sends_nothing(self):
         self.enable()

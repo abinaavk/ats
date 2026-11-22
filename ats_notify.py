@@ -14,7 +14,9 @@ from urllib.parse import urlsplit
 MASK = '********'
 DEFAULT = {'ntfy': {'url': '', 'token': ''}, 'telegram': {'token': '', 'chat_id': ''}, 'webhook': {'url': ''},
            'enabled': {'ntfy': False, 'telegram': False, 'webhook': False},
-           'thresholds': {'failures': 3, 'disk': 90, 'memory': 95}}
+           'thresholds': {'failures': 3, 'disk': 90, 'memory': 95},
+           'watch': {'kinds': ['deployment', 'service', 'health', 'backup'], 'failed_units': True, 'ignore_units': []}}
+KINDS = ('deployment', 'service', 'health', 'backup', 'disk')    # what a server's collector can raise; disk is covered by the threshold
 SECRET_FIELDS = {'ntfy': ('token',), 'telegram': ('token',), 'webhook': ('url',)}
 LEVEL = {'down': ('high', 'rotating_light'), 'warn': ('high', 'warning'), 'recovered': ('default', 'white_check_mark'), 'info': ('default', 'information_source')}
 
@@ -75,6 +77,23 @@ def validate(config):
         if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
             raise ValueError(f'The {key} threshold must be between {low} and {high}')
         result['thresholds'][key] = value
+    watch = config.get('watch') or {}
+    if not isinstance(watch, dict):
+        raise ValueError('watch must be an object')
+    kinds = watch.get('kinds', DEFAULT['watch']['kinds'])
+    if not isinstance(kinds, list) or any(k not in KINDS for k in kinds) or len(set(kinds)) != len(kinds):
+        raise ValueError('Choose alert kinds from: ' + ', '.join(KINDS))
+    result['watch']['kinds'] = [k for k in KINDS if k in kinds]
+    flag = watch.get('failed_units', True)
+    if not isinstance(flag, bool):
+        raise ValueError('failed_units must be true or false')
+    result['watch']['failed_units'] = flag
+    ignore = watch.get('ignore_units', [])
+    if isinstance(ignore, str):
+        ignore = ignore.replace(',', ' ').split()
+    if not isinstance(ignore, list) or len(ignore) > 50 or any(not isinstance(u, str) or not re.fullmatch(r'[A-Za-z0-9@_.:-]{1,100}\.(service|socket|timer|mount)', u) for u in ignore):
+        raise ValueError('Ignored units must look like name.service (up to 50, separated by spaces or commas)')
+    result['watch']['ignore_units'] = sorted(set(ignore))
     if result['enabled']['ntfy'] and not result['ntfy']['url']:
         raise ValueError('Enter the ntfy address before turning ntfy on')
     if result['enabled']['telegram'] and not (result['telegram']['token'] and result['telegram']['chat_id']):
