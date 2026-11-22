@@ -87,6 +87,17 @@ def dispatch(store, data, authenticated=None):
             raise PublicError('Monitor host adapter is not configured on this Global server; '
                               'run "server setup --apply" on it')
         return execute([sys.executable, adapter], data)
+    if kind == 'status':
+        import ats_status
+        return ats_status.collect(os.environ.get('ATS_MONITOR_ADAPTER'))
+    if kind == 'update':
+        import ats_update
+        if not isinstance(data.get('restart', True), bool):
+            raise PublicError('restart must be true or false')
+        try:
+            return ats_update.update(data.get('targets', 'both'), restart=data.get('restart', True))
+        except ats_update.UpdateError as exc:
+            raise PublicError(str(exc)) from None
     if isinstance(kind, str) and kind.startswith('term.'):
         import ats_terminal
         try:
