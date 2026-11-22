@@ -16,7 +16,7 @@ from ats_cluster import Store
 
 def _main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (signed HTTPS management and automatic Global setup)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials', 'doctor', 'pair-code', 'rotate-global'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials', 'doctor', 'pair-code', 'rotate-global', 'backup', 'backups', 'restore'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
@@ -46,6 +46,12 @@ def _main():
     parser.add_argument('--domain', help='pair: the Global\'s HTTPS address, used with --code')
     parser.add_argument('--code', help='pair: a one-time pairing code made with "server pair-code" on that Global')
     parser.add_argument('--minutes', type=int, help='pair-code: how long the code works (default 10)')
+    parser.add_argument('--output', help='backup: write the backup to this new file (default: the registry-backups directory)')
+    parser.add_argument('--input', help='restore: the backup file to restore')
+    parser.add_argument('--encrypt', action='store_true', help='backup: encrypt with a passphrase you are asked for (or --passphrase-file)')
+    parser.add_argument('--passphrase-file', help='backup/restore: file whose first line is the passphrase')
+    parser.add_argument('--force', action='store_true', help='restore: allow a backup from a different server identity')
+    parser.add_argument('--yes', action='store_true', help='restore: do not ask for confirmation')
     args = parser.parse_args()
     if (args.monitor_adapter or args.adapter_state_dir) and args.action not in ('service', 'adapter', 'setup', 'configure'):
         parser.error('Adapter options require server service or server adapter')
@@ -116,6 +122,8 @@ def _main():
         import asyncio
         import app as runtime
         asyncio.run(runtime.run_daemon())
+    elif args.action in ('backup', 'backups', 'restore'):
+        registry_backup_command(store, args, parser)
     elif args.action == 'pair-code':
         code, expires = store.make_pair_code(args.minutes or 10)
         print_pair_code(store, code, expires)
@@ -291,6 +299,44 @@ def map_repository(store, args):
         print("  Secret      : the service's existing webhook secret. A GitHub webhook that already uses this URL and secret needs no change.")
     else:
         print('  Secret      : the one in your secret file')
+
+
+def registry_backup_command(store, args, parser):
+    import ats_registry_backup as backups
+    import getpass
+    import time
+
+    def passphrase(confirm):
+        if args.passphrase_file:
+            return Path(args.passphrase_file).read_text().strip()
+        if not sys.stdin.isatty():
+            return None
+        value = getpass.getpass('Passphrase: ')
+        if confirm and value != getpass.getpass('Repeat passphrase: '):
+            raise ValueError('The passphrases do not match')
+        return value
+    if args.action == 'backup':
+        made = backups.create(store, args.output, passphrase(True) if (args.encrypt or args.passphrase_file) else None)
+        print(f"Registry backed up to {made['path']} ({made['size']} bytes, {'encrypted' if made['encrypted'] else 'NOT encrypted'}, mode 0600).")
+        if not made['encrypted']:
+            print('It contains private keys: keep it out of repositories and shared storage, or use --encrypt.')
+    elif args.action == 'backups':
+        items = backups.listing(store)
+        for item in items:
+            print(f"{item['name']}  {time.strftime('%Y-%m-%d %H:%M', time.localtime(item['at']))}  {item['size']} bytes  {'encrypted' if item['encrypted'] else 'plain'}")
+        print(f'{len(items)} backup(s) in {backups.directory(store)}' if items else 'No automatic backups yet; the daemon makes one daily, or run "server backup".')
+    else:
+        if not args.input:
+            parser.error('--input is required')
+        key = passphrase(False) if backups.is_encrypted(args.input) else None
+        info = backups.describe(args.input, key)
+        print(f"Backup of {info['role']} “{info['name']}” ({info['id'][:8]}…), {len(info['servers'])} paired server(s), {info['mappings']} webhook mapping(s), "
+              f"made {time.strftime('%Y-%m-%d %H:%M', time.localtime(info['at']))}.")
+        if not args.yes and (not sys.stdin.isatty() or input('Replace this server\'s registry with it? A safety copy is made first. [yes/NO] ') != 'yes'):
+            raise ValueError('Nothing was changed. Run again with --yes to restore.')
+        done = backups.restore(store, args.input, key, force=args.force)
+        print('Restored. Safety copy of the previous registry: ' + done['safety_copy'])
+        print('Restart the ATS daemon (and the Monitor on a Local) so they use the restored registry.')
 
 
 def print_pair_code(store, code, expires):

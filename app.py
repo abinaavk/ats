@@ -6868,7 +6868,10 @@ async def run_daemon():
     print(f"{C_GREEN}Starting ATS Daemon v7.0...{C_RESET}")
     
     import ats_cluster
-    node = ats_cluster.Store().node()
+    import ats_fleet
+    registry = ats_cluster.Store()
+    node = registry.node()
+    asyncio.create_task(ats_fleet.backup_worker(registry))      # the registry holds every key: back it up daily
     if node and node['role'] == 'global':
         import ats_operations
         import ats_remote
@@ -6880,6 +6883,7 @@ async def run_daemon():
     print(f"{C_CYAN}→ Auto-Backup Scheduler: ACTIVE{C_RESET}")
     print(f"{C_CYAN}→ Webhook Listener:     ACTIVE ({webhook_bind_address()}:{WEBHOOK_PORT}){C_RESET}")
     
+    asyncio.create_task(ats_fleet.worker(registry))             # watch the Globals and alert on change
     import ats_routing
     await ats_routing.recover(sys.modules[__name__])
     # Start tasks

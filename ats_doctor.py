@@ -7,6 +7,7 @@ It changes nothing and never prints a key, signature or remote response body.
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import stat
 import subprocess
@@ -106,6 +107,8 @@ def check_local(report, store, node):
             report.add(FAIL, label, f'reachable in {ms} ms, but its Monitor adapter is not configured',
                        'on that Global run: sudo python3 app.py server setup --apply')
             continue
+        terminal_line(report, label, health)
+        version_line(report, label, server)
         read, ms2, error = timed(ats_cluster.remote, server, {'kind': 'http', 'method': 'GET', 'path': '/api/manage/services'})
         if error:
             report.add(FAIL, label, f'signed health passed, but a service read failed: {error}',
@@ -199,6 +202,100 @@ def check_global(report, store, node, port=None, cloudflare_config=None, **plan_
                'run "server doctor" again after fixing the adapter' if error else '')
 
 
+def terminal_line(report, label, health):
+    """Whether a Global can open terminals for Monitor. Older Globals do not report it at all."""
+    if 'terminal' not in health:
+        report.add(WARN, f'{label}: terminal', 'this Global runs an older ATS that cannot report terminal support',
+                   'update it: Monitor → Settings → Servers → Update, or git pull on that server and restart ATS')
+    elif health['terminal']:
+        report.add(OK, f'{label}: terminal', 'available (Monitor can open a shell on it)')
+    else:
+        report.add(WARN, f'{label}: terminal', health.get('terminal_reason') or 'not available',
+                   'a terminal needs a PTY and a login shell for the service user; see the reason above')
+
+
+def version_line(report, label, server):
+    """Compare the Global's code to this Local's. Differences are a warning, not a failure: mixed versions usually work."""
+    import ats_status
+    try:
+        remote_info = ats_cluster.remote(server, {'kind': 'status'}, timeout=15)
+    except ats_cluster.TransportError:
+        report.add(WARN, f'{label}: version', 'this Global does not report its version (older ATS)',
+                   'update it: Monitor → Settings → Servers → Update, or git pull on that server and restart ATS')
+        return
+    mine = ats_status.repo_info(Path(__file__).resolve().parent).get('commit')
+    theirs = (remote_info.get('ats') or {})
+    if not theirs.get('available'):
+        report.add(WARN, f'{label}: version', 'the ATS folder on that Global is not a git checkout, so it cannot be compared or updated remotely')
+    elif mine and theirs.get('commit') != mine:
+        report.add(WARN, f'{label}: version', f"ATS {theirs.get('short')} on the Global, {mine[:7]} here",
+                   'update the older one: Monitor → Settings → Servers → Update')
+    else:
+        report.add(OK, f'{label}: version', f"ATS {theirs.get('short')} (same as this Local)")
+
+
+def tool_checks(report):
+    """Docker and rclone are optional, but deployments and backups need them; say what is missing and how to add it."""
+    def run_quiet(argv, timeout=10):
+        try:
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    if not shutil.which('docker'):
+        report.add(WARN, 'Docker', 'not installed (needed by Docker-based services)',
+                   'Monitor → Settings → Servers → Install Docker, or: sudo apt-get install docker.io')
+    else:
+        result = run_quiet(['docker', 'version', '--format', '{{.Server.Version}}'])
+        if result and result.returncode == 0 and result.stdout.strip():
+            report.add(OK, 'Docker', f'version {result.stdout.strip()}, daemon reachable')
+        else:
+            report.add(FAIL, 'Docker', 'installed but the daemon does not answer',
+                       'start it: sudo systemctl enable --now docker; check with: sudo docker info')
+    if not shutil.which('rclone'):
+        report.add(WARN, 'rclone', 'not installed (needed for cloud backups)',
+                   'Monitor → Settings → Servers → Install rclone, or: sudo apt-get install rclone')
+    else:
+        result = run_quiet(['rclone', 'listremotes'])
+        remotes = [x for x in (result.stdout.split() if result and result.returncode == 0 else [])]
+        if result is None or result.returncode:
+            report.add(FAIL, 'rclone', 'installed but "rclone listremotes" failed', 'run it by hand to see why')
+        elif remotes:
+            report.add(OK, 'rclone', f'{len(remotes)} remote(s) configured')
+        else:
+            report.add(WARN, 'rclone', 'installed but no remote is configured', 'run: rclone config')
+    import ats_terminal
+    ok, reason = ats_terminal.available()
+    report.add(OK if ok else WARN, 'Terminal', 'this server can open terminals for Monitor' if ok else (reason or 'not available'),
+               '' if ok else 'a terminal needs a PTY and a login shell for the service user')
+
+
+def backup_and_alert_checks(report, store, node):
+    import ats_notify
+    import ats_registry_backup as backups
+    last = backups.status(store)
+    newest = last['newest']
+    if not newest:
+        report.add(WARN, 'Registry backup', 'no backup exists yet; the registry holds every key',
+                   'the daemon makes one daily; make one now with: sudo python3 app.py server backup --encrypt')
+    elif time.time() - newest['at'] > 3 * backups.INTERVAL:
+        report.add(WARN, 'Registry backup', f"newest backup is {int((time.time() - newest['at']) / 86400)} days old",
+                   'check the daemon is running and its journal; or run: sudo python3 app.py server backup')
+    elif last['last'] and last['last'].get('error'):
+        report.add(WARN, 'Registry backup', 'last scheduled backup failed: ' + last['last']['error'], 'fix the cause, or run: sudo python3 app.py server backup')
+    else:
+        report.add(OK, 'Registry backup', f"{last['count']} kept, newest {int((time.time() - newest['at']) / 3600)} h old" + (', encrypted' if newest['encrypted'] else ', not encrypted'))
+    if node['role'] == 'local':
+        config = ats_notify.load(store)
+        if not any(config['enabled'].values()):
+            report.add(WARN, 'Alerts', 'no alert channel is turned on, so a server going down is only visible in Monitor',
+                       'Monitor → Settings → Servers → Alerts: add ntfy, Telegram or a webhook')
+        else:
+            note = store.kv_get('fleet_notify')
+            failed = [k for k, v in ((note or {}).get('outcome') or {}).items() if not v.get('ok')]
+            report.add(WARN if failed else OK, 'Alerts', ('last delivery failed for ' + ', '.join(failed)) if failed else
+                       'on for ' + ', '.join(k for k, v in config['enabled'].items() if v), 'check the address or token under Alerts' if failed else '')
+
+
 def run(store, *, port=None, cloudflare_config=None, **plan_options):
     report = Report()
     node = store.node()
@@ -206,6 +303,8 @@ def run(store, *, port=None, cloudflare_config=None, **plan_options):
         report.add(FAIL, 'ATS setup', 'this instance is not configured', 'run: sudo python3 app.py (interactive) or server configure')
         return report
     registry_checks(report, store)
+    backup_and_alert_checks(report, store, node)
+    tool_checks(report)
     if node['role'] == 'local':
         check_local(report, store, node)
     else:
