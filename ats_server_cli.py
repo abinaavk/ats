@@ -16,7 +16,7 @@ from ats_cluster import Store
 
 def _main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (signed HTTPS management and automatic Global setup)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials', 'doctor', 'pair-code', 'rotate-global', 'backup', 'backups', 'restore'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials', 'doctor', 'pair-code', 'rotate-global', 'backup', 'backups', 'restore', 'backup-push', 'backup-fetch'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
@@ -52,6 +52,7 @@ def _main():
     parser.add_argument('--passphrase-file', help='backup/restore: file whose first line is the passphrase')
     parser.add_argument('--force', action='store_true', help='restore: allow a backup from a different server identity')
     parser.add_argument('--yes', action='store_true', help='restore: do not ask for confirmation')
+    parser.add_argument('--backup-name', help='backup-fetch: which stored copy to bring back (default: the newest)')
     args = parser.parse_args()
     if (args.monitor_adapter or args.adapter_state_dir) and args.action not in ('service', 'adapter', 'setup', 'configure'):
         parser.error('Adapter options require server service or server adapter')
@@ -122,7 +123,7 @@ def _main():
         import asyncio
         import app as runtime
         asyncio.run(runtime.run_daemon())
-    elif args.action in ('backup', 'backups', 'restore'):
+    elif args.action in ('backup', 'backups', 'restore', 'backup-push', 'backup-fetch'):
         registry_backup_command(store, args, parser)
     elif args.action == 'pair-code':
         code, expires = store.make_pair_code(args.minutes or 10)
@@ -315,7 +316,22 @@ def registry_backup_command(store, args, parser):
         if confirm and value != getpass.getpass('Repeat passphrase: '):
             raise ValueError('The passphrases do not match')
         return value
-    if args.action == 'backup':
+    if args.action == 'backup-push':
+        results = backups.push_offsite(store, passphrase(True) if (args.passphrase_file or sys.stdin.isatty()) and not os.environ.get('ATS_REGISTRY_BACKUP_PASSPHRASE_FILE') else None)
+        for result in results.values():
+            print(f"{result['server']}: " + (f"copy stored ({result['name']}, {result['size']} bytes, encrypted)" if result['ok'] else 'FAILED: ' + result['error']))
+        if not all(r['ok'] for r in results.values()):
+            raise ValueError('At least one copy could not be sent')
+    elif args.action == 'backup-fetch':
+        if not args.output:
+            parser.error('--output is required')
+        candidates = [x for x in store.servers() if not x['local']]
+        sid = args.server_id or (candidates[0]['id'] if len(candidates) == 1 else None)
+        if not sid:
+            parser.error('--server-id is required when there is not exactly one Global')
+        got = backups.fetch_offsite(store, store.server(sid), args.backup_name, args.output)
+        print(f"Fetched {got['name']} ({got['size']} bytes) to {got['path']}. It is still encrypted: restore it with  server restore --input {got['path']}")
+    elif args.action == 'backup':
         made = backups.create(store, args.output, passphrase(True) if (args.encrypt or args.passphrase_file) else None)
         print(f"Registry backed up to {made['path']} ({made['size']} bytes, {'encrypted' if made['encrypted'] else 'NOT encrypted'}, mode 0600).")
         if not made['encrypted']:
@@ -325,6 +341,8 @@ def registry_backup_command(store, args, parser):
         for item in items:
             print(f"{item['name']}  {time.strftime('%Y-%m-%d %H:%M', time.localtime(item['at']))}  {item['size']} bytes  {'encrypted' if item['encrypted'] else 'plain'}")
         print(f'{len(items)} backup(s) in {backups.directory(store)}' if items else 'No automatic backups yet; the daemon makes one daily, or run "server backup".')
+        for result in backups.offsite_status(store).values():
+            print(f"off-host copy on {result.get('server', 'a Global')}: " + (f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(result['at']))} ({result.get('name')})" if result.get('ok') else 'last attempt FAILED: ' + str(result.get('error'))))
     else:
         if not args.input:
             parser.error('--input is required')

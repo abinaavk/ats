@@ -356,6 +356,27 @@ class FleetChecksTests(unittest.TestCase):
             doctor.version_line(report, 'Global', {})
         self.assertIn('older ATS', report.items[0]['detail'])
 
+    def test_off_host_backup_is_checked_when_there_is_a_global_to_send_to(self):
+        import ats_registry_backup as backups
+        self.store.configure('local', 'Primary', webhook='hooks.example.com')
+
+        def run():
+            report = doctor.Report()
+            doctor.backup_and_alert_checks(report, self.store, self.store.node())
+            return {i['title']: i for i in report.items}
+        self.assertNotIn('Off-host backup', run())                                  # nothing to send to yet: no noise
+        with patch.object(c.Store, '_verified', return_value={}):
+            self.store.pair('b' * 32, 'Remote', 'https://api.example.com', 'c' * 64)
+        found = run()['Off-host backup']
+        self.assertEqual(found['level'], 'warn')
+        self.assertIn('backup-push', found['fix'])
+        self.store.kv_set('registry_backup_offsite', {'b' * 32: {'ok': False, 'at': 1, 'error': 'refused', 'server': 'Remote'}})
+        self.assertIn('failed: refused', run()['Off-host backup']['detail'])
+        self.store.kv_set('registry_backup_offsite', {'b' * 32: {'ok': True, 'at': time.time() - 5 * 86400, 'server': 'Remote'}})
+        self.assertIn('3 days old', run()['Off-host backup']['detail'])
+        self.store.kv_set('registry_backup_offsite', {'b' * 32: {'ok': True, 'at': time.time() - 3600, 'server': 'Remote'}})
+        self.assertEqual(run()['Off-host backup']['level'], 'ok')
+
     def test_failed_services_are_listed_and_ignored_ones_are_not(self):
         report = doctor.Report()
         doctor.failed_unit_line(report, 'This server', ['atopacct.service', 'morphic.service'], ['atopacct.service'])

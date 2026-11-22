@@ -85,6 +85,16 @@ def dispatch(store, data, authenticated=None):
         except Exception:
             pass
         return {'revoked': True}
+    if kind in ('backup.put', 'backup.list', 'backup.get'):
+        import ats_registry_backup as offsite
+        try:
+            if kind == 'backup.put':
+                return offsite.receive(store, data)
+            if kind == 'backup.list':
+                return {'backups': offsite.list_offsite(store)}
+            return offsite.read_part(store, data.get('name'), data.get('index'))
+        except ValueError as exc:
+            raise PublicError(str(exc)) from None
     if kind == 'rotate':
         fresh = store.rotate_own_secret(authenticated or store.node())
         try:

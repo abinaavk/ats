@@ -112,9 +112,17 @@ class SessionTests(TerminalBase):
         time.sleep(0.6)
         one = terminal.handle('term.read', {'sid': sid, 'since': after_first, 'wait': 2})
         again = terminal.handle('term.read', {'sid': sid, 'since': after_first, 'wait': 0})   # the response was "lost"
-        self.assertEqual(one['data'], again['data'])
-        self.assertIn(b'second-marker', base64.b64decode(again['data']))
+        # The shell may print more between the two reads on a busy machine, so the second read must START with
+        # everything the first returned (nothing lost, nothing reordered); on an idle one they are identical.
+        sent, repeated = base64.b64decode(one['data']), base64.b64decode(again['data'])
+        self.assertTrue(repeated.startswith(sent), (sent, repeated))
+        self.assertTrue(sent, 'the first read returned nothing')
         self.assertFalse(again['lost'])
+        # Once the output has settled the repeated read contains the command's result as well.
+        deadline = time.time() + 20
+        while time.time() < deadline and b'second-marker' not in base64.b64decode(terminal.handle('term.read', {'sid': sid, 'since': after_first, 'wait': 0})['data']):
+            time.sleep(0.1)
+        self.assertIn(b'second-marker', base64.b64decode(terminal.handle('term.read', {'sid': sid, 'since': after_first, 'wait': 0})['data']))
 
     def test_buffer_is_bounded_and_a_slow_reader_is_told_it_missed_output(self):
         with patch.object(terminal, 'BUFFER_LIMIT', 4096):

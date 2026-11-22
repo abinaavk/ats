@@ -295,6 +295,19 @@ def backup_and_alert_checks(report, store, node):
         report.add(WARN, 'Registry backup', 'last scheduled backup failed: ' + last['last']['error'], 'fix the cause, or run: sudo python3 app.py server backup')
     else:
         report.add(OK, 'Registry backup', f"{last['count']} kept, newest {int((time.time() - newest['at']) / 3600)} h old" + (', encrypted' if newest['encrypted'] else ', not encrypted'))
+    if node['role'] == 'local' and any(not x['local'] and x['paired'] and x['connected'] for x in store.servers()):
+        copies = backups.offsite_status(store)
+        bad = [v for v in copies.values() if not v.get('ok')]
+        stale = [v for v in copies.values() if v.get('ok') and time.time() - v['at'] > 3 * backups.INTERVAL]
+        if not copies:
+            report.add(WARN, 'Off-host backup', 'no copy of the registry has left this server; if this disk is lost, so are the backups',
+                       'set ATS_REGISTRY_BACKUP_PASSPHRASE_FILE so the daily backup is encrypted and sent to your Globals, or run: sudo python3 app.py server backup-push')
+        elif bad:
+            report.add(WARN, 'Off-host backup', 'last copy to ' + ', '.join(v.get('server', '?') for v in bad) + ' failed: ' + str(bad[0].get('error')), 'check that Global with "server doctor", then run: sudo python3 app.py server backup-push')
+        elif stale:
+            report.add(WARN, 'Off-host backup', 'newest copy is more than 3 days old', 'check the daemon is running; or run: sudo python3 app.py server backup-push')
+        else:
+            report.add(OK, 'Off-host backup', 'newest copy sent ' + str(int((time.time() - max(v['at'] for v in copies.values())) / 3600)) + ' h ago to ' + ', '.join(sorted(v.get('server', '?') for v in copies.values())))
     if node['role'] == 'local':
         config = ats_notify.load(store)
         if not any(config['enabled'].values()):
