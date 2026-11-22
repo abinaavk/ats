@@ -28,6 +28,15 @@ REPO = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
 USER_AGENT = 'ATS-Cluster/1 (+https://github.com/abinaavk/ats)'
 
 
+PAIR_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+PAIR_LENGTH = 12
+KEY_GRACE = 600
+
+
+class RateLimited(ValueError):
+    """Too many pairing attempts in a short time."""
+
+
 class TransportError(ValueError):
     """A failure whose message is written by ATS and safe to show an operator.
 
@@ -85,6 +94,10 @@ class Store:
               CREATE UNIQUE INDEX IF NOT EXISTS route_secret_unique ON routes(secret);
               CREATE TABLE IF NOT EXISTS seen(scope TEXT, nonce TEXT, created REAL,
                 state TEXT, result TEXT, PRIMARY KEY(scope,nonce));
+              CREATE TABLE IF NOT EXISTS previous_key(one INTEGER PRIMARY KEY CHECK(one=1), secret TEXT NOT NULL, until REAL NOT NULL);
+              CREATE TABLE IF NOT EXISTS pair_codes(hash TEXT PRIMARY KEY, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+              CREATE TABLE IF NOT EXISTS pair_attempts(at REAL NOT NULL);
+              CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             ''')
             db.execute('BEGIN IMMEDIATE')
             columns = {row['name'] for row in db.execute('PRAGMA table_info(servers)')}
@@ -323,6 +336,121 @@ class Store:
                               (scope, nonce, time.time())).rowcount == 1
 
 
+    # ── small persistent state used by workers (alerts, backups) ──
+    def kv_get(self, key, default=None):
+        with self.db() as db:
+            row = db.execute('SELECT value FROM kv WHERE key=?', (key,)).fetchone()
+        return json.loads(row['value']) if row else default
+
+    def kv_set(self, key, value):
+        with self.db() as db:
+            db.execute('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value)))
+
+    # ── key rotation: the old key keeps working briefly so a crash mid-way cannot lock anyone out ──
+    def previous_key(self):
+        with self.db() as db:
+            row = db.execute('SELECT secret,until FROM previous_key WHERE one=1').fetchone()
+        return row['secret'] if row and row['until'] > time.time() else None
+
+    def rotate_own_secret(self, current):
+        """Global side: install a fresh key; the old one stays valid for KEY_GRACE seconds."""
+        fresh = secrets.token_hex(32)
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('UPDATE node SET secret=? WHERE id=? AND secret=?', (fresh, current['id'], current['secret'])).rowcount != 1:
+                raise ValueError('Credential changed before rotation; authenticate again')
+            db.execute('INSERT INTO previous_key(one,secret,until) VALUES(1,?,?) ON CONFLICT(one) DO UPDATE SET secret=excluded.secret,until=excluded.until',
+                       (current['secret'], time.time() + KEY_GRACE))
+        return fresh
+
+    def clear_previous_key(self, db=None):
+        if db is not None:
+            db.execute('DELETE FROM previous_key')
+            return
+        with self.db() as connection:
+            connection.execute('DELETE FROM previous_key')
+
+    def rotate_global(self, sid):
+        """Local side: have the Global rotate its key over the signed channel, verify the new key, then save it."""
+        self._local()
+        server = self.server(sid)
+        if server['local'] or not server['secret'] or not server['connected'] or server['revocation_pending']:
+            raise ValueError('Reconnect this server with a verified key before rotating it')
+        result = remote(server, {'kind': 'rotate'})
+        fresh = result.get('secret')
+        if not isinstance(fresh, str) or not re.fullmatch('[0-9a-f]{64}', fresh):
+            raise ValueError('The Global returned an invalid key; nothing was changed')
+        try:
+            self._verified(dict(server, secret=fresh))
+        except ValueError as exc:
+            raise ValueError(f'The new key could not be verified ({exc}). The old key still works for {KEY_GRACE // 60} minutes; retry, or use the Global\'s pairing file.') from None
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._unchanged(db, server)
+            self._unique_secret(db, fresh, sid)
+            db.execute('UPDATE servers SET secret=?,revision=revision+1 WHERE id=?', (fresh, sid))
+        return {'grace_seconds': result.get('grace_seconds', KEY_GRACE)}
+
+    # ── one-time pairing codes: no key is copied by hand ──
+    @staticmethod
+    def _normalize_code(code):
+        text = ''.join(ch for ch in str(code).upper() if ch not in '- \t')
+        return text if len(text) == PAIR_LENGTH and all(ch in PAIR_ALPHABET for ch in text) else None
+
+    @staticmethod
+    def _code_hash(normalized):
+        return hashlib.sha256(('ats-pair:' + normalized).encode()).hexdigest()
+
+    def make_pair_code(self, minutes=10):
+        node = self.node()
+        if not node or node['role'] != 'global':
+            raise ValueError('Only a Global creates pairing codes')
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 60:
+            raise ValueError('Choose between 1 and 60 minutes')
+        raw = ''.join(secrets.choice(PAIR_ALPHABET) for _ in range(PAIR_LENGTH))
+        expires = time.time() + minutes * 60
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('DELETE FROM pair_codes WHERE used=1 OR expires<?', (time.time(),))
+            if db.execute('SELECT count(*) FROM pair_codes').fetchone()[0] >= 5:
+                raise ValueError('Five pairing codes are already active; wait for one to expire or be used')
+            db.execute('INSERT INTO pair_codes(hash,expires,used) VALUES(?,?,0)', (self._code_hash(raw), expires))
+        return '-'.join(raw[i:i + 4] for i in (0, 4, 8)), expires
+
+    def redeem_pair_code(self, code):
+        """Global side: a valid, unused, unexpired code returns the pairing details exactly once."""
+        node = self.node()
+        if not node or node['role'] != 'global' or not node['secret']:
+            raise ValueError('Invalid or expired pairing code')
+        normalized, now = self._normalize_code(code), time.time()
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('DELETE FROM pair_attempts WHERE at<?', (now - 300,))
+            if db.execute('SELECT count(*) FROM pair_attempts WHERE at>?', (now - 60,)).fetchone()[0] >= 8:
+                raise RateLimited('Too many pairing attempts')
+            db.execute('INSERT INTO pair_attempts(at) VALUES(?)', (now,))
+            used = bool(normalized) and db.execute('UPDATE pair_codes SET used=1 WHERE hash=? AND used=0 AND expires>?',
+                                                   (self._code_hash(normalized), now)).rowcount == 1
+        if not used:
+            raise ValueError('Invalid or expired pairing code')
+        return {'id': node['id'], 'name': node['name'], 'domain': node['domain'], 'secret': node['secret'], 'role': 'global'}
+
+    def pair_by_code(self, origin, code, label=None):
+        """Local side: exchange a code for the Global's details, then verify them with a signed health request."""
+        self._local()
+        origin = domain(origin)
+        bundle = pair_remote(origin, code)
+        return self.pair(bundle['id'], label or bundle['name'], origin, bundle['secret'])
+
+    # ── webhook mappings as data (never including the secret) ──
+    def unmap(self, repository):
+        if not isinstance(repository, str) or not REPO.fullmatch(repository):
+            raise ValueError('Explicit owner/repository required')
+        with self.db() as db:
+            if db.execute('DELETE FROM routes WHERE repository=?', (repository.lower(),)).rowcount != 1:
+                raise ValueError('No such mapping')
+
+
 def canonical(method, path, body, sid, timestamp, nonce):
     return '\n'.join((method, path, sid, timestamp, nonce, hashlib.sha256(body).hexdigest())).encode()
 
@@ -344,8 +472,12 @@ def authenticate(store, method, path, body, headers):
         raise ValueError('Unauthorized')
     if not re.fullmatch('[0-9a-f]{64}', sig):
         raise ValueError('Unauthorized')
-    expected = hmac.new(n['secret'].encode(), canonical(method, path, body, sid, ts, nonce), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, sig) or not store.claim('auth', nonce):
+    message = canonical(method, path, body, sid, ts, nonce)
+    ok = hmac.compare_digest(hmac.new(n['secret'].encode(), message, hashlib.sha256).hexdigest(), sig)
+    if not ok:
+        previous = store.previous_key()
+        ok = bool(previous) and hmac.compare_digest(hmac.new(previous.encode(), message, hashlib.sha256).hexdigest(), sig)
+    if not ok or not store.claim('auth', nonce):
         raise ValueError('Unauthorized')
     return n
 
@@ -401,18 +533,9 @@ def _http_failure(host, status, headers, data):
                           'Check the hostname points at the ATS API tunnel route.', 'protocol')
 
 
-def remote(server, payload, *, timeout=None):
-    if server['local'] or not server['connected'] or not server['secret']:
-        raise TransportError('Selected Global server is disconnected or revoked', 'disabled')
-    u = urlsplit(domain(server['domain']))
-    host = u.hostname + (':' + str(u.port) if u.port and u.port != 443 else '')
-    body = json.dumps(payload, separators=(',', ':')).encode()
-    if len(body) > MAX_BODY:
-        raise ValueError('Request too large')
-    conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout or (5 if payload.get('kind') == 'health' else 10 if payload.get('kind') == 'revoke' else 65))
-    headers = signed_headers(server['secret'], server['id'], body)
-    headers['User-Agent'] = USER_AGENT
-    headers['Accept'] = 'application/json'
+def _exchange(u, host, body, headers, timeout):
+    """One HTTPS POST to /v1/request with every failure explained in words an operator can act on."""
+    conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout)
     try:
         try:
             conn.request('POST', '/v1/request', body, headers)
@@ -437,15 +560,57 @@ def remote(server, payload, *, timeout=None):
             raise TransportError('Global transport returned an invalid or incomplete response', 'protocol') from None
         if len(data) > MAX_OUTPUT:
             raise TransportError(f'{host} returned an oversized response', 'protocol')
-        if r.status != 200:
-            raise _http_failure(host, r.status, r.headers, data)
-        result = _safe_json(data)
-        if result is None or result.get('server_id') != server['id']:
-            raise TransportError('Global response identity mismatch: the hostname answers for a different server ID', 'auth')
-        if result.get('ok') is not True:
-            raise TransportError(_public_error(result.get('error')) or 'Global operation failed', 'adapter')
-        if not isinstance(result.get('data'), dict):
-            raise TransportError('Invalid Global response payload', 'protocol')
-        return result['data']
+        return r, data
     finally:
         conn.close()
+
+
+def _host(u):
+    return u.hostname + (':' + str(u.port) if u.port and u.port != 443 else '')
+
+
+def remote(server, payload, *, timeout=None):
+    if server['local'] or not server['connected'] or not server['secret']:
+        raise TransportError('Selected Global server is disconnected or revoked', 'disabled')
+    u = urlsplit(domain(server['domain']))
+    host = _host(u)
+    body = json.dumps(payload, separators=(',', ':')).encode()
+    if len(body) > MAX_BODY:
+        raise ValueError('Request too large')
+    headers = signed_headers(server['secret'], server['id'], body)
+    headers['User-Agent'] = USER_AGENT
+    headers['Accept'] = 'application/json'
+    kind = payload.get('kind')
+    r, data = _exchange(u, host, body, headers, timeout or (5 if kind == 'health' else 10 if kind in ('revoke', 'rotate') else 65))
+    if r.status != 200:
+        raise _http_failure(host, r.status, r.headers, data)
+    result = _safe_json(data)
+    if result is None or result.get('server_id') != server['id']:
+        raise TransportError('Global response identity mismatch: the hostname answers for a different server ID', 'auth')
+    if result.get('ok') is not True:
+        raise TransportError(_public_error(result.get('error')) or 'Global operation failed', 'adapter')
+    if not isinstance(result.get('data'), dict):
+        raise TransportError('Invalid Global response payload', 'protocol')
+    return result['data']
+
+
+def pair_remote(origin, code, *, timeout=15):
+    """Trade a one-time pairing code for a Global's pairing details. The request is not signed: there is no key yet."""
+    u = urlsplit(domain(origin))
+    host = _host(u)
+    body = json.dumps({'kind': 'pair', 'code': code}, separators=(',', ':')).encode()
+    r, data = _exchange(u, host, body, {'Content-Type': 'application/json', 'User-Agent': USER_AGENT, 'Accept': 'application/json'}, timeout)
+    if r.status == 403:
+        raise TransportError('The pairing code was not accepted: it is wrong, already used or expired. '
+                             'Create a new one on that Global with "server pair-code".', 'auth')
+    if r.status == 429:
+        raise TransportError(f'{host} has had too many pairing attempts. Wait a few minutes and try again.', 'ratelimit')
+    if r.status != 200:
+        raise _http_failure(host, r.status, r.headers, data)
+    result = _safe_json(data) or {}
+    bundle = result.get('data')
+    if not isinstance(bundle, dict) or not ID.fullmatch(str(bundle.get('id', ''))) or bundle.get('id') != result.get('server_id') \
+            or not re.fullmatch('[0-9a-f]{64}', str(bundle.get('secret', ''))) or bundle.get('role') != 'global':
+        raise TransportError('The server did not answer like an ATS Global; check the address.', 'protocol')
+    name(bundle.get('name'))
+    return bundle

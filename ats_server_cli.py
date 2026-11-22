@@ -16,7 +16,7 @@ from ats_cluster import Store
 
 def _main():
     parser = argparse.ArgumentParser(description='ATS multi-server configuration (signed HTTPS management and automatic Global setup)')
-    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials', 'doctor'])
+    parser.add_argument('action', choices=['configure', 'show', 'export', 'rotate', 'serve', 'map', 'unmap', 'pair', 'disconnect', 'reconnect', 'revoke', 'tunnel', 'service', 'adapter', 'setup', 'replace-credentials', 'doctor', 'pair-code', 'rotate-global'])
     parser.add_argument('--role', choices=['local', 'global'])
     parser.add_argument('--name')
     parser.add_argument('--api-domain')
@@ -43,6 +43,9 @@ def _main():
     parser.add_argument('--generate-secret', action='store_true', help='map: create a fresh webhook secret and show it once')
     parser.add_argument('--replace-mapping', action='store_true')
     parser.add_argument('--json', action='store_true', help='doctor: machine-readable output')
+    parser.add_argument('--domain', help='pair: the Global\'s HTTPS address, used with --code')
+    parser.add_argument('--code', help='pair: a one-time pairing code made with "server pair-code" on that Global')
+    parser.add_argument('--minutes', type=int, help='pair-code: how long the code works (default 10)')
     args = parser.parse_args()
     if (args.monitor_adapter or args.adapter_state_dir) and args.action not in ('service', 'adapter', 'setup', 'configure'):
         parser.error('Adapter options require server service or server adapter')
@@ -50,8 +53,10 @@ def _main():
         parser.error('--apply requires server configure or server setup')
     if args.install_monitor and (not args.apply or args.action not in ('configure', 'setup')):
         parser.error('--install-monitor requires --apply with server setup or server configure')
-    if args.action in ('pair', 'replace-credentials') and not args.pairing_file:
+    if args.action == 'replace-credentials' and not args.pairing_file:
         parser.error('--pairing-file is required')
+    if args.action == 'pair' and not args.pairing_file and not (args.domain and args.code):
+        parser.error('--pairing-file is required (or --domain and --code for a one-time pairing code)')
     if args.action in ('disconnect', 'reconnect', 'revoke') and not args.server_id:
         parser.error('--server-id is required')
     if args.action == 'map':
@@ -111,6 +116,21 @@ def _main():
         import asyncio
         import app as runtime
         asyncio.run(runtime.run_daemon())
+    elif args.action == 'pair-code':
+        code, expires = store.make_pair_code(args.minutes or 10)
+        print_pair_code(store, code, expires)
+    elif args.action == 'rotate-global':
+        sid = args.server_id
+        if not sid:
+            candidates = [x for x in store.servers() if not x['local']]
+            if len(candidates) != 1:
+                parser.error('--server-id is required when there is not exactly one Global')
+            sid = candidates[0]['id']
+        result = store.rotate_global(sid)
+        print(f"Key rotated and verified. The old key keeps working for {result['grace_seconds'] // 60} more minutes; nothing needs to be copied.")
+    elif args.action == 'pair' and args.code:
+        store.pair_by_code(args.domain, args.code, args.name)
+        print('Global server paired and verified')
     elif args.action in ('pair', 'replace-credentials'):
         with open(args.pairing_file) as f:
             bundle = json.load(f)
@@ -271,6 +291,16 @@ def map_repository(store, args):
         print("  Secret      : the service's existing webhook secret. A GitHub webhook that already uses this URL and secret needs no change.")
     else:
         print('  Secret      : the one in your secret file')
+
+
+def print_pair_code(store, code, expires):
+    import time
+    node = store.node() or {}
+    minutes = max(1, round((expires - time.time()) / 60))
+    print(f'One-time pairing code: {code}')
+    print(f'  Valid for about {minutes} minutes, works once, and can be created again at any time.')
+    print(f"  In Monitor: Settings -> Servers -> Add a Global server -> address {node.get('domain')} and this code.")
+    print(f"  Or on the Local server: server pair --domain {node.get('domain')} --code {code}")
 
 
 def setup_global(store, args):
@@ -537,6 +567,7 @@ def rotate_pairing(store, path=None):
             node['secret'] = secrets.token_hex(32)
             json.dump(node, f)
         db.execute('UPDATE node SET secret=?', (node['secret'],))
+        store.clear_previous_key(db)
     print('Credentials rotated. Re-pair this Global on Local using the private file.')
 
 
@@ -705,8 +736,9 @@ def menu(store=None, ui=None):
                 ('7', 'Reconnect Global'), ('8', 'Revoke Global'),
                 ('9', 'Check Global API tunnel route'), ('10', 'Preview automatic startup service'),
                 ('11', 'Set up Global API service and tunnel'), ('12', 'Update saved Global ID / passkey'),
-                ('13', 'Run health check (doctor)'), ('0', 'Back'))
-        allowed = {'1', '10', '13', '0'} | ({'2', '3', '9', '11'} if node.get('role') == 'global' else {'4', '5', '6', '7', '8', '12'})
+                ('13', 'Run health check (doctor)'), ('14', 'Create a one-time pairing code'),
+                ('15', 'Pair a Global with a one-time code'), ('16', "Rotate a Global's key from here"), ('0', 'Back'))
+        allowed = {'1', '10', '13', '0'} | ({'2', '3', '9', '11', '14'} if node.get('role') == 'global' else {'4', '5', '6', '7', '8', '12', '15', '16'})
         for number, label in options:
             if number not in allowed:
                 continue
@@ -732,6 +764,18 @@ def menu(store=None, ui=None):
                 if proceed:
                     args.apply = True
                     setup_global(store, args)
+            elif choice == '14':
+                code, expires = store.make_pair_code(10)
+                print_pair_code(store, code, expires)
+            elif choice == '15':
+                origin = input('Global HTTPS address (for example https://api.example.com): ').strip()
+                store.pair_by_code(origin, input('One-time pairing code: ').strip())
+                status('Global paired and verified', 'success')
+            elif choice == '16':
+                sid = input('Global server ID: ').strip()
+                if input('Rotate this Global\'s key now? The new key is verified before it is saved. [yes/NO] ') == 'yes':
+                    store.rotate_global(sid)
+                    status('Key rotated and verified; nothing needs to be copied', 'success')
             elif choice == '13':
                 import ats_doctor
                 print(ats_doctor.run(store).text())
