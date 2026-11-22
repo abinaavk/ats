@@ -74,6 +74,7 @@ def dispatch(store, data, authenticated=None):
             if db.execute('UPDATE node SET secret=? WHERE id=? AND secret=?',
                           (secrets.token_hex(32), current['id'], current['secret'])).rowcount != 1:
                 raise ValueError('Credential changed before revocation; authenticate again')
+            store.clear_previous_key(db)
         # The exported pairing file must carry the replacement key, never the revoked one.
         try:
             import ats_server_cli
@@ -81,12 +82,31 @@ def dispatch(store, data, authenticated=None):
         except Exception:
             pass
         return {'revoked': True}
+    if kind == 'rotate':
+        fresh = store.rotate_own_secret(authenticated or store.node())
+        try:
+            import ats_server_cli
+            ats_server_cli.save_pairing(store)
+        except Exception:
+            pass
+        return {'secret': fresh, 'grace_seconds': cluster.KEY_GRACE}
     if kind == 'http':
         adapter = os.environ.get('ATS_MONITOR_ADAPTER')
         if not adapter or not Path(adapter).is_file():
             raise PublicError('Monitor host adapter is not configured on this Global server; '
                               'run "server setup --apply" on it')
         return execute([sys.executable, adapter], data)
+    if kind == 'status':
+        import ats_status
+        return ats_status.collect(os.environ.get('ATS_MONITOR_ADAPTER'))
+    if kind == 'update':
+        import ats_update
+        if not isinstance(data.get('restart', True), bool):
+            raise PublicError('restart must be true or false')
+        try:
+            return ats_update.update(data.get('targets', 'both'), restart=data.get('restart', True))
+        except ats_update.UpdateError as exc:
+            raise PublicError(str(exc)) from None
     if isinstance(kind, str) and kind.startswith('term.'):
         import ats_terminal
         try:
@@ -123,6 +143,21 @@ class Handler(BaseHTTPRequestHandler):
         # The time is not secret and lets the caller tell clock skew from a wrong key.
         return self.reply(401, {'ok': False, 'error': 'unauthorized', 'server_time': int(time.time())})
 
+    def pairing(self, body):
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return self.unauthorized()
+        if not isinstance(data, dict) or data.get('kind') != 'pair' or not isinstance(data.get('code'), str) or len(data['code']) > 64:
+            return self.unauthorized()
+        try:
+            bundle = self.server.store.redeem_pair_code(data['code'])
+        except cluster.RateLimited:
+            return self.reply(429, {'ok': False, 'error': 'Too many attempts'})
+        except ValueError:
+            return self.reply(403, {'ok': False, 'error': 'Invalid or expired pairing code'})
+        return self.reply(200, {'ok': True, 'server_id': bundle['id'], 'data': bundle})
+
     def reply(self, code, data):
         payload = json.dumps(data).encode()
         if len(payload) > cluster.MAX_OUTPUT:
@@ -143,6 +178,10 @@ class Handler(BaseHTTPRequestHandler):
             lengths = self.headers.get_all('Content-Length', [])
             if len(lengths) != 1 or not lengths[0].isdigit() or not 0 < int(lengths[0]) <= cluster.MAX_BODY:
                 return self.reply(413, {'ok': False})
+            if not self.headers.get('X-ATS-Signature') and not self.headers.get('X-ATS-Server'):
+                body = self.rfile.read(int(lengths[0]))
+                self.read_deadline.cancel()
+                return self.pairing(body)       # the only request accepted without a signature: a one-time pairing code
             for key in ('X-ATS-Server', 'X-ATS-Time', 'X-ATS-Nonce', 'X-ATS-Signature'):
                 if len(self.headers.get_all(key, [])) != 1:
                     return self.unauthorized()

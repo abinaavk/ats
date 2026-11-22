@@ -321,3 +321,5 @@ webhook delivery remain unverified until an authorized operator tests them.
 The operations behind Manage's delete, Cloudflare config editor and one-click installs are `services.delete`, `cloudflare.config.get` /
 `cloudflare.config.set` and `system.install` (only `docker` and `rclone`, from the apt or dnf packages, as root). All three report progress steps
 and run on the selected server, including a Global through the signed channel. `services.delete` is idempotent; see the Monitor's `docs/manage.md`.
+
+For version updates, pairing codes, key rotation, the fleet overview, alerts and registry backups see [fleet-operations.md](fleet-operations.md).

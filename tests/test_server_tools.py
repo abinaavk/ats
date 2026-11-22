@@ -1,9 +1,11 @@
 """Deleting services reliably, editing the Cloudflare tunnel config safely, installing Docker/rclone on demand."""
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -311,6 +313,84 @@ class CloudflareFileTests(Base):
         other = self.root / 'elsewhere.yml'
         runtime.cloudflare_file(self.a, 'cloudflare.config.set', dict(content=self.GOOD, base_sha256=self.get()['sha256'], path=str(other)))
         self.assertFalse(other.exists())
+
+
+    def backups(self):
+        return runtime.cloudflare_file(self.a, 'cloudflare.config.backups', {})['backups']
+
+    def restore(self, name, **extra):
+        return runtime.cloudflare_file(self.a, 'cloudflare.config.restore', dict(name=name, base_sha256=self.get()['sha256'], **extra))
+
+    def two_edits(self):
+        first = self.GOOD.replace('a.example.com', 'one.example.com')
+        self.set(first)
+        time.sleep(1.1)                                # backup names carry second resolution
+        self.set(first.replace('one.example.com', 'two.example.com'))
+        return first
+
+    def test_backups_are_listed_newest_first_with_the_hostnames_they_route(self):
+        self.assertEqual(self.backups(), [])
+        self.two_edits()
+        listed = self.backups()
+        self.assertEqual([b['hostnames'] for b in listed], [['one.example.com'], ['a.example.com']])
+        self.assertTrue(all(re.fullmatch(r'[0-9a-f]{64}', b['sha256']) and b['size'] > 0 for b in listed))
+        (self.path.parent / (self.path.name + '.bak-20200101-000000')).symlink_to(self.path)
+        (self.path.parent / 'other.yml.bak-20200101-000000').write_text(self.GOOD)
+        (self.path.parent / (self.path.name + '.bak-notadate')).write_text(self.GOOD)
+        self.assertEqual(len(self.backups()), 2)       # symlinks, other files' backups and odd names are never offered
+
+    def test_restoring_validates_backs_up_the_current_file_and_restarts(self):
+        self.two_edits()
+        target = self.backups()[1]
+        before = self.path.read_text()
+        result = self.restore(target['name'])
+        self.assertEqual(self.path.read_text(), self.GOOD)
+        self.assertEqual((result['restored'], result['restarted']), (target['name'], True))
+        self.assertEqual(Path(result['backup']).read_text(), before)         # restoring is itself undoable
+        self.assertEqual(len(self.restarts), 3)
+        self.assertEqual(self.backups()[0]['hostnames'], ['two.example.com'])
+
+    def test_a_backup_that_is_no_longer_valid_is_refused_and_nothing_changes(self):
+        self.two_edits()
+        name = self.backups()[0]['name']
+        (self.path.parent / name).write_text(self.GOOD + '# REJECT\n')
+        before, restarts = self.path.read_text(), len(self.restarts)
+        with self.assertRaisesRegex(ValueError, 'cloudflared rejected'):
+            self.restore(name)
+        self.assertEqual((self.path.read_text(), len(self.restarts)), (before, restarts))
+
+    def test_restore_rejects_names_outside_the_listed_pattern_and_stale_pages(self):
+        self.two_edits()
+        outside = self.root / 'secret.txt'
+        outside.write_text('x')
+        for bad in ('../secret.txt', str(outside), self.path.name, self.path.name + '.bak-20200101-000000/../../x', 'other.yml.bak-20200101-000000', None, 5, ['a']):
+            with self.assertRaises(ValueError, msg=bad):
+                self.restore(bad)
+        with self.assertRaisesRegex(self.a.ServiceOpError, 'no longer exists'):
+            self.restore(self.path.name + '.bak-20200101-000000')
+        link = self.path.parent / (self.path.name + '.bak-20200101-000001')
+        link.symlink_to(outside)
+        with self.assertRaises(self.a.ServiceOpError):
+            self.restore(link.name)                    # a symlink named like a backup is never followed
+        self.assertNotIn('x', self.path.read_text().split())
+        seen = self.get()['sha256']
+        self.path.write_text(self.GOOD + '# changed meanwhile\n')
+        with self.assertRaisesRegex(self.a.ServiceOpError, 'changed on the server'):
+            runtime.cloudflare_file(self.a, 'cloudflare.config.restore', dict(name=self.backups()[0]['name'], base_sha256=seen))
+
+    def test_a_restore_that_cannot_start_cloudflared_puts_the_previous_file_back(self):
+        self.two_edits()
+        calls = []
+
+        def restart(*a, **k):
+            calls.append(k)
+            if len(calls) == 1:
+                raise RuntimeError('cloudflared did not become active')
+        before = self.path.read_text()
+        with mock.patch.object(self.a, 'restart_cloudflared_resilient', restart):
+            with self.assertRaisesRegex(self.a.ServiceOpError, 'previous file was restored'):
+                self.restore(self.backups()[1]['name'])
+        self.assertEqual(self.path.read_text(), before)
 
 
 class InstallTests(Base):

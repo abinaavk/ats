@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -556,6 +557,29 @@ def delete(a, args):
 # ── Cloudflare tunnel config file: read and edit safely ──
 CF_MAX = 512 * 1024
 CF_BACKUP = re.compile(r'\.bak-\d{8}-\d{6}\Z')
+CF_BACKUP_NAME = re.compile(r'[A-Za-z0-9._-]{1,120}\.bak-\d{8}-\d{6}\Z')
+
+
+def cloudflare_backups(path, yaml):
+    """Timestamped copies the editor made next to the config, newest first, with what each one routes."""
+    folder, base, found = os.path.dirname(path), os.path.basename(path), []
+    try: names = os.listdir(folder)
+    except OSError: return []
+    for name in sorted(names, reverse=True):
+        if not (name.startswith(base + '.bak-') and CF_BACKUP.search(name)): continue
+        full = os.path.join(folder, name)
+        try:
+            info = os.lstat(full)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > CF_MAX: continue
+            with open(full, 'rb') as stream: data = stream.read()
+        except OSError: continue
+        hosts = []
+        try:
+            config = yaml.safe_load(data.decode('utf-8', 'replace')) or {}
+            hosts = sorted({rule.get('hostname') for rule in config.get('ingress', []) if isinstance(rule, dict) and rule.get('hostname')})
+        except Exception: pass
+        found.append({'name': name, 'at': int(info.st_mtime), 'size': info.st_size, 'sha256': hashlib.sha256(data).hexdigest(), 'hostnames': hosts[:50]})
+    return found
 
 
 def cloudflare_file(a, op, args):
@@ -581,7 +605,23 @@ def cloudflare_file(a, op, args):
             return {'path': a.CLOUDFLARE_CONFIG, 'exists': raw is not None, 'content': (raw or b'').decode('utf-8', 'replace'),
                     'sha256': digest, 'service': a.CLOUDFLARED_SERVICE, 'active': a.check_systemd_active(a.CLOUDFLARED_SERVICE),
                     'validator': bool(shutil.which('cloudflared'))}
+        if op == 'cloudflare.config.backups':
+            return {'path': a.CLOUDFLARE_CONFIG, 'backups': cloudflare_backups(path, a.yaml)}
         content, base, restart = args.get('content'), args.get('base_sha256'), args.get('restart', True)
+        restored = None
+        if op == 'cloudflare.config.restore':
+            restored = args.get('name')
+            if not isinstance(restored, str) or not CF_BACKUP_NAME.fullmatch(restored) or not restored.startswith(os.path.basename(path) + '.bak-'):
+                raise ValueError('Choose one of the listed backups')
+            try:
+                descriptor = os.open(os.path.join(os.path.dirname(path), restored), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                with os.fdopen(descriptor, 'rb') as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode): raise ValueError('Choose one of the listed backups')
+                    content = stream.read(CF_MAX + 1).decode('utf-8')
+            except FileNotFoundError:
+                raise a.ServiceOpError('That backup no longer exists. Reload the list.', 'conflict')
+            except (OSError, UnicodeDecodeError) as exc:
+                raise a.ServiceOpError('That backup cannot be read' + (f': {exc.strerror}' if isinstance(exc, OSError) else ' as text'))
         if not isinstance(content, str) or '\x00' in content: raise ValueError('content must be text')
         if not isinstance(base, str) or not re.fullmatch('[0-9a-f]{64}', base): raise ValueError('base_sha256 is required')
         if not isinstance(restart, bool): raise ValueError('restart must be true or false')
@@ -672,8 +712,9 @@ def cloudflare_file(a, op, args):
         else:
             warnings.append('The file was saved but cloudflared was not restarted, so the running tunnel still uses the old routes.')
         routes = {rule.get('hostname') for rule in config['ingress'] if isinstance(rule, dict)}
-        a.audit_log('CLOUDFLARE_CONFIG_EDIT', 'SYSTEM', {'bytes': len(text.encode()), 'restarted': restarted})
-        return {'saved': True, 'restarted': restarted, 'backup': saved.get('backup'), 'sha256': hashlib.sha256(text.encode()).hexdigest(),
+        a.audit_log('CLOUDFLARE_CONFIG_RESTORE' if restored else 'CLOUDFLARE_CONFIG_EDIT', 'SYSTEM',
+                    dict({'bytes': len(text.encode()), 'restarted': restarted}, **({'from': restored} if restored else {})))
+        return {'saved': True, 'restored': restored, 'restarted': restarted, 'backup': saved.get('backup'), 'sha256': hashlib.sha256(text.encode()).hexdigest(),
                 'missing_routes': sorted(x['domain'] for x in services if x['domain'] not in routes), 'warnings': warnings}
 
 
@@ -756,9 +797,9 @@ def install_dependency(a, args):
 
 
 def run(a, op, args):
-    if op not in {'cloudflare.config.get','cloudflare.config.set','system.install','cloudflare.status','cloudflare.sync','cloudflare.restart','services.deploy','services.delete','services.config.set','services.resources','services.action','webhook.test','services.redeploy'}:
+    if op not in {'cloudflare.config.get','cloudflare.config.set','cloudflare.config.backups','cloudflare.config.restore','system.install','cloudflare.status','cloudflare.sync','cloudflare.restart','services.deploy','services.delete','services.config.set','services.resources','services.action','webhook.test','services.redeploy'}:
         raise a.ServiceOpError('Unsupported operation','unsupported')
-    if op in ('cloudflare.config.get','cloudflare.config.set'): return cloudflare_file(a,op,args)
+    if op in ('cloudflare.config.get','cloudflare.config.set','cloudflare.config.backups','cloudflare.config.restore'): return cloudflare_file(a,op,args)
     if op=='system.install': return install_dependency(a,args)
     if op.startswith('cloudflare.'): return cloudflare(a,op,args)
     if op=='services.deploy': return deploy(a,args)

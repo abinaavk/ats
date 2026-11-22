@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -27,6 +28,13 @@ else:
     json.load(sys.stdin)
     print(json.dumps({"status": 200, "body": {"ok": True, "data": {"services": []}}}))
 '''
+
+
+def isolate(case):
+    """Doctor's host-tool probes must never touch the machine running the tests (it may have a real Docker)."""
+    probe = patch.object(doctor, 'tool_checks', lambda report: None)
+    probe.start()
+    case.addCleanup(probe.stop)
 
 
 def levels(report):
@@ -50,6 +58,7 @@ class LocalDoctorTests(unittest.TestCase):
         pairing = patch.object(cli, 'default_pairing_path', return_value=self.root / 'files' / 'pairing.json')
         pairing.start()
         self.addCleanup(pairing.stop)
+        isolate(self)
         self.global_store = c.Store(self.root / 'global.db')
         self.node = self.global_store.configure('global', 'Build', 'https://localhost')
         self.http = ats_remote.Server(('127.0.0.1', 0), self.global_store)
@@ -149,6 +158,7 @@ class GlobalDoctorTests(unittest.TestCase):
         pairing = patch.object(cli, 'default_pairing_path', return_value=self.pairing)
         pairing.start()
         self.addCleanup(pairing.stop)
+        isolate(self)
         self.store = c.Store()
         self.node = self.store.configure('global', 'Build', 'https://api.example.com')
         self.http = ats_remote.Server(('127.0.0.1', 0), self.store)
@@ -254,6 +264,114 @@ class GlobalDoctorTests(unittest.TestCase):
                 cli.main()
         self.assertEqual(caught.exception.code, 1)
         self.assertEqual(json.loads(out.getvalue())[0]['fix'], 'fix it')
+
+
+
+class FleetChecksTests(unittest.TestCase):
+    """Docker, rclone, terminal, version, backup and alert checks, with fake tools only."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        env = patch.dict(os.environ, {'PATH': str(self.bin)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.assertEqual(__import__('shutil').which('docker'), None)          # the host's real tools are out of reach
+        self.store = c.Store(self.root / 'registry.db')
+
+    def tool(self, name, script):
+        path = self.bin / name
+        path.write_text('#!/bin/sh\n' + script + '\n')
+        path.chmod(0o755)
+
+    def checks(self):
+        report = doctor.Report()
+        with patch('ats_terminal.available', return_value=(True, '')):
+            doctor.tool_checks(report)
+        return {i['title']: i for i in report.items}
+
+    def test_missing_tools_are_warnings_that_say_how_to_install_them(self):
+        found = self.checks()
+        self.assertEqual((found['Docker']['level'], found['rclone']['level']), ('warn', 'warn'))
+        self.assertIn('Install Docker', found['Docker']['fix'])
+        self.assertIn('Install rclone', found['rclone']['fix'])
+
+    def test_working_tools_pass_and_broken_ones_name_the_next_step(self):
+        self.tool('docker', 'echo 27.0.1')
+        self.tool('rclone', 'echo gdrive:; echo s3:')
+        found = self.checks()
+        self.assertEqual((found['Docker']['level'], found['rclone']['level']), ('ok', 'ok'))
+        self.assertIn('27.0.1', found['Docker']['detail'])
+        self.assertIn('2 remote', found['rclone']['detail'])
+        self.tool('docker', 'echo "Cannot connect to the Docker daemon" >&2; exit 1')
+        self.tool('rclone', 'exit 0')
+        found = self.checks()
+        self.assertEqual(found['Docker']['level'], 'fail')
+        self.assertIn('systemctl enable --now docker', found['Docker']['fix'])
+        self.assertEqual((found['rclone']['level'], found['rclone']['fix']), ('warn', 'run: rclone config'))
+        self.tool('rclone', 'exit 4')
+        self.assertEqual(self.checks()['rclone']['level'], 'fail')
+
+    def test_a_hanging_tool_cannot_hang_the_doctor(self):
+        self.tool('docker', 'sleep 30')
+        with patch.object(doctor.subprocess, 'run', side_effect=doctor.subprocess.TimeoutExpired('docker', 10)):
+            self.assertEqual(self.checks()['Docker']['level'], 'fail')
+
+    def test_terminal_availability_on_this_server_and_on_a_global(self):
+        report = doctor.Report()
+        with patch('ats_terminal.available', return_value=(False, 'no PTY for the service user')):
+            doctor.tool_checks(report)
+        item = [i for i in report.items if i['title'] == 'Terminal'][0]
+        self.assertEqual((item['level'], item['detail']), ('warn', 'no PTY for the service user'))
+        for health, level in (({'terminal': True}, 'ok'), ({'terminal': False, 'terminal_reason': 'no shell'}, 'warn'), ({}, 'warn')):
+            report = doctor.Report()
+            doctor.terminal_line(report, 'Global “B”', health)
+            self.assertEqual(report.items[0]['level'], level)
+        self.assertIn('older ATS', report.items[0]['detail'])
+
+    def test_version_differences_and_old_globals_are_reported(self):
+        import ats_status
+        mine = ats_status.repo_info(Path(doctor.__file__).resolve().parent, ttl=0).get('commit') or 'a' * 40
+        cases = [({'ats': {'available': True, 'commit': mine, 'short': mine[:7]}}, 'ok'),
+                 ({'ats': {'available': True, 'commit': 'b' * 40, 'short': 'bbbbbbb'}}, 'warn'),
+                 ({'ats': {'available': False}}, 'warn')]
+        for payload, level in cases:
+            report = doctor.Report()
+            with patch.object(doctor.ats_cluster, 'remote', return_value=payload), \
+                    patch.object(ats_status, 'repo_info', return_value={'commit': mine}):
+                doctor.version_line(report, 'Global', {})
+            self.assertEqual(report.items[0]['level'], level, payload)
+        report = doctor.Report()
+        with patch.object(doctor.ats_cluster, 'remote', side_effect=c.TransportError('Unsupported request kind', 'adapter')):
+            doctor.version_line(report, 'Global', {})
+        self.assertIn('older ATS', report.items[0]['detail'])
+
+    def test_backup_and_alert_checks_report_age_failures_and_delivery_problems(self):
+        import ats_notify
+        import ats_registry_backup as backups
+        node = self.store.configure('local', 'Primary', webhook='hooks.example.com')
+
+        def run():
+            report = doctor.Report()
+            doctor.backup_and_alert_checks(report, self.store, self.store.node())
+            return {i['title']: i for i in report.items}
+        found = run()
+        self.assertFalse((self.root / 'registry-backups').exists())               # doctor never creates anything
+        self.assertEqual((found['Registry backup']['level'], found['Alerts']['level']), ('warn', 'warn'))
+        backups.create(self.store)
+        found = run()
+        self.assertEqual(found['Registry backup']['level'], 'ok')
+        newest = Path(backups.listing(self.store)[0]['path'])
+        os.utime(newest, (time.time() - 5 * 86400, time.time() - 5 * 86400))
+        self.assertIn('5 days old', run()['Registry backup']['detail'])
+        ats_notify.save(self.store, {'webhook': {'url': 'https://hooks.example.com/x'}, 'enabled': {'webhook': True}})
+        self.store.kv_set('fleet_notify', {'at': 1, 'outcome': {'webhook': {'ok': False, 'error': 'HTTP 404'}}})
+        found = run()
+        self.assertEqual(found['Alerts']['level'], 'warn')
+        self.assertIn('webhook', found['Alerts']['detail'])
+        self.assertNotIn('hooks.example.com', json.dumps(found))
 
 
 if __name__ == '__main__':
