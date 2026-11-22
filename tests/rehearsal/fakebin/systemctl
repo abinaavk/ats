@@ -75,9 +75,13 @@ def start(name):
     pidfile(name).write_text(str(proc.pid))
 
 def env_base():
-    return {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG') if k in os.environ}
+    # The daemon (and the jobs it starts) call this same fake systemctl, so the rehearsal's settings travel with them.
+    return {k: v for k, v in os.environ.items() if k in ('PATH', 'HOME', 'LANG') or k.startswith('E2E_')}
 
 args = sys.argv[1:]
+# Like real systemd, a unit name without a suffix means NAME.service.
+if len(args) > 1 and not args[1].startswith('-') and '.' not in args[1]:
+    args[1] += '.service'
 cmd = args[0] if args else ''
 if cmd == 'list-unit-files':
     pattern = args[1]

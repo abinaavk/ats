@@ -315,3 +315,9 @@ storage monitoring; they are deliberately not pruned automatically.
 Validation uses temporary TLS certificates, host fixtures and fake system tools.
 Production hosts, Cloudflare routes, public TLS termination and real GitHub
 webhook delivery remain unverified until an authorized operator tests them.
+
+## Server tools (delete, tunnel config, Docker and rclone)
+
+The operations behind Manage's delete, Cloudflare config editor and one-click installs are `services.delete`, `cloudflare.config.get` /
+`cloudflare.config.set` and `system.install` (only `docker` and `rclone`, from the apt or dnf packages, as root). All three report progress steps
+and run on the selected server, including a Global through the signed channel. `services.delete` is idempotent; see the Monitor's `docs/manage.md`.
